@@ -148,23 +148,6 @@ class AscendQwen2_5_VisionAttention(Qwen2_5_VisionAttention):
         # [s, b, c] --> [s, b, head * 3 * head_dim]
         x, _ = self.qkv(x)
 
-        x = rearrange(x,
-                      's b (t h d) -> (b t) s h d',
-                      b=1,
-                      t=3,
-                      h=self.num_attention_heads_per_partition *
-                      self.world_size)
-        x = all_to_all_4d(x, is_seq_to_head=True)
-        cur_seq = x.shape[1]
-        x = x[:, :true_seq, :, :]
-        x = rearrange(
-            x,
-            '(b t) s h d -> s b (t h d)',
-            b=1,
-            t=3,
-            h=self.num_attention_heads_per_partition,
-        )
-
         # [s, b, 3 * head * head_dim] -> 3 * [s, b, head, head_dim]
         q, k, v = self.split_qkv(x)
         batch_size = q.shape[1]
@@ -191,13 +174,10 @@ class AscendQwen2_5_VisionAttention(Qwen2_5_VisionAttention):
             num_heads=self.num_attention_heads_per_partition,
             num_kv_heads=self.num_attention_heads_per_partition,
             out=context_layer)
-        padding = (0, 0, 0, 0, 0, cur_seq - true_seq)
-        context_layer = F.pad(context_layer, padding)
-        context_layer = all_to_all_3d(context_layer, is_seq_to_head=False)
-
-        context_layer = rearrange(context_layer,
-                                  "(b s) h d -> s b (h d)",
-                                  b=batch_size).contiguous()
+        
+        #For Qwen2.5VL batch size is fixed to 1
+        seq_co, head_co, dim_co = context_layer.shape
+        context_layer = context_layer.reshape(seq_co, 1, head_co * dim_co)
 
         output, _ = self.proj(context_layer)
         return output
@@ -365,7 +345,7 @@ class AscendQwen2_5_VisionTransformer(Qwen2_5_VisionTransformer):
                                   self.hidden_size_per_attention_head)
         sin_new = sin_new.reshape(1, -1, 1,
                                   self.hidden_size_per_attention_head)
-        return cos_new, sin_new
+        return cos_new.to(torch.bfloat16), sin_new.to(torch.bfloat16)
 
     def pad_qkv_bias(self, bias):
         first_half = bias.reshape(
