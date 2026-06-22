@@ -372,6 +372,69 @@ def test_build_non_spec_causal_conv1d_host_meta_requires_has_initial_state():
         )
 
 
+def test_build_spec_causal_conv1d_host_meta_avoids_device_contiguous(monkeypatch):
+    copied_tensors = []
+
+    def fake_copy_to_pinned_cpu(tensor, pinned_buffer):
+        copied_tensors.append(tensor)
+        return tensor
+
+    monkeypatch.setattr(
+        ascend_gdn_attn_builder,
+        "_copy_to_pinned_cpu",
+        fake_copy_to_pinned_cpu,
+    )
+    spec_state_indices = torch.arange(12, dtype=torch.int32).view(3, 4)
+    num_accepted_tokens = torch.arange(6, dtype=torch.int32)[::2]
+    attn_metadata = SimpleNamespace(
+        spec_sequence_masks=torch.ones(3, dtype=torch.bool),
+        spec_state_indices_tensor=spec_state_indices,
+        num_accepted_tokens=num_accepted_tokens,
+        num_spec_decodes=3,
+    )
+
+    host_meta = ascend_gdn_attn_builder._build_spec_causal_conv1d_host_meta(
+        SimpleNamespace(),
+        attn_metadata,
+        spec_query_start_loc_cpu=torch.tensor([0, 4, 8, 12], dtype=torch.int32),
+    )
+
+    assert host_meta.cache_indices_cpu is copied_tensors[0]
+    assert host_meta.num_accepted_tokens_cpu is copied_tensors[1]
+    assert copied_tensors[0].stride() == (4,)
+    assert not copied_tensors[0].is_contiguous()
+    assert copied_tensors[1].stride() == (2,)
+    assert not copied_tensors[1].is_contiguous()
+
+
+def test_build_spec_causal_conv1d_host_meta_prefers_cpu_sources(monkeypatch):
+    def fail_copy_to_pinned_cpu(tensor, pinned_buffer):
+        raise AssertionError("_copy_to_pinned_cpu should not be called when CPU sources exist")
+
+    monkeypatch.setattr(
+        ascend_gdn_attn_builder,
+        "_copy_to_pinned_cpu",
+        fail_copy_to_pinned_cpu,
+    )
+    attn_metadata = SimpleNamespace(
+        spec_sequence_masks=torch.ones(2, dtype=torch.bool),
+        spec_state_indices_tensor=torch.arange(8, dtype=torch.int32).view(2, 4),
+        num_accepted_tokens=torch.ones(2, dtype=torch.int32),
+        num_spec_decodes=2,
+        spec_cache_indices_cpu=torch.tensor([7, 11], dtype=torch.int32),
+        num_accepted_tokens_cpu=torch.tensor([1, 3], dtype=torch.int32),
+    )
+
+    host_meta = ascend_gdn_attn_builder._build_spec_causal_conv1d_host_meta(
+        SimpleNamespace(),
+        attn_metadata,
+        spec_query_start_loc_cpu=torch.tensor([0, 4, 8], dtype=torch.int32),
+    )
+
+    assert torch.equal(host_meta.cache_indices_cpu, torch.tensor([7, 11], dtype=torch.int32))
+    assert torch.equal(host_meta.num_accepted_tokens_cpu, torch.tensor([1, 3], dtype=torch.int32))
+
+
 def test_get_non_spec_causal_conv1d_host_args_falls_back_to_runtime_metadata():
     attn_metadata = SimpleNamespace(
         non_spec_prefill_fallback_meta=None,

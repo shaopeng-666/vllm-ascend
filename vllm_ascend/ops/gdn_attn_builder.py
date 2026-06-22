@@ -613,11 +613,35 @@ def _copy_to_pinned_cpu(
         )
     else:
         cpu_tensor = pinned_buffer[:num_elements]
-    cpu_tensor.copy_(
-        tensor.reshape(-1),
+    cpu_tensor.view(tensor.shape).copy_(
+        tensor,
         non_blocking=True,
     )
     return cpu_tensor
+
+
+def _build_mamba_block_table_tensor_cpu(
+    builder,
+    common_attn_metadata: CommonAttentionMetadata,
+) -> torch.Tensor | None:
+    block_table_tensor_cpu = getattr(common_attn_metadata, "block_table_tensor_cpu", None)
+    if block_table_tensor_cpu is None:
+        return None
+
+    mamba_cache_mode = builder.vllm_config.cache_config.mamba_cache_mode
+    if mamba_cache_mode in ("all", "none"):
+        return block_table_tensor_cpu
+
+    seq_lens_cpu = vars(common_attn_metadata).get("seq_lens_cpu")
+    if seq_lens_cpu is None:
+        return None
+
+    return mamba_get_block_table_tensor(
+        block_table_tensor_cpu,
+        seq_lens_cpu,
+        builder.kv_cache_spec,
+        mamba_cache_mode,
+    )
 
 
 def _build_non_spec_causal_conv1d_host_meta(
@@ -689,20 +713,32 @@ def _build_spec_causal_conv1d_host_meta(
     if attn_metadata.spec_state_indices_tensor is None:
         raise RuntimeError("Expected attn_metadata.spec_state_indices_tensor for Ascend GDN speculative path.")
 
+    num_spec_decodes = attn_metadata.num_spec_decodes
+    cache_indices_cpu = getattr(attn_metadata, "spec_cache_indices_cpu", None)
+    num_accepted_tokens_cpu = getattr(attn_metadata, "num_accepted_tokens_cpu", None)
+
     slot = None
-    if attn_metadata.spec_state_indices_tensor.device.type != "cpu":
+    if (
+        (cache_indices_cpu is None and attn_metadata.spec_state_indices_tensor.device.type != "cpu")
+        or (num_accepted_tokens_cpu is None and attn_metadata.num_accepted_tokens.device.type != "cpu")
+    ):
         slot = _acquire_spec_causal_conv1d_host_slot(builder)
 
-    num_spec_decodes = attn_metadata.num_spec_decodes
-    cache_indices_cpu = _copy_to_pinned_cpu(
-        attn_metadata.spec_state_indices_tensor[:num_spec_decodes, 0].contiguous(),
-        None if slot is None else slot.cache_indices_cpu,
-    )
+    if cache_indices_cpu is None:
+        cache_indices_cpu = _copy_to_pinned_cpu(
+            attn_metadata.spec_state_indices_tensor[:num_spec_decodes, 0],
+            None if slot is None else slot.cache_indices_cpu,
+        )
+    else:
+        cache_indices_cpu = cache_indices_cpu[:num_spec_decodes]
 
-    num_accepted_tokens_cpu = _copy_to_pinned_cpu(
-        attn_metadata.num_accepted_tokens[:num_spec_decodes].contiguous(),
-        None if slot is None else slot.num_accepted_tokens_cpu,
-    )
+    if num_accepted_tokens_cpu is None:
+        num_accepted_tokens_cpu = _copy_to_pinned_cpu(
+            attn_metadata.num_accepted_tokens[:num_spec_decodes],
+            None if slot is None else slot.num_accepted_tokens_cpu,
+        )
+    else:
+        num_accepted_tokens_cpu = num_accepted_tokens_cpu[:num_spec_decodes]
 
     return GDNSpecCausalConv1dHostMetadata(
         query_start_loc_cpu=spec_query_start_loc_cpu,
@@ -933,6 +969,7 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         num_accepted_tokens: torch.Tensor | None = None,
         num_decode_draft_tokens_cpu: torch.Tensor | None = None,
         fast_build: bool = False,
+        num_accepted_tokens_cpu: torch.Tensor | None = None,
     ) -> GDNAttentionMetadata:
         m = common_attn_metadata
 
@@ -946,10 +983,13 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             self.kv_cache_spec,
             self.vllm_config.cache_config.mamba_cache_mode,
         )
+        block_table_tensor_cpu = _build_mamba_block_table_tensor_cpu(self, m)
 
         spec_sequence_masks_cpu: torch.Tensor | None = None
+        spec_sequence_indices_cpu: torch.Tensor | None = None
         spec_sequence_indices: torch.Tensor | None = None
         non_spec_sequence_indices: torch.Tensor | None = None
+        spec_cache_indices_cpu: torch.Tensor | None = None
         if not self.use_spec_decode or num_decode_draft_tokens_cpu is None:
             spec_sequence_masks = None
             num_spec_decodes = 0
@@ -968,6 +1008,7 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             else:
                 spec_sequence_masks = self.spec_sequence_masks[:num_reqs]
                 spec_sequence_masks.copy_(spec_sequence_masks_cpu, non_blocking=True)
+                spec_sequence_indices_cpu = torch.nonzero(spec_sequence_masks_cpu, as_tuple=True)[0]
                 spec_sequence_indices, non_spec_sequence_indices = self._copy_sequence_indices_to_device(
                     spec_sequence_masks_cpu,
                     num_spec_decodes,
@@ -987,10 +1028,12 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             non_spec_query_start_loc = query_start_loc
             non_spec_query_start_loc_cpu = query_start_loc_cpu
             num_accepted_tokens = None
+            num_accepted_tokens_cpu = None
         else:
             query_lens = query_start_loc[1:] - query_start_loc[:-1]
             query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
             assert spec_sequence_masks_cpu is not None
+            assert spec_sequence_indices_cpu is not None
             assert spec_sequence_indices is not None
             assert non_spec_sequence_indices is not None
 
@@ -1028,6 +1071,12 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                     0,
                     spec_sequence_indices,
                 )
+                if block_table_tensor_cpu is not None:
+                    spec_cache_indices_cpu = torch.index_select(
+                        block_table_tensor_cpu[:, 0],
+                        0,
+                        spec_sequence_indices_cpu,
+                    )
                 non_spec_state_indices_tensor = None
                 spec_query_start_loc = query_start_loc[: num_spec_decodes + 1]
                 non_spec_query_start_loc = None
@@ -1048,6 +1097,12 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                     0,
                     spec_sequence_indices,
                 )
+                if block_table_tensor_cpu is not None:
+                    spec_cache_indices_cpu = torch.index_select(
+                        block_table_tensor_cpu[:, 0],
+                        0,
+                        spec_sequence_indices_cpu,
+                    )
                 non_spec_state_indices_tensor = torch.index_select(
                     block_table_tensor[:, 0],
                     0,
@@ -1100,6 +1155,12 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 0,
                 spec_sequence_indices,
             )
+            if num_accepted_tokens_cpu is not None:
+                num_accepted_tokens_cpu = torch.index_select(
+                    num_accepted_tokens_cpu,
+                    0,
+                    spec_sequence_indices_cpu,
+                )
 
         chunk_indices: torch.Tensor | None = None
         chunk_offsets: torch.Tensor | None = None
@@ -1238,6 +1299,11 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             batch_ptr=batch_ptr,
             token_chunk_offset_ptr=token_chunk_offset_ptr,
         )
+        if spec_cache_indices_cpu is not None:
+            setattr(attn_metadata, "spec_cache_indices_cpu", spec_cache_indices_cpu)
+        if num_accepted_tokens_cpu is not None:
+            setattr(attn_metadata, "num_accepted_tokens_cpu", num_accepted_tokens_cpu)
+
         attn_metadata = self._attach_non_spec_prefill_fallback_meta(
             attn_metadata,
             common_attn_metadata,

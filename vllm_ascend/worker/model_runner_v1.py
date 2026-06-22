@@ -3001,6 +3001,11 @@ class NPUModelRunner(GPUModelRunner):
                     dtype=torch.int32,
                     device=self.device,
                 )
+                blk_table_tensor_cpu = torch.zeros(
+                    (num_reqs_padded, 1),
+                    dtype=torch.int32,
+                    device="cpu",
+                )
                 slot_mapping = torch.zeros(
                     (num_tokens_padded,),
                     dtype=torch.int64,
@@ -3010,7 +3015,8 @@ class NPUModelRunner(GPUModelRunner):
                 blk_table = self.input_batch.block_table[kv_cache_gid]
                 slot_mapping = blk_table.slot_mapping.gpu[:maybe_pcp_full_tokens]
                 self.cpu_slot_mapping = blk_table.slot_mapping.cpu[:maybe_pcp_full_tokens]
-                blk_table_tensor = blk_table.get_device_tensor()[:num_reqs_padded]          
+                blk_table_tensor = blk_table.get_device_tensor()[:num_reqs_padded]
+                blk_table_tensor_cpu = blk_table.get_cpu_tensor()[:num_reqs_padded]
                 # Fill unused with -1. Needed for reshape_and_cache in full cuda
                 # graph mode. `blk_table_tensor` -1 to match mamba PAD_SLOT_ID
                 if self.pcp_size == 1:
@@ -3026,6 +3032,7 @@ class NPUModelRunner(GPUModelRunner):
                         # and [block, offset] scatter indices to DSA kernels.
                         slot_mapping[:num_tokens_padded].fill_(0)
                         blk_table_tensor[:num_reqs_padded].fill_(0)
+                        blk_table_tensor_cpu = None
                     else:
                         slot_mapping[num_tokens:num_tokens_padded].fill_(-1)
                         blk_table_tensor[num_reqs:num_reqs_padded].fill_(0)
@@ -3045,7 +3052,7 @@ class NPUModelRunner(GPUModelRunner):
                     self.routed_experts_slot_mapping_device[:n].copy_(
                         slot_mapping
                     )
-            return blk_table_tensor, slot_mapping
+            return blk_table_tensor, slot_mapping, blk_table_tensor_cpu
 
         if self.use_compress and num_scheduled_tokens_compressed_list is not None:
             total_num_scheduled_tokens_compressed_list = [
@@ -3058,9 +3065,17 @@ class NPUModelRunner(GPUModelRunner):
             total_num_scheduled_tokens_compressed_list = None
             num_reqs_actual = num_reqs
 
-        block_table_gid_0, slot_mapping_gid_0 = _get_block_table_and_slot_mapping(
-            0, total_num_scheduled_tokens_compressed_list)  # type: ignore[arg-type]
+        (
+            block_table_gid_0,
+            slot_mapping_gid_0,
+            block_table_gid_0_cpu,
+        ) = _get_block_table_and_slot_mapping(
+            0,
+            total_num_scheduled_tokens_compressed_list,
+        )  # type: ignore[arg-type]
         self.long_seq_metadata, block_table_gid_0 = _get_pcp_metadata(block_table_gid_0)
+        if self.use_cp:
+            block_table_gid_0_cpu = None
         num_computed_tokens_cpu = self.input_batch.num_computed_tokens_cpu_tensor[
             :num_reqs_padded
         ]
@@ -3095,6 +3110,7 @@ class NPUModelRunner(GPUModelRunner):
             max_query_len=max_query_len,
             max_seq_len=max_seq_len,
             block_table_tensor=block_table_gid_0,
+            block_table_tensor_cpu=block_table_gid_0_cpu,
             slot_mapping=slot_mapping_gid_0,
             slot_mapping_cpu=self.cpu_slot_mapping,
             causal=True,
@@ -3133,6 +3149,7 @@ class NPUModelRunner(GPUModelRunner):
                 assert ubid is None, "UBatching not supported with GDN yet"
                 extra_attn_metadata_args = dict(
                     num_accepted_tokens=self.num_accepted_tokens.gpu[:num_reqs_padded],
+                    num_accepted_tokens_cpu=self.num_accepted_tokens.cpu[:num_reqs_padded],
                     num_decode_draft_tokens_cpu=self.num_decode_draft_tokens.cpu[:num_reqs_padded],
                 )
 
