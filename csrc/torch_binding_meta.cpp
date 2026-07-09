@@ -726,6 +726,25 @@ std::tuple<at::Tensor, at::Tensor> npu_fused_gdn_gating_meta(
     return std::make_tuple(g, beta_output);
 }
 
+std::tuple<at::Tensor, at::Tensor> npu_chunk_gated_delta_rule_meta(
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& value,
+    const at::Tensor& beta,
+    const at::Tensor& initial_state,
+    const at::Tensor& actual_seq_lengths,
+    const c10::optional<at::Tensor>& g,
+    const c10::optional<double> scale)
+{
+    auto out_options = value.options().dtype(at::ScalarType::BFloat16);
+    at::Tensor output = at::empty_symint(value.sym_sizes(), out_options);
+
+    auto state_options = initial_state.options().dtype(at::ScalarType::Float);
+    at::Tensor final_state = at::empty_symint(initial_state.sym_sizes(), state_options);
+
+    return std::make_tuple(output, final_state);
+}
+
 std::vector<at::Tensor> moe_grouped_matmul_meta(
     at::Tensor x,
     at::Tensor weight,
@@ -1766,6 +1785,9 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("store_kv_block", &vllm_ascend::meta::store_kv_block);
     // npu_fused_gdn_gating
     ops.impl("npu_fused_gdn_gating", &vllm_ascend::meta::npu_fused_gdn_gating_meta);
+
+    // npu_chunk_gated_delta_rule
+    ops.impl("npu_chunk_gated_delta_rule", &vllm_ascend::meta::npu_chunk_gated_delta_rule_meta);
 }
 }
 #endif
