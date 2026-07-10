@@ -40,7 +40,11 @@ from vllm_ascend.ops.triton.fla.chunk import chunk_gated_delta_rule
 from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_split_reshape_cat
 from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
 from vllm_ascend.ops.triton.mamba.causal_conv1d import extract_last_width
-from vllm_ascend.utils import weak_ref_tensors
+from vllm_ascend.utils import (
+    AscendDeviceType,
+    get_ascend_device_type,
+    weak_ref_tensors,
+)
 
 
 def to_int64_tuple(tensor: torch.Tensor) -> tuple[int, ...]:
@@ -264,6 +268,10 @@ def get_non_spec_chunked_prefill_meta(attn_metadata):
     if fallback_meta is None:
         return None
     return fallback_meta.chunk
+
+
+def use_a3_fused_gdn_prefill() -> bool:
+    return get_ascend_device_type() == AscendDeviceType.A3
 
 
 class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
@@ -701,19 +709,37 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         if attn_metadata.num_prefills > 0:
             initial_state = ssm_state[non_spec_state_indices_tensor].transpose(-1, -2).contiguous()
             clear_ssm_states(initial_state, has_initial_state)
-            (core_attn_out_non_spec, last_recurrent_state) = chunk_gated_delta_rule(
-                q=query_non_spec,
-                k=key_non_spec,
-                v=value_non_spec,
-                g=g_non_spec,
-                beta=beta_non_spec,
-                initial_state=initial_state,
-                output_final_state=True,
-                cu_seqlens=non_spec_query_start_loc,
-                prebuilt_meta=get_non_spec_chunked_prefill_meta(attn_metadata),
-                head_first=False,
-                use_qk_l2norm_in_kernel=True,
-            )
+            if use_a3_fused_gdn_prefill():
+                actual_seq_lengths = (non_spec_query_start_loc[1:] - non_spec_query_start_loc[:-1]).to(
+                    torch.int32
+                )
+                query_non_spec = l2norm_fwd(query_non_spec)
+                key_non_spec = l2norm_fwd(key_non_spec)
+                core_attn_out_non_spec, last_recurrent_state = torch.ops._C_ascend.npu_chunk_gated_delta_rule(
+                    query=query_non_spec.squeeze(0).contiguous(),
+                    key=key_non_spec.squeeze(0).contiguous(),
+                    value=value_non_spec.squeeze(0).contiguous(),
+                    beta=beta_non_spec.squeeze(0).contiguous(),
+                    initial_state=initial_state,
+                    actual_seq_lengths=actual_seq_lengths,
+                    g=g_non_spec.squeeze(0).contiguous() if g_non_spec is not None else None,
+                    scale=key_non_spec.shape[-1] ** -0.5,
+                )
+                core_attn_out_non_spec = core_attn_out_non_spec.unsqueeze(0)
+            else:
+                (core_attn_out_non_spec, last_recurrent_state) = chunk_gated_delta_rule(
+                    q=query_non_spec,
+                    k=key_non_spec,
+                    v=value_non_spec,
+                    g=g_non_spec,
+                    beta=beta_non_spec,
+                    initial_state=initial_state,
+                    output_final_state=True,
+                    cu_seqlens=non_spec_query_start_loc,
+                    prebuilt_meta=get_non_spec_chunked_prefill_meta(attn_metadata),
+                    head_first=False,
+                    use_qk_l2norm_in_kernel=True,
+                )
             ssm_state[non_spec_state_indices_tensor] = (
                 last_recurrent_state.transpose(-1, -2).contiguous().to(ssm_state.dtype)
             )
