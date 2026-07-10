@@ -181,6 +181,9 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         # 1. Convolution sequence transformation
         conv_weights = self.conv1d.weight.view(self.conv1d.weight.size(0), self.conv1d.weight.size(2))
         conv_head_num = self.num_k_heads // self.tp_size if ascend_envs.VLLM_ASCEND_GDN_CONV_HEAD_FIRST else 0
+        use_head_first = (conv_head_num > 0 and spec_sequence_masks is None
+                          and attn_metadata.num_prefills > 0 and attn_metadata.num_decodes == 0
+                          and get_pcp_group().world_size <= 1)
         if spec_sequence_masks is not None:
             if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
                 mixed_qkv_spec = mixed_qkv
@@ -272,6 +275,57 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                         self_kv_cache[0][prefill_cache_indices, :state_len, :] = all_last_width_prefill_x[
                             -1, ...
                         ].transpose(-1, -2)
+                elif use_head_first:
+                    activation_num = 1 if self.activation else 0
+                    H_k = self.num_k_heads // self.tp_size
+                    H_v = self.num_v_heads // self.tp_size
+                    hkd = self.head_k_dim
+                    hvd = self.head_v_dim
+                    qk_dim = 2 * H_k * hkd
+                    v_dim = H_v * hvd
+                    conv_w = self.conv1d.weight.view(self.conv1d.weight.size(0), self.conv1d.weight.size(2))
+                    conv_w_qk = conv_w[:, :qk_dim].contiguous()
+                    conv_w_v = conv_w[:, qk_dim:].contiguous()
+                    conv_w_qk_T = conv_w_qk.transpose(0, 1)
+                    conv_w_v_T = conv_w_v.transpose(0, 1)
+                    state_qk = self_kv_cache[0][:, :, :qk_dim].contiguous()
+                    state_v = self_kv_cache[0][:, :, qk_dim:].contiguous()
+                    bias_qk = self.conv1d.bias[:qk_dim].contiguous() if self.conv1d.bias is not None else None
+                    bias_v = self.conv1d.bias[qk_dim:].contiguous() if self.conv1d.bias is not None else None
+                    x_qk = mixed_qkv_non_spec[:, :qk_dim].contiguous()
+                    x_v = mixed_qkv_non_spec[:, qk_dim:].contiguous()
+                    out_qk = torch.empty_like(x_qk)
+                    torch.ops._C_ascend.npu_causal_conv1d_custom(
+                        out_qk, x_qk, conv_w_qk_T, conv_state=state_qk,
+                        bias_opt=bias_qk,
+                        query_start_loc_opt=query_start_loc_opt,
+                        cache_indices_opt=cache_indices_opt,
+                        initial_state_mode_opt=initial_state_mode_opt,
+                        num_accepted_tokens_opt=None,
+                        activation_mode=activation_num,
+                        pad_slot_id=PAD_SLOT_ID,
+                        run_mode=0, head_num=2 * H_k,
+                    )
+                    self_kv_cache[0][:, :, :qk_dim] = state_qk
+                    out_v = torch.empty_like(x_v)
+                    torch.ops._C_ascend.npu_causal_conv1d_custom(
+                        out_v, x_v, conv_w_v_T, conv_state=state_v,
+                        bias_opt=bias_v,
+                        query_start_loc_opt=query_start_loc_opt,
+                        cache_indices_opt=cache_indices_opt,
+                        initial_state_mode_opt=initial_state_mode_opt,
+                        num_accepted_tokens_opt=None,
+                        activation_mode=activation_num,
+                        pad_slot_id=PAD_SLOT_ID,
+                        run_mode=0, head_num=H_v,
+                    )
+                    self_kv_cache[0][:, :, qk_dim:] = state_v
+                    N = mixed_qkv_non_spec.shape[0]
+                    qk_hf = out_qk.view(2 * H_k, N, hkd).transpose(0, 1).contiguous().unsqueeze(0)
+                    query_non_spec = qk_hf[:, :, :H_k, :]
+                    key_non_spec = qk_hf[:, :, H_k:, :]
+                    value_non_spec = out_v.view(H_v, N, hvd).transpose(0, 1).contiguous().unsqueeze(0)
+                    mixed_qkv_non_spec = None
                 else:
                     conv_weights_T = conv_weights.transpose(0, 1)
                     activation_num = 1 if self.activation else 0
@@ -289,13 +343,8 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                         activation_mode=activation_num,
                         pad_slot_id=PAD_SLOT_ID,
                         run_mode=0,
-                        head_num=conv_head_num,
+                        head_num=0,
                     )
-                    if conv_head_num > 0:
-                        N = mixed_qkv_non_spec_output.shape[0]
-                        D = mixed_qkv_non_spec_output.shape[-1] // conv_head_num
-                        mixed_qkv_non_spec_output = mixed_qkv_non_spec_output.view(
-                            conv_head_num, N, D).transpose(0, 1).contiguous().view(N, -1)
                     mixed_qkv_non_spec = mixed_qkv_non_spec_output
         elif attn_metadata.num_decodes > 0:
             conv_weights_T = conv_weights.transpose(0, 1)
@@ -323,7 +372,8 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             mixed_qkv_non_spec = None
 
         query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
-        query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(mixed_qkv_non_spec)
+        if not use_head_first:
+            query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(mixed_qkv_non_spec)
 
         # 2. Recurrent attention
         g, beta = DeviceOperator.fused_gdn_gating(self.A_log, a, b, self.dt_bias)
@@ -427,6 +477,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 prebuilt_meta=attn_metadata.non_spec_prefill_metadata.chunk,
                 head_first=False,
                 use_qk_l2norm_in_kernel=True,
+                qk_head_first=use_head_first,
             )
             ssm_state[prefill_state_indices] = last_recurrent_state.transpose(-1, -2).contiguous().to(ssm_state.dtype)
             if split_non_spec:
