@@ -204,6 +204,7 @@ def chunk_gated_delta_rule_fwd(
     )
     # obtain WY representation. u is actually the new v.
     k_for_triton = k.transpose(1, 2).contiguous() if qk_head_first else k
+    v_for_triton = v.transpose(1, 2).contiguous() if qk_head_first else v
     A = chunk_scaled_dot_kkt_fwd(
         k=k_for_triton,
         beta=beta,
@@ -221,7 +222,7 @@ def chunk_gated_delta_rule_fwd(
     )
     w, u = recompute_w_u_fwd(
         k=k_for_triton,
-        v=v,
+        v=v_for_triton,
         beta=beta,
         A=A,
         g_cumsum=g,
