@@ -110,6 +110,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Whether to enable causal_conv1d head-first output layout in GDN prefill path.
+    # 0 (default): legacy behavior, head_num=0, no output reshape.
+    # 1: pass head_num=H to causal_conv1d in prefill (run_mode=0), output in BNSD/NTD layout.
+    # Decode path (run_mode=1) always uses head_num=0 regardless of this setting.
+    "VLLM_ASCEND_GDN_CONV_HEAD_FIRST": lambda: bool(int(os.getenv("VLLM_ASCEND_GDN_CONV_HEAD_FIRST", "0"))),
 }
 
 # end-env-vars-definition

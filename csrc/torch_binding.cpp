@@ -793,7 +793,8 @@ at::Tensor npu_causal_conv1d_custom(
     const c10::optional<at::Tensor>& num_accepted_tokens_opt,
     int64_t  activation_mode,
     int64_t  pad_slot_id,
-    int64_t  run_mode)
+    int64_t  run_mode,
+    int64_t  head_num)
 {
     EXEC_NPU_CMD(aclnnCausalConv1d,
                     x,
@@ -807,6 +808,7 @@ at::Tensor npu_causal_conv1d_custom(
                     activation_mode,
                     pad_slot_id,
                     run_mode,
+                    head_num,
                     output
                 );
 
@@ -2584,7 +2586,8 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "                         Tensor? num_accepted_tokens_opt, "
         "                         int activation_mode, "
         "                         int pad_slot_id, "
-        "                         int run_mode"
+        "                         int run_mode, "
+        "                         int head_num"
         ") -> (Tensor output)");
     ops.impl("npu_causal_conv1d_custom", torch::kPrivateUse1, &vllm_ascend::npu_causal_conv1d_custom);
     ops.def(

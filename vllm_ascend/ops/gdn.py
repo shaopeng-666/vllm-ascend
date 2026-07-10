@@ -27,6 +27,7 @@ from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata  # typ
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.attention.utils import maybe_save_kv_layer_to_connector
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionBackend
@@ -179,6 +180,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # 1. Convolution sequence transformation
         conv_weights = self.conv1d.weight.view(self.conv1d.weight.size(0), self.conv1d.weight.size(2))
+        conv_head_num = self.num_k_heads // self.tp_size if ascend_envs.VLLM_ASCEND_GDN_CONV_HEAD_FIRST else 0
         if spec_sequence_masks is not None:
             if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
                 mixed_qkv_spec = mixed_qkv
@@ -210,6 +212,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 activation_mode=activation_num,
                 pad_slot_id=PAD_SLOT_ID,
                 run_mode=1,
+                head_num=0,
             )
             mixed_qkv_spec = output_spec
 
@@ -257,7 +260,13 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                         activation_mode=activation_num,
                         pad_slot_id=PAD_SLOT_ID,
                         run_mode=0,
+                        head_num=conv_head_num,
                     )
+                    if conv_head_num > 0:
+                        N = mixed_qkv_non_spec_output.shape[0]
+                        D = mixed_qkv_non_spec_output.shape[-1] // conv_head_num
+                        mixed_qkv_non_spec_output = mixed_qkv_non_spec_output.view(
+                            conv_head_num, N, D).transpose(0, 1).contiguous().view(N, -1)
                     mixed_qkv_non_spec = mixed_qkv_non_spec_output
                     if prefill_cache_indices.shape[0] > 0:
                         self_kv_cache[0][prefill_cache_indices, :state_len, :] = all_last_width_prefill_x[
@@ -280,7 +289,13 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                         activation_mode=activation_num,
                         pad_slot_id=PAD_SLOT_ID,
                         run_mode=0,
+                        head_num=conv_head_num,
                     )
+                    if conv_head_num > 0:
+                        N = mixed_qkv_non_spec_output.shape[0]
+                        D = mixed_qkv_non_spec_output.shape[-1] // conv_head_num
+                        mixed_qkv_non_spec_output = mixed_qkv_non_spec_output.view(
+                            conv_head_num, N, D).transpose(0, 1).contiguous().view(N, -1)
                     mixed_qkv_non_spec = mixed_qkv_non_spec_output
         elif attn_metadata.num_decodes > 0:
             conv_weights_T = conv_weights.transpose(0, 1)
@@ -301,6 +316,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 activation_mode=activation_num,
                 pad_slot_id=PAD_SLOT_ID,
                 run_mode=1,
+                head_num=0,
             )
             mixed_qkv_non_spec = output_non_spec
         else:
