@@ -28,9 +28,6 @@ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
 from vllm_ascend import envs as ascend_envs
-import logging as _logging
-_logging.getLogger(__name__).info(
-    "VLLM_ASCEND_GDN_CONV_HEAD_FIRST=%d", int(ascend_envs.VLLM_ASCEND_GDN_CONV_HEAD_FIRST))
 from vllm_ascend.attention.utils import maybe_save_kv_layer_to_connector
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionBackend
@@ -184,11 +181,6 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         # 1. Convolution sequence transformation
         conv_weights = self.conv1d.weight.view(self.conv1d.weight.size(0), self.conv1d.weight.size(2))
         conv_head_num = self.num_k_heads // self.tp_size if ascend_envs.VLLM_ASCEND_GDN_CONV_HEAD_FIRST else 0
-        split_non_spec = (
-            spec_sequence_masks is None and attn_metadata.num_prefills > 0 and attn_metadata.num_decodes > 0
-        )
-        use_head_first = (conv_head_num > 0 and attn_metadata.num_prefills > 0
-                          and not split_non_spec and get_pcp_group().world_size <= 1)
         if spec_sequence_masks is not None:
             if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
                 mixed_qkv_spec = mixed_qkv
@@ -299,7 +291,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                         run_mode=0,
                         head_num=conv_head_num,
                     )
-                    if conv_head_num > 0 and not use_head_first:
+                    if conv_head_num > 0:
                         N = mixed_qkv_non_spec_output.shape[0]
                         D = mixed_qkv_non_spec_output.shape[-1] // conv_head_num
                         mixed_qkv_non_spec_output = mixed_qkv_non_spec_output.view(
@@ -331,18 +323,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             mixed_qkv_non_spec = None
 
         query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
-        if use_head_first:
-            H = conv_head_num
-            N = mixed_qkv_non_spec.shape[0]
-            dim = mixed_qkv_non_spec.shape[1]
-            headDim = dim // H
-            hkd = self.head_k_dim
-            hf = mixed_qkv_non_spec.view(-1).view(H, N, headDim)
-            query_non_spec = hf[:, :, :hkd].contiguous().unsqueeze(0)
-            key_non_spec = hf[:, :, hkd:2*hkd].contiguous().unsqueeze(0)
-            value_non_spec = hf[:, :, 2*hkd:].contiguous().unsqueeze(0)
-        else:
-            query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(mixed_qkv_non_spec)
+        query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(mixed_qkv_non_spec)
 
         # 2. Recurrent attention
         g, beta = DeviceOperator.fused_gdn_gating(self.A_log, a, b, self.dt_bias)
@@ -446,7 +427,6 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 prebuilt_meta=attn_metadata.non_spec_prefill_metadata.chunk,
                 head_first=False,
                 use_qk_l2norm_in_kernel=True,
-                qk_head_first=use_head_first,
             )
             ssm_state[prefill_state_indices] = last_recurrent_state.transpose(-1, -2).contiguous().to(ssm_state.dtype)
             if split_non_spec:
