@@ -284,8 +284,8 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     qk_dim = 2 * H_k * hkd
                     v_dim = H_v * hvd
                     conv_w = self.conv1d.weight.view(self.conv1d.weight.size(0), self.conv1d.weight.size(2))
-                    conv_w_qk = conv_w[:, :qk_dim].contiguous()
-                    conv_w_v = conv_w[:, qk_dim:].contiguous()
+                    conv_w_qk = conv_w[:qk_dim, :].contiguous()
+                    conv_w_v = conv_w[qk_dim:, :].contiguous()
                     conv_w_qk_T = conv_w_qk.transpose(0, 1)
                     conv_w_v_T = conv_w_v.transpose(0, 1)
                     state_qk = self_kv_cache[0][:, :, :qk_dim].contiguous()
