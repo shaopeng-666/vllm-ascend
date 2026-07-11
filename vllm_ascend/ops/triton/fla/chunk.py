@@ -205,7 +205,7 @@ def chunk_gated_delta_rule_fwd(
     # obtain WY representation. u is actually the new v.
     k_for_triton = k.transpose(1, 2).contiguous() if qk_head_first else k
     A = chunk_scaled_dot_kkt_fwd(
-        k=k,
+        k=k_for_triton,
         beta=beta,
         g_cumsum=g,
         cu_seqlens=cu_seqlens,
@@ -220,7 +220,7 @@ def chunk_gated_delta_rule_fwd(
         output_dtype=k.dtype,
     )
     w, u = recompute_w_u_fwd(
-        k=k,
+        k=k_for_triton,
         v=v,
         beta=beta,
         A=A,
@@ -229,8 +229,12 @@ def chunk_gated_delta_rule_fwd(
         chunk_indices=chunk_indices_chunk64_host,
     )
 
-    q_ascendc = q.to(torch.bfloat16).transpose(1, 2).contiguous()
-    k_ascendc = k.to(torch.bfloat16).transpose(1, 2).contiguous()
+    if qk_head_first:
+        q_ascendc = q.to(torch.bfloat16).contiguous()
+        k_ascendc = k.to(torch.bfloat16).contiguous()
+    else:
+        q_ascendc = q.to(torch.bfloat16).transpose(1, 2).contiguous()
+        k_ascendc = k.to(torch.bfloat16).transpose(1, 2).contiguous()
     w_ascendc = w.to(torch.bfloat16).transpose(1, 2).contiguous()
     u_ascendc = u.to(torch.bfloat16).transpose(1, 2).contiguous()
     g_ascendc = g.transpose(1, 2).contiguous()
@@ -470,7 +474,7 @@ def chunk_gated_delta_rule(
             stacklevel=2,
         )
         q, k, v, beta, g = map(lambda x: rearrange(x, "b h t ... -> b t h ..."), (q, k, v, beta, g))
-    if not head_first and q.shape[1] < q.shape[2]:
+    if not head_first and not qk_head_first and q.shape[1] < q.shape[2]:
         warnings.warn(
             f"chunk_gated_delta_rule: Input tensor shape suggests potential format mismatch: seq_len ({q.shape[1]}) < num_heads ({q.shape[2]}). "
             "This may indicate the inputs were passed in head-first format [B, H, T, ...] "
