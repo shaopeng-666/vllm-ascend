@@ -283,27 +283,17 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     hvd = self.head_v_dim
                     qk_dim = 2 * H_k * hkd
                     v_dim = H_v * hvd
-                    # DEBUG: 确认 head 数对应关系
-                    import logging
-                    logger = logging.getLogger(__name__)
-                    logger.warning(f"[DEBUG] GDN head-first split: H_k={H_k}, H_v={H_v}, hkd={hkd}, hvd={hvd}, qk_dim={qk_dim}, v_dim={v_dim}")
-                    logger.warning(f"[DEBUG] conv1d.weight shape: {self.conv1d.weight.shape}, after view: [{self.conv1d.weight.size(0)}, {self.conv1d.weight.size(2)}]")
-                    logger.warning(f"[DEBUG] self_kv_cache[0] shape: {self_kv_cache[0].shape}")
                     conv_w = self.conv1d.weight.view(self.conv1d.weight.size(0), self.conv1d.weight.size(2))
                     conv_w_qk = conv_w[:qk_dim, :].contiguous()
                     conv_w_v = conv_w[qk_dim:, :].contiguous()
                     conv_w_qk_T = conv_w_qk.transpose(0, 1)
                     conv_w_v_T = conv_w_v.transpose(0, 1)
-                    logger.warning(f"[DEBUG] conv_w_qk shape: {conv_w_qk.shape}, conv_w_v shape: {conv_w_v.shape}")
                     state_qk = self_kv_cache[0][:, :, :qk_dim].contiguous()
                     state_v = self_kv_cache[0][:, :, qk_dim:].contiguous()
-                    logger.warning(f"[DEBUG] state_qk shape: {state_qk.shape}, state_v shape: {state_v.shape}")
-                    logger.warning(f"[DEBUG] state_qk before conv1d: sum={state_qk.sum().item():.4f}")
                     bias_qk = self.conv1d.bias[:qk_dim].contiguous() if self.conv1d.bias is not None else None
                     bias_v = self.conv1d.bias[qk_dim:].contiguous() if self.conv1d.bias is not None else None
                     x_qk = mixed_qkv_non_spec[:, :qk_dim].contiguous()
                     x_v = mixed_qkv_non_spec[:, qk_dim:].contiguous()
-                    logger.warning(f"[DEBUG] x_qk shape: {x_qk.shape}, x_v shape: {x_v.shape}")
                     out_qk = torch.empty_like(x_qk)
                     torch.ops._C_ascend.npu_causal_conv1d_custom(
                         out_qk, x_qk, conv_w_qk_T, conv_state=state_qk,
@@ -316,7 +306,6 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                         pad_slot_id=PAD_SLOT_ID,
                         run_mode=0, head_num=2 * H_k,
                     )
-                    logger.warning(f"[DEBUG] state_qk after conv1d: sum={state_qk.sum().item():.4f}")
                     self_kv_cache[0][:, :, :qk_dim] = state_qk
                     out_v = torch.empty_like(x_v)
                     torch.ops._C_ascend.npu_causal_conv1d_custom(

@@ -77,11 +77,13 @@ def recompute_w_u_fwd(
     A: torch.Tensor,
     cu_seqlens=None,
     chunk_indices=None,
+    qk_head_first: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     chunk_size = A.shape[-1]
     chunk_indices = _prepare_chunk_indices_if_needed(cu_seqlens, chunk_indices, chunk_size)
+    k_npu = k.contiguous() if qk_head_first else k.transpose(1, 2).contiguous()
     w, u = torch.ops._C_ascend.npu_recompute_wu_fwd(
-        k.transpose(1, 2).contiguous(),
+        k_npu,
         v.transpose(1, 2).contiguous(),
         beta.to(g_cumsum.dtype).transpose(1, 2).contiguous(),
         A.transpose(1, 2).contiguous(),
@@ -90,6 +92,8 @@ def recompute_w_u_fwd(
         chunk_indices=_as_host_tuple(chunk_indices),
         chunk_size=chunk_size,
     )
+    if qk_head_first:
+        return w, u
     return w.transpose(1, 2).contiguous(), u.transpose(1, 2).contiguous()
 
 
@@ -227,16 +231,17 @@ def chunk_gated_delta_rule_fwd(
         g_cumsum=g,
         cu_seqlens=cu_seqlens_host,
         chunk_indices=chunk_indices_chunk64_host,
+        qk_head_first=qk_head_first,
     )
 
+    q_ascendc = q.to(torch.bfloat16).transpose(1, 2).contiguous()
+    k_ascendc = k.to(torch.bfloat16).transpose(1, 2).contiguous()
     if qk_head_first:
-        q_ascendc = q.to(torch.bfloat16).contiguous()
-        k_ascendc = k.to(torch.bfloat16).contiguous()
+        w_ascendc = w.to(torch.bfloat16).contiguous()
+        u_ascendc = u.to(torch.bfloat16).contiguous()
     else:
-        q_ascendc = q.to(torch.bfloat16).transpose(1, 2).contiguous()
-        k_ascendc = k.to(torch.bfloat16).transpose(1, 2).contiguous()
-    w_ascendc = w.to(torch.bfloat16).transpose(1, 2).contiguous()
-    u_ascendc = u.to(torch.bfloat16).transpose(1, 2).contiguous()
+        w_ascendc = w.to(torch.bfloat16).transpose(1, 2).contiguous()
+        u_ascendc = u.to(torch.bfloat16).transpose(1, 2).contiguous()
     g_ascendc = g.transpose(1, 2).contiguous()
 
     h, v_new, final_state = torch.ops._C_ascend.chunk_gated_delta_rule_fwd_h(
