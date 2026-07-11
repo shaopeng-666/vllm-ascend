@@ -205,7 +205,7 @@ def chunk_gated_delta_rule_fwd(
     # obtain WY representation. u is actually the new v.
     k_for_triton = k.transpose(1, 2).contiguous() if qk_head_first else k
     A = chunk_scaled_dot_kkt_fwd(
-        k=k_for_triton,
+        k=k,
         beta=beta,
         g_cumsum=g,
         cu_seqlens=cu_seqlens,
@@ -229,12 +229,8 @@ def chunk_gated_delta_rule_fwd(
         chunk_indices=chunk_indices_chunk64_host,
     )
 
-    if qk_head_first:
-        q_ascendc = q.to(torch.bfloat16).contiguous()
-        k_ascendc = k.to(torch.bfloat16).contiguous()
-    else:
-        q_ascendc = q.to(torch.bfloat16).transpose(1, 2).contiguous()
-        k_ascendc = k.to(torch.bfloat16).transpose(1, 2).contiguous()
+    q_ascendc = q.to(torch.bfloat16).transpose(1, 2).contiguous()
+    k_ascendc = k.to(torch.bfloat16).transpose(1, 2).contiguous()
     w_ascendc = w.to(torch.bfloat16).transpose(1, 2).contiguous()
     u_ascendc = u.to(torch.bfloat16).transpose(1, 2).contiguous()
     g_ascendc = g.transpose(1, 2).contiguous()

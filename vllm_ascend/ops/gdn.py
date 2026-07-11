@@ -321,9 +321,9 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     )
                     self_kv_cache[0][:, :, qk_dim:] = state_v
                     N = mixed_qkv_non_spec.shape[0]
-                    qk_hf = out_qk.view(2 * H_k, N, hkd).unsqueeze(0)
-                    query_non_spec = qk_hf[:, :H_k, :, :]
-                    key_non_spec = qk_hf[:, H_k:, :, :]
+                    qk_hf = out_qk.view(2 * H_k, N, hkd).transpose(0, 1).contiguous().unsqueeze(0)
+                    query_non_spec = qk_hf[:, :, :H_k, :]
+                    key_non_spec = qk_hf[:, :, H_k:, :]
                     value_non_spec = out_v.view(H_v, N, hvd).transpose(0, 1).contiguous().unsqueeze(0)
                     mixed_qkv_non_spec = None
                 else:
