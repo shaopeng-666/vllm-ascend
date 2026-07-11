@@ -207,9 +207,10 @@ def chunk_gated_delta_rule_fwd(
         block_indices=block_indices_cumsum,
     )
     # obtain WY representation. u is actually the new v.
+    # chunk_scaled_dot_kkt_fwd Triton kernel expects time-first [B,T,Hg,K] layout.
     k_for_triton = k.transpose(1, 2).contiguous() if qk_head_first else k
     A = chunk_scaled_dot_kkt_fwd(
-        k=k_for_triton,
+        k=k,
         beta=beta,
         g_cumsum=g,
         cu_seqlens=cu_seqlens,
