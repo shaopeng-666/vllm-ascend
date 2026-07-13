@@ -114,6 +114,8 @@ env_variables: dict[str, Callable[[], Any]] = {
     # When K/V head dimensions match, this passes Hq + Hk + Hv for spec,
     # prefill, and decode, so the output can be split without a flat reshape.
     "VLLM_ASCEND_GDN_CONV_HEAD_FIRST": lambda: bool(int(os.getenv("VLLM_ASCEND_GDN_CONV_HEAD_FIRST", "1"))),
+    # Enable optional FLA debug traces. Keep disabled in production.
+    "VLLM_ASCEND_GDN_DEBUG_SPLIT": lambda: bool(int(os.getenv("VLLM_ASCEND_GDN_DEBUG_SPLIT", "0"))),
 }
 
 # end-env-vars-definition
