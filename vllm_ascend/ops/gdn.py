@@ -15,6 +15,7 @@
 # limitations under the License.
 #
 
+import inspect
 import logging
 
 import torch
@@ -300,18 +301,19 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     x_qk = mixed_qkv_non_spec[:, :qk_dim].contiguous()
                     x_v = mixed_qkv_non_spec[:, qk_dim:].contiguous()
                     if _dbg:
+                        _ln = inspect.currentframe().f_lineno
                         logger.warning(
-                            "[DEBUG] GDN head-first split: H_k=%s H_v=%s hkd=%s hvd=%s "
+                            "[gdn.py:%d] GDN head-first split: H_k=%s H_v=%s hkd=%s hvd=%s "
                             "qk_dim=%s v_dim=%s | conv_w=%s conv_w_qk=%s conv_w_v=%s "
                             "| state_qk=%s state_v=%s | x_qk=%s x_v=%s",
-                            H_k, H_v, hkd, hvd, qk_dim, v_dim,
+                            _ln, H_k, H_v, hkd, hvd, qk_dim, v_dim,
                             tuple(conv_w.shape), tuple(conv_w_qk.shape), tuple(conv_w_v.shape),
                             tuple(state_qk.shape), tuple(state_v.shape),
                             tuple(x_qk.shape), tuple(x_v.shape),
                         )
-                        # NOTE: .item() forces NPU->CPU sync; debug only.
-                        logger.warning("[DEBUG] state_qk before conv1d: sum=%.4f",
-                                       state_qk.sum().item())
+                        _ln = inspect.currentframe().f_lineno
+                        logger.warning("[gdn.py:%d] state_qk before conv1d: sum=%.4f",
+                                       _ln, state_qk.sum().item())
                     out_qk = torch.empty_like(x_qk)
                     torch.ops._C_ascend.npu_causal_conv1d_custom(
                         out_qk, x_qk, conv_w_qk_T, conv_state=state_qk,
@@ -326,8 +328,9 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     )
                     self_kv_cache[0][:, :, :qk_dim] = state_qk
                     if _dbg:
-                        logger.warning("[DEBUG] state_qk after qk conv1d: sum=%.4f",
-                                       state_qk.sum().item())
+                        _ln = inspect.currentframe().f_lineno
+                        logger.warning("[gdn.py:%d] state_qk after qk conv1d: sum=%.4f",
+                                       _ln, state_qk.sum().item())
                     out_v = torch.empty_like(x_v)
                     torch.ops._C_ascend.npu_causal_conv1d_custom(
                         out_v, x_v, conv_w_v_T, conv_state=state_v,
@@ -342,8 +345,9 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     )
                     self_kv_cache[0][:, :, qk_dim:] = state_v
                     if _dbg:
-                        logger.warning("[DEBUG] state_v after v conv1d: sum=%.4f",
-                                       state_v.sum().item())
+                        _ln = inspect.currentframe().f_lineno
+                        logger.warning("[gdn.py:%d] state_v after v conv1d: sum=%.4f",
+                                       _ln, state_v.sum().item())
                     N = mixed_qkv_non_spec.shape[0]
                     # conv1d with head_num>0 outputs head-first [H, N, D]
                     # Keep head-first format [1, H, N, D] for qk_head_first optimization
@@ -352,8 +356,10 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     key_non_spec = qk_hf[:, H_k:, :, :]
                     value_non_spec = out_v.view(H_v, N, hvd).transpose(0, 1).contiguous().unsqueeze(0)
                     if _dbg:
+                        _ln = inspect.currentframe().f_lineno
                         logger.warning(
-                            "[DEBUG] after reshape: q=%s k=%s v=%s",
+                            "[gdn.py:%d] after reshape: q=%s k=%s v=%s",
+                            _ln,
                             tuple(query_non_spec.shape),
                             tuple(key_non_spec.shape),
                             tuple(value_non_spec.shape),

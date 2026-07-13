@@ -8,6 +8,7 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # ruff: noqa: E501
 # mypy: ignore-errors
+import inspect
 import logging
 import warnings
 
@@ -473,11 +474,11 @@ def chunk_gated_delta_rule(
     assert len(beta.shape) == 3, "beta must be of shape [B, T, H] if head_first=False, or [B, H, T] otherwise."
 
     if ascend_envs.VLLM_ASCEND_GDN_DEBUG_SPLIT:
-        # Always-executed entry trace; .shape does not trigger NPU->CPU sync.
+        _ln = inspect.currentframe().f_lineno
         logger.warning(
-            "[DEBUG] chunk_gated_delta_rule enter: qk_head_first=%s head_first=%s "
+            "[chunk.py:%d] chunk_gated_delta_rule enter: qk_head_first=%s head_first=%s "
             "q=%s k=%s v=%s g=%s beta=%s scale=%s",
-            qk_head_first, head_first,
+            _ln, qk_head_first, head_first,
             tuple(q.shape), tuple(k.shape), tuple(v.shape),
             tuple(g.shape), tuple(beta.shape), scale,
         )
