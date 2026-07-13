@@ -115,6 +115,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     # 1: pass head_num=H to causal_conv1d in prefill (run_mode=0), output in BNSD/NTD layout.
     # Decode path (run_mode=1) always uses head_num=0 regardless of this setting.
     "VLLM_ASCEND_GDN_CONV_HEAD_FIRST": lambda: bool(int(os.getenv("VLLM_ASCEND_GDN_CONV_HEAD_FIRST", "1"))),
+    # Debug logging for the GDN qk_head_first conv1d split path.
+    # 0 (default): off, no debug output.
+    # 1: print head/dim/shape/state-sum traces around the split conv1d calls.
+    # NOTE: triggers NPU->CPU sync (.item()) on each forward; for debugging only.
+    "VLLM_ASCEND_GDN_DEBUG_SPLIT": lambda: bool(int(os.getenv("VLLM_ASCEND_GDN_DEBUG_SPLIT", "0"))),
 }
 
 # end-env-vars-definition

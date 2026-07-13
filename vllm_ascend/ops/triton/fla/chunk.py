@@ -8,6 +8,7 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # ruff: noqa: E501
 # mypy: ignore-errors
+import logging
 import warnings
 
 import torch
@@ -16,11 +17,15 @@ from vllm.distributed import get_pcp_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fla.ops.utils import SUPPRESS_LEVEL
 
+from vllm_ascend import envs as ascend_envs
+
 from .chunk_delta_hupdate import chunk_gated_delta_rule_fwd_hupdate
 from .chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
 from .cumsum import chunk_local_cumsum
 from .l2norm import l2norm_fwd
 from .utils import input_guard, prepare_chunk_indices, prepare_final_chunk_indices
+
+logger = logging.getLogger(__name__)
 
 
 def _as_host_tuple(values):
@@ -466,6 +471,16 @@ def chunk_gated_delta_rule(
     assert q.dtype == k.dtype == v.dtype
     assert q.dtype != torch.float32, "ChunkGatedDeltaRuleFunction does not support float32. Please use bfloat16."
     assert len(beta.shape) == 3, "beta must be of shape [B, T, H] if head_first=False, or [B, H, T] otherwise."
+
+    if ascend_envs.VLLM_ASCEND_GDN_DEBUG_SPLIT:
+        # Always-executed entry trace; .shape does not trigger NPU->CPU sync.
+        logger.warning(
+            "[DEBUG] chunk_gated_delta_rule enter: qk_head_first=%s head_first=%s "
+            "q=%s k=%s v=%s g=%s beta=%s scale=%s",
+            qk_head_first, head_first,
+            tuple(q.shape), tuple(k.shape), tuple(v.shape),
+            tuple(g.shape), tuple(beta.shape), scale,
+        )
 
     if head_first:
         raise DeprecationWarning(
