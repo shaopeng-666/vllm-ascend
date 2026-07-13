@@ -85,12 +85,18 @@ def recompute_w_u_fwd(
     chunk_indices=None,
     qk_head_first: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    _dbg = ascend_envs.VLLM_ASCEND_GDN_DEBUG_SPLIT
     chunk_size = A.shape[-1]
     chunk_indices = _prepare_chunk_indices_if_needed(cu_seqlens, chunk_indices, chunk_size)
     if qk_head_first:
         k_hf = k.contiguous()
     else:
         k_hf = k.transpose(1, 2).contiguous()
+    if _dbg:
+        _ln = inspect.currentframe().f_lineno
+        logger.warning("[chunk.py:%d] recompute input: k_hf=%s v=%s beta=%s A=%s g=%s qk_head_first=%s",
+                       _ln, tuple(k_hf.shape), tuple(v.shape), tuple(beta.shape),
+                       tuple(A.shape), tuple(g_cumsum.shape), qk_head_first)
     w, u = torch.ops._C_ascend.npu_recompute_wu_fwd(
         k_hf,
         v.transpose(1, 2).contiguous(),
@@ -101,6 +107,9 @@ def recompute_w_u_fwd(
         chunk_indices=_as_host_tuple(chunk_indices),
         chunk_size=chunk_size,
     )
+    if _dbg:
+        _ln = inspect.currentframe().f_lineno
+        logger.warning("[chunk.py:%d] recompute output: w=%s u=%s", _ln, tuple(w.shape), tuple(u.shape))
     if qk_head_first:
         return w.contiguous(), u.contiguous()
     return w.transpose(1, 2).contiguous(), u.transpose(1, 2).contiguous()
@@ -209,14 +218,21 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens_host = _as_host_tuple(cu_seqlens)
     if chunk_indices_chunk64_host is None and chunk_indices is not None:
         chunk_indices_chunk64_host = _as_host_tuple(chunk_indices)
+    _dbg = ascend_envs.VLLM_ASCEND_GDN_DEBUG_SPLIT
     g = chunk_local_cumsum(
         g,
         chunk_size=chunk_size,
         cu_seqlens=cu_seqlens,
         block_indices=block_indices_cumsum,
     )
+    if _dbg:
+        _ln = inspect.currentframe().f_lineno
+        logger.warning("[chunk.py:%d] after cumsum: g=%s qk_head_first=%s", _ln, tuple(g.shape), qk_head_first)
     # obtain WY representation. u is actually the new v.
     k_for_triton = k.transpose(1, 2).contiguous() if qk_head_first else k
+    if _dbg:
+        _ln = inspect.currentframe().f_lineno
+        logger.warning("[chunk.py:%d] k_for_triton=%s k=%s", _ln, tuple(k_for_triton.shape), tuple(k.shape))
     A = chunk_scaled_dot_kkt_fwd(
         k=k_for_triton,
         beta=beta,
@@ -225,6 +241,9 @@ def chunk_gated_delta_rule_fwd(
         chunk_indices=chunk_indices,
         output_dtype=torch.float32,
     )
+    if _dbg:
+        _ln = inspect.currentframe().f_lineno
+        logger.warning("[chunk.py:%d] after kkt: A=%s", _ln, tuple(A.shape))
     A = solve_tril(
         A=A,
         cu_seqlens=cu_seqlens_host,
@@ -232,6 +251,9 @@ def chunk_gated_delta_rule_fwd(
         chunk_indices_bt=chunk_indices_chunk64_host,
         output_dtype=k.dtype,
     )
+    if _dbg:
+        _ln = inspect.currentframe().f_lineno
+        logger.warning("[chunk.py:%d] after solve_tril: A=%s", _ln, tuple(A.shape))
     w, u = recompute_w_u_fwd(
         k=k if qk_head_first else k_for_triton,
         v=v,
@@ -242,6 +264,9 @@ def chunk_gated_delta_rule_fwd(
         chunk_indices=chunk_indices_chunk64_host,
         qk_head_first=qk_head_first,
     )
+    if _dbg:
+        _ln = inspect.currentframe().f_lineno
+        logger.warning("[chunk.py:%d] after recompute: w=%s u=%s", _ln, tuple(w.shape), tuple(u.shape))
 
     if qk_head_first:
         q_ascendc = q.to(torch.bfloat16).contiguous()
@@ -254,6 +279,11 @@ def chunk_gated_delta_rule_fwd(
         w_ascendc = w.to(torch.bfloat16).transpose(1, 2).contiguous()
         u_ascendc = u.to(torch.bfloat16).transpose(1, 2).contiguous()
     g_ascendc = g.transpose(1, 2).contiguous()
+    if _dbg:
+        _ln = inspect.currentframe().f_lineno
+        logger.warning("[chunk.py:%d] ascendc: q=%s k=%s w=%s u=%s g=%s",
+                       _ln, tuple(q_ascendc.shape), tuple(k_ascendc.shape),
+                       tuple(w_ascendc.shape), tuple(u_ascendc.shape), tuple(g_ascendc.shape))
 
     h, v_new, final_state = torch.ops._C_ascend.chunk_gated_delta_rule_fwd_h(
         k_ascendc,
