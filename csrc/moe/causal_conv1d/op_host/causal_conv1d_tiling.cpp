@@ -62,6 +62,13 @@
          fnExecutionPlan = fnHostPlan.executionPlan;
      } else {
          baseDimChoice = ChooseCanonicalUpdateBaseDimChoice(context, tiling->batch, tiling->dim, coreNum);
+         if (tiling->isOutReshape) {
+             const int64_t headDim = tiling->dim / tiling->headNum;
+             const int64_t alignedBaseDim = AlignDownInt64(baseDimChoice.baseDim, headDim);
+             baseDimChoice.baseDim = (alignedBaseDim > 0) ? alignedBaseDim : headDim;
+             baseDimChoice.baseDimCnt = CeilDivInt64(tiling->dim, baseDimChoice.baseDim);
+             baseDimChoice.gridSize = tiling->batch * baseDimChoice.baseDimCnt;
+         }
      }
  
      OP_CHECK_IF(baseDimChoice.baseDim <= 0 || baseDimChoice.baseDimCnt <= 0 || baseDimChoice.gridSize <= 0,
