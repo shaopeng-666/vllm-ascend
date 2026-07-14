@@ -339,13 +339,12 @@ def chunk_gated_delta_rule_fwd(
     )
 
     o = o_ascendc.to(torch.bfloat16).transpose(1, 2).contiguous()
-    v_new = v_new.to(torch.bfloat16).transpose(1, 2).contiguous()
-    h = h.to(torch.bfloat16).transpose(1, 2).contiguous()
 
-    if SUPPRESS_LEVEL < 3:
-        return g, o, A, final_state, None, None, None
-    elif SUPPRESS_LEVEL >= 3:
+    if SUPPRESS_LEVEL >= 3:
+        v_new = v_new.to(torch.bfloat16).transpose(1, 2).contiguous()
+        h = h.to(torch.bfloat16).transpose(1, 2).contiguous()
         return g, o, A, final_state, w, h, v_new
+    return g, o, A, final_state, None, None, None
 
 
 class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
@@ -368,7 +367,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         if use_qk_l2norm_in_kernel:
             q = l2norm_fwd(q)
             k = l2norm_fwd(k)
-        g, o, A, final_state, w, h, v_new = chunk_gated_delta_rule_fwd(
+        _, o, _, final_state, _, _, _ = chunk_gated_delta_rule_fwd(
             q=q,
             k=k,
             v=v,
@@ -380,8 +379,6 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             cu_seqlens=cu_seqlens,
             prebuilt_meta=prebuilt_meta,
         )
-        ctx.scale = scale
-        ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
         return o.to(q.dtype), final_state
 
 
