@@ -185,8 +185,8 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # 1. Convolution sequence transformation
         conv_weights = self.conv1d.weight.view(self.conv1d.weight.size(0), self.conv1d.weight.size(2))
-        conv_head_num = self.num_k_heads // self.tp_size if ascend_envs.VLLM_ASCEND_GDN_CONV_HEAD_FIRST else 0
-        use_head_first = (conv_head_num > 0 and spec_sequence_masks is None
+        conv_head_num = self.num_k_heads // self.tp_size
+        use_head_first = (spec_sequence_masks is None
                           and attn_metadata.num_prefills > 0 and attn_metadata.num_decodes == 0
                           and get_pcp_group().world_size <= 1)
         if spec_sequence_masks is not None:
@@ -514,9 +514,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 output_final_state=True,
                 cu_seqlens=prefill_query_start_loc,
                 prebuilt_meta=attn_metadata.non_spec_prefill_metadata.chunk,
-                head_first=False,
                 use_qk_l2norm_in_kernel=True,
-                qk_head_first=use_head_first,
             )
             ssm_state[prefill_state_indices] = last_recurrent_state.transpose(-1, -2).contiguous().to(ssm_state.dtype)
             if split_non_spec:
