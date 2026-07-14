@@ -14,13 +14,13 @@ class TestChunkGatedDeltaRule(PytestBase):
         mock_forward_context = MagicMock()
         mock_forward_context.attn_metadata = mock_attn_metadata
 
-        q = torch.randn(1, 17, 4, 128, dtype=torch.bfloat16).npu()
-        k = torch.randn(1, 17, 4, 128, dtype=torch.bfloat16).npu()
+        q = torch.randn(1, 4, 17, 128, dtype=torch.bfloat16).npu()
+        k = torch.randn(1, 4, 17, 128, dtype=torch.bfloat16).npu()
         v = torch.randn(1, 17, 8, 128, dtype=torch.bfloat16).npu()
         g = torch.randn(1, 17, 8, dtype=torch.float32).npu()
         beta = torch.randn(1, 17, 8, dtype=torch.bfloat16).npu()
         initial_state = torch.randn(3, 8, 128, 128, dtype=torch.bfloat16).npu()
-        q_start_loc = torch.range(0, 3, dtype=torch.int).npu()
+        q_start_loc = torch.tensor([0, 5, 11, 17], dtype=torch.int32).npu()
 
         mock_pcp_group = MagicMock()
         mock_pcp_group.world_size = 1
@@ -40,7 +40,6 @@ class TestChunkGatedDeltaRule(PytestBase):
                 initial_state=initial_state,
                 output_final_state=True,
                 cu_seqlens=q_start_loc,
-                head_first=False,
                 use_qk_l2norm_in_kernel=True,
             )
 
