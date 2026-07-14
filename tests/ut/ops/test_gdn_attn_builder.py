@@ -798,7 +798,7 @@ def test_builder_skips_prebuilt_meta_without_non_spec_prefill(batch_spec: BatchS
         )
 
 
-def test_head_major_conv_qkv_split_returns_token_major_tensors():
+def test_head_major_conv_qkv_split_preserves_head_major_tensors():
     num_k_heads, num_v_heads, num_tokens, head_dim = 2, 3, 4, 5
     mixed_qkv = torch.arange(
         (2 * num_k_heads + num_v_heads) * num_tokens * head_dim,
@@ -811,15 +811,13 @@ def test_head_major_conv_qkv_split_returns_token_major_tensors():
         num_v_heads=num_v_heads,
     )
 
-    assert query.shape == (1, num_tokens, num_k_heads, head_dim)
-    assert key.shape == (1, num_tokens, num_k_heads, head_dim)
-    assert value.shape == (1, num_tokens, num_v_heads, head_dim)
-    torch.testing.assert_close(query[0], mixed_qkv[:num_k_heads].movedim(0, 1))
-    torch.testing.assert_close(
-        key[0],
-        mixed_qkv[num_k_heads : 2 * num_k_heads].movedim(0, 1),
-    )
-    torch.testing.assert_close(value[0], mixed_qkv[2 * num_k_heads :].movedim(0, 1))
+    assert query.shape == (1, num_k_heads, num_tokens, head_dim)
+    assert key.shape == (1, num_k_heads, num_tokens, head_dim)
+    assert value.shape == (1, num_v_heads, num_tokens, head_dim)
+    torch.testing.assert_close(query[0], mixed_qkv[:num_k_heads])
+    torch.testing.assert_close(key[0], mixed_qkv[num_k_heads : 2 * num_k_heads])
+    torch.testing.assert_close(value[0], mixed_qkv[2 * num_k_heads :])
+    assert query.untyped_storage().data_ptr() == mixed_qkv.untyped_storage().data_ptr()
 
     output = _allocate_conv_output(mixed_qkv.movedim(0, 1).reshape(num_tokens, -1), 7, head_dim)
     assert output.shape == (7, num_tokens, head_dim)

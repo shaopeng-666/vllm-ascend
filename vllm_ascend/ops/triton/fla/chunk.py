@@ -164,6 +164,7 @@ def chunk_gated_delta_rule_fwd(
     output_final_state: bool,
     cu_seqlens: torch.LongTensor | None = None,
     prebuilt_meta=None,
+    head_first: bool = False,
 ):
     forward_context = get_forward_context()
     num_decodes = 0
@@ -190,17 +191,44 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens_host = _as_host_tuple(cu_seqlens)
     if chunk_indices_chunk64_host is None and chunk_indices is not None:
         chunk_indices_chunk64_host = _as_host_tuple(chunk_indices)
-    g = chunk_local_cumsum(
-        g,
-        chunk_size=chunk_size,
-        cu_seqlens=cu_seqlens,
-        block_indices=block_indices_cumsum,
-    )
+    if head_first:
+        # Preserve Conv1D's BHTD layout for recompute, fwd-h, and fwd-o.
+        # KKT/solve-tri remain token-major, so only that side path converts.
+        # The varlen cumsum and KKT helpers are token-major. Keep this
+        # auxiliary gate/WY path BTH while Q/K/V stay BHTD end-to-end.
+        g_bth = chunk_local_cumsum(
+            g.movedim(1, 2).contiguous(),
+            chunk_size=chunk_size,
+            cu_seqlens=cu_seqlens,
+            block_indices=block_indices_cumsum,
+        )
+        q_bhtd = q.to(torch.bfloat16).contiguous()
+        k_bhtd = k.to(torch.bfloat16).contiguous()
+        v_bhtd = v.contiguous()
+        beta_bht = beta
+        k_bthd = k_bhtd.movedim(1, 2).contiguous()
+        beta_bth = beta_bht.movedim(1, 2).contiguous()
+        g_bht = g_bth.movedim(1, 2).contiguous()
+    else:
+        g_bth = chunk_local_cumsum(
+            g,
+            chunk_size=chunk_size,
+            cu_seqlens=cu_seqlens,
+            block_indices=block_indices_cumsum,
+        )
+        q_bhtd = q.to(torch.bfloat16).movedim(1, 2).contiguous()
+        k_bhtd = k.to(torch.bfloat16).movedim(1, 2).contiguous()
+        v_bhtd = v.movedim(1, 2).contiguous()
+        beta_bht = beta.movedim(2, 1).contiguous()
+        g_bht = g_bth.movedim(2, 1).contiguous()
+        k_bthd = k
+        beta_bth = beta
+
     # Obtain WY representation. u is actually the new v.
     A = chunk_scaled_dot_kkt_fwd(
-        k=k,
-        beta=beta,
-        g_cumsum=g,
+        k=k_bthd,
+        beta=beta_bth,
+        g_cumsum=g_bth,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         output_dtype=torch.float32,
@@ -212,14 +240,6 @@ def chunk_gated_delta_rule_fwd(
         chunk_indices_bt=chunk_indices_chunk64_host,
         output_dtype=k.dtype,
     )
-
-    # These AscendC operators all use BHTD/BHTC. Convert once, then keep that
-    # layout through recompute, fwd-h, and fwd-o.
-    q_bhtd = q.to(torch.bfloat16).movedim(1, 2).contiguous()
-    k_bhtd = k.to(torch.bfloat16).movedim(1, 2).contiguous()
-    v_bhtd = v.movedim(1, 2).contiguous()
-    beta_bht = beta.movedim(2, 1).contiguous()
-    g_bht = g.movedim(2, 1).contiguous()
     A_bhtc = A.movedim(1, 2).contiguous()
 
     w, u = recompute_w_u_fwd(
@@ -251,10 +271,10 @@ def chunk_gated_delta_rule_fwd(
         if actual_num_decodes is None:
             actual_num_decodes = num_decodes
         h_update = chunk_gated_delta_rule_fwd_hupdate(
-            k=k,
+            k=k_bthd,
             w=w.movedim(1, 2).contiguous(),
             u=u.movedim(1, 2).contiguous(),
-            g=g,
+            g=g_bth,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices_chunk64,
             chunk_offsets=chunk_offsets_chunk64,
@@ -347,6 +367,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         output_final_state: bool,
         cu_seqlens: torch.LongTensor | None = None,
         prebuilt_meta=None,
+        head_first: bool = False,
         use_qk_l2norm_in_kernel: bool = False,
     ):
         if use_qk_l2norm_in_kernel:
@@ -363,6 +384,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
             prebuilt_meta=prebuilt_meta,
+            head_first=head_first,
         )
         ctx.scale = scale
         ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
@@ -454,12 +476,6 @@ def chunk_gated_delta_rule(
     assert q.dtype != torch.float32, "ChunkGatedDeltaRuleFunction does not support float32. Please use bfloat16."
     assert len(beta.shape) == 3, "beta must be of shape [B, T, H] if head_first=False, or [B, H, T] otherwise."
 
-    if head_first:
-        raise DeprecationWarning(
-            "chunk_gated_delta_rule: head_first is deprecated and will be removed in a future version. "
-            "Please use head_first=False for now instead.",
-            stacklevel=2,
-        )
     if not head_first and q.shape[1] < q.shape[2]:
         warnings.warn(
             f"chunk_gated_delta_rule: Input tensor shape suggests potential format mismatch: seq_len ({q.shape[1]}) < num_heads ({q.shape[2]}). "
@@ -492,6 +508,7 @@ def chunk_gated_delta_rule(
         output_final_state,
         cu_seqlens,
         prebuilt_meta,
+        head_first,
         use_qk_l2norm_in_kernel,
     )
     return o, final_state

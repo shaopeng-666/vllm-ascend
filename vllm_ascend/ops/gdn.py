@@ -55,15 +55,19 @@ def _split_head_major_qkv(
     num_k_heads: int,
     num_v_heads: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    # Conv1D emits [Hq + Hk + Hv, T, D]. FLA consumes [B, T, H, D].
+    # Conv1D emits [Hq + Hk + Hv, T, D]. Keep that head-major layout and
+    # only add the single-batch dimension required by the chunk interface.
     query, key, value = mixed_qkv.split(
         (num_k_heads, num_k_heads, num_v_heads),
         dim=0,
     )
-    return tuple(
-        tensor.movedim(0, 1).unsqueeze(0).contiguous()
-        for tensor in (query, key, value)
-    )
+    return tuple(tensor.unsqueeze(0) for tensor in (query, key, value))
+
+
+def _to_token_major(tensor: torch.Tensor, head_major: bool) -> torch.Tensor:
+    # The recurrent custom op only accepts TND. Prefill does not use this path.
+    tensor = tensor.squeeze(0)
+    return tensor.movedim(0, 1).contiguous() if head_major else tensor
 
 
 class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
@@ -424,9 +428,9 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             # The custom op extends dtype support (e.g. float32 state) and is
             # loaded at runtime via ASCEND_CUSTOM_OPP_PATH.
             core_attn_out_spec = torch.ops._C_ascend.npu_recurrent_gated_delta_rule(
-                query=query_spec.squeeze(0),
-                key=key_spec.squeeze(0),
-                value=value_spec.squeeze(0),
+                query=_to_token_major(query_spec, use_head_major_conv),
+                key=_to_token_major(key_spec, use_head_major_conv),
+                value=_to_token_major(value_spec, use_head_major_conv),
                 g=g_spec.squeeze(0),
                 beta=beta_spec.squeeze(0),
                 state=ssm_state,
@@ -444,9 +448,9 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             assert g_non_spec is not None
             assert beta_non_spec is not None
             if use_head_major_conv:
-                query_decode = query_non_spec[:, :num_decode_tokens]
-                key_decode = key_non_spec[:, :num_decode_tokens]
-                value_decode = value_non_spec[:, :num_decode_tokens]
+                query_decode = query_non_spec[:, :, :num_decode_tokens]
+                key_decode = key_non_spec[:, :, :num_decode_tokens]
+                value_decode = value_non_spec[:, :, :num_decode_tokens]
             else:
                 query_decode, key_decode, value_decode = self.rearrange_mixed_qkv(
                     mixed_qkv_non_spec[:num_decode_tokens]
@@ -455,9 +459,9 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             query_decode = l2norm_fwd(query_decode)
             key_decode = l2norm_fwd(key_decode)
             core_attn_out_decode = torch.ops._C_ascend.npu_recurrent_gated_delta_rule(
-                query=query_decode.squeeze(0),
-                key=key_decode.squeeze(0),
-                value=value_decode.squeeze(0),
+                query=_to_token_major(query_decode, use_head_major_conv),
+                key=_to_token_major(key_decode, use_head_major_conv),
+                value=_to_token_major(value_decode, use_head_major_conv),
                 g=g_non_spec[:, :num_decode_tokens].squeeze(0),
                 beta=beta_non_spec[:, :num_decode_tokens].squeeze(0),
                 state=ssm_state,
@@ -479,9 +483,14 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             assert g_non_spec is not None
             assert beta_non_spec is not None
             if split_non_spec:
-                query_non_spec = query_non_spec[:, num_decode_tokens:]
-                key_non_spec = key_non_spec[:, num_decode_tokens:]
-                value_non_spec = value_non_spec[:, num_decode_tokens:]
+                if use_head_major_conv:
+                    query_non_spec = query_non_spec[:, :, num_decode_tokens:]
+                    key_non_spec = key_non_spec[:, :, num_decode_tokens:]
+                    value_non_spec = value_non_spec[:, :, num_decode_tokens:]
+                else:
+                    query_non_spec = query_non_spec[:, num_decode_tokens:]
+                    key_non_spec = key_non_spec[:, num_decode_tokens:]
+                    value_non_spec = value_non_spec[:, num_decode_tokens:]
                 g_non_spec = g_non_spec[:, num_decode_tokens:]
                 beta_non_spec = beta_non_spec[:, num_decode_tokens:]
 
@@ -491,13 +500,13 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 q=query_non_spec,
                 k=key_non_spec,
                 v=value_non_spec,
-                g=g_non_spec,
-                beta=beta_non_spec,
+                g=(g_non_spec.movedim(1, 2).contiguous() if use_head_major_conv else g_non_spec),
+                beta=(beta_non_spec.movedim(1, 2).contiguous() if use_head_major_conv else beta_non_spec),
                 initial_state=initial_state,
                 output_final_state=True,
                 cu_seqlens=prefill_query_start_loc,
                 prebuilt_meta=attn_metadata.non_spec_prefill_metadata.chunk,
-                head_first=False,
+                head_first=use_head_major_conv,
                 use_qk_l2norm_in_kernel=True,
             )
             ssm_state[prefill_state_indices] = last_recurrent_state.transpose(-1, -2).contiguous().to(ssm_state.dtype)
@@ -513,9 +522,9 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             # Dispatches to the vllm-ascend AscendC custom operator
             # (csrc/recurrent_gated_delta_rule), NOT the built-in CANN operator.
             core_attn_out_non_spec = torch.ops._C_ascend.npu_recurrent_gated_delta_rule(
-                query=query_non_spec.squeeze(0),
-                key=key_non_spec.squeeze(0),
-                value=value_non_spec.squeeze(0),
+                query=_to_token_major(query_non_spec, use_head_major_conv),
+                key=_to_token_major(key_non_spec, use_head_major_conv),
+                value=_to_token_major(value_non_spec, use_head_major_conv),
                 g=g_non_spec.squeeze(0) if g_non_spec is not None else g_non_spec,
                 beta=beta_non_spec.squeeze(0) if beta_non_spec is not None else beta_non_spec,
                 state=ssm_state,
