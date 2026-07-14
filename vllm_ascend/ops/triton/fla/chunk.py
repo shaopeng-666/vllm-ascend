@@ -18,7 +18,7 @@ from vllm_ascend.ops.triton.triton_utils import get_aicore_num
 from .chunk_delta_hupdate import chunk_gated_delta_rule_fwd_hupdate
 from .chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd_kernel
 from .cumsum import chunk_local_cumsum
-from .l2norm import l2norm_fwd
+from .l2norm import fused_l2norm_fwd, l2norm_fwd
 from .utils import input_guard, prepare_chunk_indices, prepare_final_chunk_indices, safe_exp
 
 
@@ -396,8 +396,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         use_qk_l2norm_in_kernel: bool = False,
     ):
         if use_qk_l2norm_in_kernel:
-            q = l2norm_fwd(q)
-            k = l2norm_fwd(k)
+            q, k = fused_l2norm_fwd(q, k)
         o, final_state = chunk_gated_delta_rule_fwd(
             q=q,
             k=k,
