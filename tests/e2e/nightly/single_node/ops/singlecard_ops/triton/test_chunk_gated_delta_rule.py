@@ -14,9 +14,9 @@ class TestChunkGatedDeltaRule(PytestBase):
         mock_forward_context = MagicMock()
         mock_forward_context.attn_metadata = mock_attn_metadata
 
-        q = torch.randn(1, 17, 4, 128, dtype=torch.bfloat16).npu()
-        k = torch.randn(1, 17, 4, 128, dtype=torch.bfloat16).npu()
-        v = torch.randn(1, 17, 8, 128, dtype=torch.bfloat16).npu()
+        q = torch.randn(1, 4, 17, 128, dtype=torch.bfloat16).npu()
+        k = torch.randn(1, 4, 17, 128, dtype=torch.bfloat16).npu()
+        v = torch.randn(1, 8, 17, 128, dtype=torch.bfloat16).npu()
         g = torch.randn(1, 17, 8, dtype=torch.float32).npu()
         beta = torch.randn(1, 17, 8, dtype=torch.bfloat16).npu()
         initial_state = torch.randn(3, 8, 128, 128, dtype=torch.bfloat16).npu()
@@ -40,7 +40,6 @@ class TestChunkGatedDeltaRule(PytestBase):
                 initial_state=initial_state,
                 output_final_state=True,
                 cu_seqlens=q_start_loc,
-                head_first=False,
                 use_qk_l2norm_in_kernel=True,
             )
 
@@ -81,3 +80,42 @@ def test_chunk_gated_delta_rule_310_state_layout_matches_vllm():
     torch.testing.assert_close(out, expected_out, rtol=1e-5, atol=1e-5)
     assert final_state is not None
     torch.testing.assert_close(final_state, expected_state, rtol=1e-5, atol=1e-5)
+
+
+def test_chunk_gated_delta_rule_head_first_varlen():
+    mock_attn_metadata = MagicMock()
+    mock_attn_metadata.num_decodes = 0
+    mock_forward_context = MagicMock()
+    mock_forward_context.attn_metadata = mock_attn_metadata
+    mock_pcp_group = MagicMock()
+    mock_pcp_group.world_size = 1
+
+    torch.manual_seed(0)
+    q = torch.randn(1, 17, 4, 128, dtype=torch.bfloat16).npu()
+    k = torch.randn(1, 17, 4, 128, dtype=torch.bfloat16).npu()
+    v = torch.randn(1, 17, 8, 128, dtype=torch.bfloat16).npu()
+    g = torch.randn(1, 17, 8, dtype=torch.float32).npu()
+    beta = torch.randn(1, 17, 8, dtype=torch.bfloat16).npu()
+    initial_state = torch.randn(2, 8, 128, 128, dtype=torch.bfloat16).npu()
+    cu_seqlens = torch.tensor([0, 1, 17], dtype=torch.int64).npu()
+
+    with (
+        patch("vllm_ascend.ops.triton.fla.chunk.get_forward_context", return_value=mock_forward_context),
+        patch("vllm_ascend.ops.triton.fla.chunk.get_pcp_group", return_value=mock_pcp_group),
+    ):
+        head_major_out, head_major_state = chunk_gated_delta_rule(
+            q=q.movedim(1, 2).contiguous(),
+            k=k.movedim(1, 2).contiguous(),
+            v=v.movedim(1, 2).contiguous(),
+            g=g,
+            beta=beta,
+            initial_state=initial_state,
+            output_final_state=True,
+            cu_seqlens=cu_seqlens,
+            use_qk_l2norm_in_kernel=True,
+        )
+
+    assert head_major_out.shape == (1, 17, 8, 128)
+    assert head_major_state.shape == (2, 8, 128, 128)
+    assert torch.isfinite(head_major_out).all()
+    assert torch.isfinite(head_major_state).all()
