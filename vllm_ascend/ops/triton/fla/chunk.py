@@ -8,9 +8,6 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # ruff: noqa: E501
 # mypy: ignore-errors
-import inspect
-import logging
-
 import torch
 from vllm.distributed import get_pcp_group
 from vllm.forward_context import get_forward_context
@@ -23,8 +20,6 @@ from .chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
 from .cumsum import chunk_local_cumsum
 from .l2norm import l2norm_fwd
 from .utils import input_guard, prepare_chunk_indices, prepare_final_chunk_indices
-
-logger = logging.getLogger(__name__)
 
 
 def _as_host_tuple(values):
@@ -82,7 +77,6 @@ def recompute_w_u_fwd(
     cu_seqlens=None,
     chunk_indices=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    _dbg = ascend_envs.VLLM_ASCEND_GDN_DEBUG_SPLIT
     chunk_size = A.shape[-1]
     chunk_indices = _prepare_chunk_indices_if_needed(cu_seqlens, chunk_indices, chunk_size)
     k_hf = k.contiguous()
@@ -90,11 +84,6 @@ def recompute_w_u_fwd(
     beta_hf = beta.to(g_cumsum.dtype).contiguous()
     A_hf = A.contiguous()
     g_hf = g_cumsum.contiguous()
-    if _dbg:
-        _ln = inspect.currentframe().f_lineno
-        logger.warning("[chunk.py:%d] recompute input: k_hf=%s v_hf=%s beta_hf=%s A_hf=%s g_hf=%s",
-                       _ln, tuple(k_hf.shape), tuple(v_hf.shape), tuple(beta_hf.shape),
-                       tuple(A_hf.shape), tuple(g_hf.shape))
     w, u = torch.ops._C_ascend.npu_recompute_wu_fwd(
         k_hf,
         v_hf,
@@ -105,9 +94,6 @@ def recompute_w_u_fwd(
         chunk_indices=_as_host_tuple(chunk_indices),
         chunk_size=chunk_size,
     )
-    if _dbg:
-        _ln = inspect.currentframe().f_lineno
-        logger.warning("[chunk.py:%d] recompute output: w=%s u=%s", _ln, tuple(w.shape), tuple(u.shape))
     return w.contiguous(), u.contiguous()
 
 
@@ -213,25 +199,18 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens_host = _as_host_tuple(cu_seqlens)
     if chunk_indices_chunk64_host is None and chunk_indices is not None:
         chunk_indices_chunk64_host = _as_host_tuple(chunk_indices)
-    _dbg = ascend_envs.VLLM_ASCEND_GDN_DEBUG_SPLIT
     g = chunk_local_cumsum(
         g,
         chunk_size=chunk_size,
         cu_seqlens=cu_seqlens,
         block_indices=block_indices_cumsum,
     )
-    if _dbg:
-        _ln = inspect.currentframe().f_lineno
-        logger.warning("[chunk.py:%d] after cumsum: g=%s", _ln, tuple(g.shape))
 
     g_hf = g.transpose(1, 2).contiguous()
     beta_hf = beta.transpose(1, 2).contiguous()
     v_hf = v.transpose(1, 2).contiguous()
     k_for_triton = k.transpose(1, 2).contiguous()
 
-    if _dbg:
-        _ln = inspect.currentframe().f_lineno
-        logger.warning("[chunk.py:%d] k_for_triton=%s k=%s", _ln, tuple(k_for_triton.shape), tuple(k.shape))
     A = chunk_scaled_dot_kkt_fwd(
         k=k_for_triton,
         beta=beta_hf,
@@ -240,9 +219,6 @@ def chunk_gated_delta_rule_fwd(
         chunk_indices=chunk_indices,
         output_dtype=torch.float32,
     )
-    if _dbg:
-        _ln = inspect.currentframe().f_lineno
-        logger.warning("[chunk.py:%d] after kkt: A=%s", _ln, tuple(A.shape))
     A = solve_tril(
         A=A,
         cu_seqlens=cu_seqlens_host,
@@ -250,9 +226,6 @@ def chunk_gated_delta_rule_fwd(
         chunk_indices_bt=chunk_indices_chunk64_host,
         output_dtype=k.dtype,
     )
-    if _dbg:
-        _ln = inspect.currentframe().f_lineno
-        logger.warning("[chunk.py:%d] after solve_tril: A=%s", _ln, tuple(A.shape))
 
     A_hf = A.transpose(1, 2).contiguous()
 
@@ -265,20 +238,12 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens=cu_seqlens_host,
         chunk_indices=chunk_indices_chunk64_host,
     )
-    if _dbg:
-        _ln = inspect.currentframe().f_lineno
-        logger.warning("[chunk.py:%d] after recompute: w=%s u=%s", _ln, tuple(w.shape), tuple(u.shape))
 
     q_ascendc = q.to(torch.bfloat16).contiguous()
     k_ascendc = k.to(torch.bfloat16).contiguous()
     w_ascendc = w.to(torch.bfloat16).contiguous()
     u_ascendc = u.to(torch.bfloat16).contiguous()
     g_ascendc = g_hf.contiguous()
-    if _dbg:
-        _ln = inspect.currentframe().f_lineno
-        logger.warning("[chunk.py:%d] ascendc: q=%s k=%s w=%s u=%s g=%s",
-                       _ln, tuple(q_ascendc.shape), tuple(k_ascendc.shape),
-                       tuple(w_ascendc.shape), tuple(u_ascendc.shape), tuple(g_ascendc.shape))
 
     h, v_new, final_state = torch.ops._C_ascend.chunk_gated_delta_rule_fwd_h(
         k_ascendc,
@@ -473,16 +438,6 @@ def chunk_gated_delta_rule(
     assert q.dtype == k.dtype == v.dtype
     assert q.dtype != torch.float32, "ChunkGatedDeltaRuleFunction does not support float32. Please use bfloat16."
     assert len(beta.shape) == 3, "beta must be of shape [B, T, H]."
-
-    if ascend_envs.VLLM_ASCEND_GDN_DEBUG_SPLIT:
-        _ln = inspect.currentframe().f_lineno
-        logger.warning(
-            "[chunk.py:%d] chunk_gated_delta_rule enter: "
-            "q=%s k=%s v=%s g=%s beta=%s scale=%s",
-            _ln,
-            tuple(q.shape), tuple(k.shape), tuple(v.shape),
-            tuple(g.shape), tuple(beta.shape), scale,
-        )
 
     if cu_seqlens is not None:
         if q.shape[0] != 1:

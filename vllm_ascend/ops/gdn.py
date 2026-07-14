@@ -15,9 +15,6 @@
 # limitations under the License.
 #
 
-import inspect
-import logging
-
 import torch
 from einops import rearrange
 from vllm.distributed import get_pcp_group
@@ -38,8 +35,6 @@ from vllm_ascend.ops.triton.fla.chunk import chunk_gated_delta_rule
 from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_split_reshape_cat
 from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
 from vllm_ascend.ops.triton.mamba.causal_conv1d import extract_last_width
-
-logger = logging.getLogger(__name__)
 
 
 class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
@@ -288,7 +283,6 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     hvd = self.head_v_dim
                     qk_dim = 2 * H_k * hkd
                     v_dim = H_v * hvd
-                    _dbg = ascend_envs.VLLM_ASCEND_GDN_DEBUG_SPLIT
                     conv_w = self.conv1d.weight.view(self.conv1d.weight.size(0), self.conv1d.weight.size(2))
                     conv_w_qk = conv_w[:qk_dim, :].contiguous()
                     conv_w_v = conv_w[qk_dim:, :].contiguous()
@@ -300,20 +294,6 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     bias_v = self.conv1d.bias[qk_dim:].contiguous() if self.conv1d.bias is not None else None
                     x_qk = mixed_qkv_non_spec[:, :qk_dim].contiguous()
                     x_v = mixed_qkv_non_spec[:, qk_dim:].contiguous()
-                    if _dbg:
-                        _ln = inspect.currentframe().f_lineno
-                        logger.warning(
-                            "[gdn.py:%d] GDN head-first split: H_k=%s H_v=%s hkd=%s hvd=%s "
-                            "qk_dim=%s v_dim=%s | conv_w=%s conv_w_qk=%s conv_w_v=%s "
-                            "| state_qk=%s state_v=%s | x_qk=%s x_v=%s",
-                            _ln, H_k, H_v, hkd, hvd, qk_dim, v_dim,
-                            tuple(conv_w.shape), tuple(conv_w_qk.shape), tuple(conv_w_v.shape),
-                            tuple(state_qk.shape), tuple(state_v.shape),
-                            tuple(x_qk.shape), tuple(x_v.shape),
-                        )
-                        _ln = inspect.currentframe().f_lineno
-                        logger.warning("[gdn.py:%d] state_qk before conv1d: sum=%.4f",
-                                       _ln, state_qk.sum().item())
                     out_qk = torch.empty_like(x_qk)
                     torch.ops._C_ascend.npu_causal_conv1d_custom(
                         out_qk, x_qk, conv_w_qk_T, conv_state=state_qk,
@@ -327,10 +307,6 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                         run_mode=0, head_num=2 * H_k,
                     )
                     self_kv_cache[0][:, :, :qk_dim] = state_qk
-                    if _dbg:
-                        _ln = inspect.currentframe().f_lineno
-                        logger.warning("[gdn.py:%d] state_qk after qk conv1d: sum=%.4f",
-                                       _ln, state_qk.sum().item())
                     out_v = torch.empty_like(x_v)
                     torch.ops._C_ascend.npu_causal_conv1d_custom(
                         out_v, x_v, conv_w_v_T, conv_state=state_v,
@@ -344,10 +320,6 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                         run_mode=0, head_num=H_v,
                     )
                     self_kv_cache[0][:, :, qk_dim:] = state_v
-                    if _dbg:
-                        _ln = inspect.currentframe().f_lineno
-                        logger.warning("[gdn.py:%d] state_v after v conv1d: sum=%.4f",
-                                       _ln, state_v.sum().item())
                     N = mixed_qkv_non_spec.shape[0]
                     # conv1d with head_num>0 outputs head-first [H, N, D]
                     # Keep head-first format [1, H, N, D] for qk_head_first optimization
@@ -355,15 +327,6 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     query_non_spec = qk_hf[:, :H_k, :, :]
                     key_non_spec = qk_hf[:, H_k:, :, :]
                     value_non_spec = out_v.view(H_v, N, hvd).transpose(0, 1).contiguous().unsqueeze(0)
-                    if _dbg:
-                        _ln = inspect.currentframe().f_lineno
-                        logger.warning(
-                            "[gdn.py:%d] after reshape: q=%s k=%s v=%s",
-                            _ln,
-                            tuple(query_non_spec.shape),
-                            tuple(key_non_spec.shape),
-                            tuple(value_non_spec.shape),
-                        )
                     mixed_qkv_non_spec = None
                 else:
                     conv_weights_T = conv_weights.transpose(0, 1)

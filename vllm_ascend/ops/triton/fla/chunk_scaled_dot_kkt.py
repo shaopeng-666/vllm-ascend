@@ -9,18 +9,12 @@
 # ruff: noqa: E501
 # mypy: ignore-errors
 
-import inspect
-import logging
-
 import torch
 from vllm.triton_utils import tl, triton
 
-from vllm_ascend import envs as ascend_envs
 from vllm_ascend.ops.triton.triton_utils import get_aicore_num
 
 from .utils import prepare_chunk_indices, safe_exp
-
-logger = logging.getLogger(__name__)
 
 
 @triton.heuristics(
@@ -138,12 +132,6 @@ def chunk_scaled_dot_kkt_fwd(
 
     from vllm_ascend.device.device_op import DeviceOperator
 
-    _dbg = ascend_envs.VLLM_ASCEND_GDN_DEBUG_SPLIT
-    if _dbg:
-        _ln = inspect.currentframe().f_lineno
-        logger.warning("[chunk_scaled_dot_kkt.py:%d] kkt input: k=%s beta=%s g_cumsum=%s",
-                       _ln, tuple(k.shape), tuple(beta.shape), tuple(g_cumsum.shape))
-
     beta_hf = beta.contiguous()
     g_hf = g_cumsum.contiguous()
 
@@ -165,7 +153,4 @@ def chunk_scaled_dot_kkt_fwd(
         BT=BT,
         BK=128,
     )
-    if _dbg:
-        _ln = inspect.currentframe().f_lineno
-        logger.warning("[chunk_scaled_dot_kkt.py:%d] kkt output: A=%s", _ln, tuple(A.shape))
     return A

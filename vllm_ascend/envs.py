@@ -110,11 +110,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
-    # Debug logging for the GDN qk_head_first conv1d split path.
-    # 0 (default): off, no debug output.
-    # 1: print head/dim/shape/state-sum traces around the split conv1d calls.
-    # NOTE: triggers NPU->CPU sync (.item()) on each forward; for debugging only.
-    "VLLM_ASCEND_GDN_DEBUG_SPLIT": lambda: bool(int(os.getenv("VLLM_ASCEND_GDN_DEBUG_SPLIT", "0"))),
 }
 
 # end-env-vars-definition
