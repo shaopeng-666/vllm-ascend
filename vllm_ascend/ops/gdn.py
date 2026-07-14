@@ -33,6 +33,7 @@ from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionBackend
 from vllm_ascend.ops.triton.fla.chunk import chunk_gated_delta_rule
 from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_split_reshape_cat
+from vllm_ascend.ops.triton.fla.l2norm import fused_l2norm_fwd
 from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
 from vllm_ascend.ops.triton.mamba.causal_conv1d import extract_last_width
 
@@ -467,6 +468,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
 
             initial_state = ssm_state[prefill_state_indices].transpose(-1, -2).contiguous()
             clear_ssm_states(initial_state, prefill_has_initial_state)
+            query_non_spec, key_non_spec = fused_l2norm_fwd(query_non_spec, key_non_spec)
             (core_attn_out_non_spec, last_recurrent_state) = chunk_gated_delta_rule(
                 q=query_non_spec,
                 k=key_non_spec,
@@ -477,7 +479,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 output_final_state=True,
                 cu_seqlens=prefill_query_start_loc,
                 prebuilt_meta=attn_metadata.non_spec_prefill_metadata.chunk,
-                use_qk_l2norm_in_kernel=True,
+                use_qk_l2norm_in_kernel=False,
             )
             ssm_state[prefill_state_indices] = last_recurrent_state.transpose(-1, -2).contiguous().to(ssm_state.dtype)
             if split_non_spec:
