@@ -219,15 +219,14 @@ def chunk_gated_delta_rule_fwd(
     if chunk_indices_chunk64_host is None and chunk_indices is not None:
         chunk_indices_chunk64_host = _as_host_tuple(chunk_indices)
     
-    # Method 4: Use head_first=True to directly output head-first format, avoiding transpose
-    g_hf = chunk_local_cumsum(
+    g = chunk_local_cumsum(
         g,
         chunk_size=chunk_size,
         cu_seqlens=cu_seqlens,
         block_indices=block_indices_cumsum,
-        head_first=True,
     )
 
+    g_hf = g.transpose(1, 2).contiguous()
     beta_hf = beta.transpose(1, 2).contiguous()
     v_hf = v.contiguous()
 
