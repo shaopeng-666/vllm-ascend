@@ -427,7 +427,7 @@ def test_chunk_gated_delta_rule_fwd_pcp_chaining_subtracts_initial_state(
         prebuilt_meta=prebuilt_meta,
     )
 
-    final_state = result[3]
+    final_state = result[1]
     # Sequential: Φ_1·(Φ_0·s0 + p_0) + p_1
     expected = torch.matmul(phi_1, torch.matmul(phi_0, s0) + p_0) + p_1
     torch.testing.assert_close(final_state, expected, rtol=1e-4, atol=1e-4)

@@ -163,6 +163,8 @@
      __aicore__ inline void ProcessFnChunk(int32_t seq, int32_t cacheIdx, bool hasInit, int32_t seqStart,
                                            int32_t seqLen, int32_t chunkStart, int32_t chunkLen, int32_t channelStart,
                                            int32_t baseDim, int32_t dim);
+     __aicore__ inline void DataCopyWithTranspose(LocalTensor<T> &outSlotT, int32_t baseDim, int32_t dim,
+         int32_t channelStart, int32_t start, int32_t t);
      __aicore__ inline const CausalConv1dTilingData *GetTilingData() const;
      __aicore__ inline bool HasActivation() const;
      __aicore__ inline bool HasBias() const;
@@ -391,7 +393,42 @@
          SetFlag<HardEvent::V_MTE2>(inputVToMte2Event_);
      }
  }
- 
+
+ template <CAUSAL_CONV1D_TEMPLATE_ARGS>
+ __aicore__ inline void CAUSAL_CONV1D_CLASS::DataCopyWithTranspose(LocalTensor<T> &outSlotT, int32_t baseDim, int32_t dim,
+     int32_t channelStart, int32_t start, int32_t t)
+ {
+     const int32_t headNum = static_cast<int32_t>(tilingData_->headNum);
+     const int32_t cuSeqlen = static_cast<int32_t>(tilingData_->cuSeqlen);
+     const int32_t seqLen = static_cast<int32_t>(tilingData_->seqLen);
+     const int32_t batch = static_cast<int32_t>(tilingData_->batch);
+     const int32_t inputMode = static_cast<int32_t>(tilingData_->inputMode);
+     if (headNum == 0 || dim == 0) {
+         return;
+     }
+     int32_t headDim = dim / headNum;
+     int32_t processHeadNum = baseDim / headDim;
+     int32_t headStart = channelStart / headDim;
+
+     int32_t taskWindowMode = GetSeqTaskWindowMode(inputMode);
+     if (taskWindowMode == SEQ_TASK_WINDOW_MODE_VARLEN) {
+         int64_t outOffset = static_cast<int64_t>(headStart * headDim * cuSeqlen) + static_cast<int64_t>(start + t) * headDim;
+         for (int32_t headLoop = 0; headLoop < processHeadNum; ++headLoop) {
+             DataCopy(yGm[outOffset], outSlotT[headLoop * headDim], headDim);
+             outOffset += headDim * cuSeqlen;
+         }
+     } else if (taskWindowMode == SEQ_TASK_WINDOW_MODE_BATCH) {
+         int64_t batch_idx = (start + t) / seqLen;
+         int64_t token_idx = (start + t) % seqLen;
+         int64_t outOffset = static_cast<int64_t>(batch_idx * seqLen * dim) + static_cast<int64_t>(headStart * headDim * seqLen) +
+             static_cast<int64_t>(token_idx * headDim);
+         for (int32_t headLoop = 0; headLoop < processHeadNum; ++headLoop) {
+             DataCopy(yGm[outOffset], outSlotT[headLoop * headDim], headDim);
+             outOffset += headDim * seqLen;
+         }
+     }
+ }
+
  template <CAUSAL_CONV1D_TEMPLATE_ARGS>
  __aicore__ inline void CAUSAL_CONV1D_CLASS::RunSeq(int32_t start, int32_t len, int32_t channelStart,
                                                     int32_t baseDim, int32_t dim)
@@ -472,10 +509,14 @@
          }
  
          SetFlag<HardEvent::V_MTE3>(outVToMte3Event_[outSlot]);
- 
-         const int64_t outOffset = static_cast<int64_t>(start + t) * dim + channelStart;
+
          WaitFlag<HardEvent::V_MTE3>(outVToMte3Event_[outSlot]);
-         DataCopy(yGm[outOffset], outSlotT, baseDim);
+         if (tilingData_->isOutReshape) {
+             DataCopyWithTranspose(outSlotT, baseDim, dim, channelStart, start, t);
+         } else {
+             const int64_t outOffset = static_cast<int64_t>(start + t) * dim + channelStart;
+             DataCopy(yGm[outOffset], outSlotT, baseDim);
+         }
          if (t + 2 < len) {
              SetFlag<HardEvent::MTE3_V>(outMte3ToVEvent_[outSlot]);
          }
@@ -690,20 +731,24 @@
          AdvanceFnLocalPartials(slotCurr, baseDim);
  
          SetFlag<HardEvent::V_MTE3>(outVToMte3Event_[outSlot]);
- 
-         const int64_t outOffset = static_cast<int64_t>(start + t) * dim + channelStart;
+
          WaitFlag<HardEvent::V_MTE3>(outVToMte3Event_[outSlot]);
-         DataCopy(yGm[outOffset], outSlotT, baseDim);
+         if (tilingData_->isOutReshape) {
+             DataCopyWithTranspose(outSlotT, baseDim, dim, channelStart, start, t);
+         } else {
+             const int64_t outOffset = static_cast<int64_t>(start + t) * dim + channelStart;
+             DataCopy(yGm[outOffset], outSlotT, baseDim);
+         }
          if (t + 2 < len) {
              SetFlag<HardEvent::MTE3_V>(outMte3ToVEvent_[outSlot]);
          }
- 
+
          if (t + 2 < len) {
              SetFlag<HardEvent::V_MTE2>(inputVToMte2Event_);
          }
      }
  }
- 
+
  template <CAUSAL_CONV1D_TEMPLATE_ARGS>
  __aicore__ inline void CAUSAL_CONV1D_CLASS::DrainTaskMte3()
  {
