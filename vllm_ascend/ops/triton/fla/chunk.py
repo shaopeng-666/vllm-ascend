@@ -437,6 +437,39 @@ def chunk_gated_delta_rule(
     chunk_offsets: torch.Tensor | None = None,
     core_attn_out: torch.Tensor | None = None,
 ):
+    r"""
+    Gated Delta Rule chunk forward (head-first prefill path).
+
+    Args:
+        q (torch.Tensor):
+            queries of shape `[B, H, T, K]` (head-first).
+        k (torch.Tensor):
+            keys of shape `[B, H, T, K]` (head-first).
+        v (torch.Tensor):
+            values of shape `[B, T, H, V]` (time-first, transposed internally).
+        g (torch.Tensor):
+            (forget) gating tensor (in log space!) of shape `[B, T, H]` (time-first, transposed internally).
+        beta (torch.Tensor):
+            betas of shape `[B, T, H]` (time-first, transposed internally).
+        scale (Optional[float]):
+            Scale factor for the attention scores.
+            If not provided, defaults to `1 / sqrt(K)`. Default: `None`.
+        initial_state (Optional[torch.Tensor]):
+            Initial state of shape `[N, H, K, V]` for `N` input sequences.
+            Default: `None`.
+        output_final_state (Optional[bool]):
+            Whether to output the final state of shape `[N, H, K, V]`. Default: `False`.
+        cu_seqlens (torch.LongTensor):
+            Cumulative sequence lengths of shape `[N+1]` used for variable-length inputs.
+        use_qk_l2norm_in_kernel (bool):
+            Whether to apply L2 normalization to q/k inside the kernel. Default: `False`.
+
+    Returns:
+        o (torch.Tensor):
+            Outputs of shape `[B, T, H, V]`.
+        final_state (torch.Tensor):
+            Final state of shape `[N, H, K, V]` if `output_final_state=True` else `None`.
+    """
     assert q.dtype == k.dtype == v.dtype
     assert q.dtype != torch.float32, "ChunkGatedDeltaRuleFunction does not support float32. Please use bfloat16."
     assert len(beta.shape) == 3, "beta must be of shape [B, T, H]."
