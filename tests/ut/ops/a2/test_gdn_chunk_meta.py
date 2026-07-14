@@ -16,7 +16,8 @@
 import pytest
 import torch
 
-from vllm_ascend.ops.triton.fla import chunk, chunk_o, chunk_o_update
+from vllm_ascend.device.device_op import DeviceOperator
+from vllm_ascend.ops.triton.fla import chunk, chunk_o, chunk_o_update, chunk_scaled_dot_kkt
 from vllm_ascend.utils import enable_custom_op
 
 enable_custom_op()
@@ -555,3 +556,33 @@ def test_chunk_fwd_preserves_head_major_k_for_kkt_and_ascendc_calls(monkeypatch:
     assert captured["fwd_o"][2].shape == (1, 3, 5, 4)
     assert output.shape == (1, 5, 3, 4)
     assert final_state is initial_state
+
+
+def test_kkt_preserves_bth_gate_layout(monkeypatch: pytest.MonkeyPatch):
+    k = torch.randn(1, 2, 5, 4)
+    beta = torch.rand(1, 5, 3)
+    g_cumsum = torch.randn(1, 5, 3)
+    captured: dict[str, torch.Tensor] = {}
+
+    def fake_kkt(**kwargs):
+        captured["beta"] = kwargs["beta"]
+        captured["g_cumsum"] = kwargs["g_cumsum"]
+        return kwargs["A"]
+
+    monkeypatch.setattr(chunk_scaled_dot_kkt, "get_aicore_num", lambda: 1)
+    monkeypatch.setattr(
+        DeviceOperator,
+        "chunk_scaled_dot_kkt_fwd",
+        staticmethod(fake_kkt),
+    )
+
+    A = chunk_scaled_dot_kkt.chunk_scaled_dot_kkt_fwd(
+        k=k,
+        beta=beta,
+        g_cumsum=g_cumsum,
+        chunk_size=2,
+    )
+
+    assert captured["beta"] is beta
+    assert captured["g_cumsum"] is g_cumsum
+    assert A.shape == (1, 5, 3, 2)

@@ -32,8 +32,8 @@ logger = logging.getLogger(__name__)
 @triton.jit(do_not_specialize=["T", "B", "bh_step", "task_num", "num_core"])
 def chunk_scaled_dot_kkt_fwd_kernel(
     k,
-    beta,  # [H, B, T]
-    g_cumsum,  # [H, B, T]
+    beta,  # [B, T, H]
+    g_cumsum,  # [B, T, H]
     A,
     cu_seqlens,
     chunk_indices,
@@ -53,7 +53,6 @@ def chunk_scaled_dot_kkt_fwd_kernel(
     # Keep the original physical sequence stride for BHTD K addressing. In
     # varlen mode T below becomes the current sequence length.
     T_max = T
-    bt_stride = B * T
     core_id = tl.program_id(0)
 
     for task_id in tl.range(core_id, task_num, num_core):
@@ -75,7 +74,7 @@ def chunk_scaled_dot_kkt_fwd_kernel(
         o_t = tl.arange(0, BT)
         o_t_fp32 = o_t.to(tl.float32)
 
-        p_beta = tl.make_block_ptr(beta + i_h * bt_stride + bos, (T,), (1,), (i_t * BT,), (BT,), (0,))
+        p_beta = tl.make_block_ptr(beta + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
         b_beta = tl.load(p_beta, boundary_check=(0,))
 
         b_A = tl.zeros([BT, BT], dtype=tl.float32)
@@ -87,7 +86,7 @@ def chunk_scaled_dot_kkt_fwd_kernel(
             b_A += tl.dot(b_k, tl.trans(b_k))
 
         if USE_G:
-            p_g = tl.make_block_ptr(g_cumsum + i_h * bt_stride + bos, (T,), (1,), (i_t * BT,), (BT,), (0,))
+            p_g = tl.make_block_ptr(g_cumsum + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
             b_g = tl.load(p_g, boundary_check=(0,))
             b_g_diff = b_g[:, None] - b_g[None, :]
             b_A *= safe_exp(b_g_diff)
@@ -156,8 +155,8 @@ def chunk_scaled_dot_kkt_fwd(
         bh_step=bh_step,
         task_num=task_num,
         k=k,
-        beta=torch.permute(beta, (2, 0, 1)).contiguous(),
-        g_cumsum=torch.permute(g_cumsum, (2, 0, 1)).contiguous(),
+        beta=beta,
+        g_cumsum=g_cumsum,
         A=A,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
