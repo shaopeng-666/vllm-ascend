@@ -201,13 +201,12 @@ def chunk_gated_delta_rule_fwd(
     k_bhtd = k.to(torch.bfloat16)
     v_bhtd = v
     beta_bht = beta.movedim(1, 2)
-    beta_bth = beta
     g_bht = g_bth.movedim(1, 2).contiguous()
 
     # Obtain WY representation. u is actually the new v.
     A = chunk_scaled_dot_kkt_fwd(
         k=k_bhtd,
-        beta=beta_bth,
+        beta=beta,
         g_cumsum=g_bth,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
