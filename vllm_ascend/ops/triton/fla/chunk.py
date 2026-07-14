@@ -188,9 +188,9 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens_host = _as_host_tuple(cu_seqlens)
     if chunk_indices_chunk64_host is None and chunk_indices is not None:
         chunk_indices_chunk64_host = _as_host_tuple(chunk_indices)
-    # Conv1D and the AscendC recompute/fwd-h/fwd-o kernels consume BHTD.
-    # g/beta retain the BTH layout emitted by fused_gdn_gating. Only KKT and
-    # the AscendC gate input require materialized layout conversions.
+    # Conv1D, KKT, and the AscendC recompute/fwd-h/fwd-o kernels consume BHTD.
+    # g/beta retain the BTH layout emitted by fused_gdn_gating. Only the
+    # AscendC gate input requires a materialized layout conversion.
     g_bth = chunk_local_cumsum(
         g,
         chunk_size=chunk_size,
@@ -200,14 +200,13 @@ def chunk_gated_delta_rule_fwd(
     q_bhtd = q.to(torch.bfloat16)
     k_bhtd = k.to(torch.bfloat16)
     v_bhtd = v
-    k_bthd = k_bhtd.movedim(1, 2).contiguous()
     beta_bht = beta.movedim(1, 2)
     beta_bth = beta
     g_bht = g_bth.movedim(1, 2).contiguous()
 
     # Obtain WY representation. u is actually the new v.
     A = chunk_scaled_dot_kkt_fwd(
-        k=k_bthd,
+        k=k_bhtd,
         beta=beta_bth,
         g_cumsum=g_bth,
         cu_seqlens=cu_seqlens,
@@ -251,6 +250,8 @@ def chunk_gated_delta_rule_fwd(
         actual_num_decodes = getattr(prebuilt_meta, "num_decodes", None)
         if actual_num_decodes is None:
             actual_num_decodes = num_decodes
+        # The PCP h-update kernel still has a BTHD interface.
+        k_bthd = k_bhtd.movedim(1, 2).contiguous()
         h_update = chunk_gated_delta_rule_fwd_hupdate(
             k=k_bthd,
             w=w.movedim(1, 2).contiguous(),

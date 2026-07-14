@@ -487,14 +487,14 @@ def test_chunk_ascendc_wrappers_preserve_bhtd_layout(monkeypatch: pytest.MonkeyP
     assert captures["fwd_o_g"] is g
 
 
-def test_chunk_fwd_converts_to_bhtd_once_before_ascendc_calls(monkeypatch: pytest.MonkeyPatch):
-    q = torch.randn(1, 5, 2, 4, dtype=torch.bfloat16)
+def test_chunk_fwd_preserves_head_major_k_for_kkt_and_ascendc_calls(monkeypatch: pytest.MonkeyPatch):
+    q = torch.randn(1, 2, 5, 4, dtype=torch.bfloat16)
     k = torch.randn_like(q)
-    v = torch.randn(1, 5, 3, 4, dtype=torch.bfloat16)
+    v = torch.randn(1, 3, 5, 4, dtype=torch.bfloat16)
     g = torch.randn(1, 5, 3, dtype=torch.float32)
     beta = torch.rand(1, 5, 3, dtype=torch.bfloat16)
     initial_state = torch.randn(1, 3, 4, 4, dtype=torch.bfloat16)
-    captured: dict[str, tuple[torch.Tensor, ...]] = {}
+    captured: dict[str, tuple[torch.Tensor, ...] | torch.Tensor] = {}
 
     monkeypatch.setattr(chunk, "get_forward_context", lambda: type("Ctx", (), {"attn_metadata": None})())
     monkeypatch.setattr(
@@ -503,11 +503,11 @@ def test_chunk_fwd_converts_to_bhtd_once_before_ascendc_calls(monkeypatch: pytes
         lambda: type("Group", (), {"world_size": 1, "rank_in_group": 0})(),
     )
     monkeypatch.setattr(chunk, "chunk_local_cumsum", lambda value, **kwargs: value)
-    monkeypatch.setattr(
-        chunk,
-        "chunk_scaled_dot_kkt_fwd",
-        lambda **kwargs: torch.empty(1, 5, 3, 2, dtype=torch.float32),
-    )
+    def fake_kkt(**kwargs):
+        captured["kkt_k"] = kwargs["k"]
+        return torch.empty(1, 5, 3, 2, dtype=torch.float32)
+
+    monkeypatch.setattr(chunk, "chunk_scaled_dot_kkt_fwd", fake_kkt)
     monkeypatch.setattr(chunk, "solve_tril", lambda A, **kwargs: A)
 
     def fake_recompute(**kwargs):
@@ -544,6 +544,7 @@ def test_chunk_fwd_converts_to_bhtd_once_before_ascendc_calls(monkeypatch: pytes
         output_final_state=True,
     )
 
+    assert captured["kkt_k"] is k
     assert captured["recompute"][0].shape == (1, 2, 5, 4)
     assert captured["recompute"][1].shape == (1, 3, 5, 4)
     assert captured["recompute"][2].shape == (1, 3, 5)
