@@ -51,6 +51,8 @@ def chunk_scaled_dot_kkt_fwd_kernel(
         i_t_i = task_id // bh_step
         i_bh = task_id % bh_step
         i_b, i_h = i_bh // H, i_bh % H
+        head_kv = i_h // (H // Hg)
+        T_max = T
         if IS_VARLEN:
             i_n, i_t = (
                 tl.load(chunk_indices + i_t_i * 2).to(tl.int32),
@@ -58,9 +60,11 @@ def chunk_scaled_dot_kkt_fwd_kernel(
             )
             bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
             T = eos - bos
+            k_base = k + head_kv * T_max * K + bos * K
         else:
             bos, eos = i_b * T, i_b * T + T
             i_t = i_t_i
+            k_base = k + (i_b * Hg + head_kv) * T * K
         o_t = tl.arange(0, BT)
         o_t_fp32 = o_t.to(tl.float32)
 
@@ -70,7 +74,7 @@ def chunk_scaled_dot_kkt_fwd_kernel(
         b_A = tl.zeros([BT, BT], dtype=tl.float32)
         for i_k in range(tl.cdiv(K, BK)):
             p_k = tl.make_block_ptr(
-                k + (bos * Hg + i_h // (H // Hg)) * K, (T, K), (Hg * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
+                k_base, (T, K), (K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
             )
             b_k = tl.load(p_k, boundary_check=(0, 1))
             b_A += tl.dot(b_k, tl.trans(b_k))
@@ -101,7 +105,7 @@ def chunk_scaled_dot_kkt_fwd(
 
     Args:
         k (torch.Tensor):
-            The key tensor of shape `[B, T, H, K]`.
+            The key tensor of shape `[B, H, T, K]` (head-first).
         beta (torch.Tensor):
             The beta tensor of shape `[B, H, T]` (head-first).
         g_cumsum (torch.Tensor):
@@ -117,7 +121,7 @@ def chunk_scaled_dot_kkt_fwd(
     Returns:
         beta * K * K^T of shape `[B, T, H, BT]` where `BT` is the chunk size.
     """
-    B, T, Hg, K = k.shape
+    B, Hg, T, K = k.shape
 
     H = beta.shape[1]
     BT = chunk_size

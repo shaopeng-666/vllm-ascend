@@ -206,10 +206,9 @@ def chunk_gated_delta_rule_fwd(
     g_hf = g.transpose(1, 2).contiguous()
     beta_hf = beta.transpose(1, 2).contiguous()
     v_hf = v.transpose(1, 2).contiguous()
-    k_for_triton = k.transpose(1, 2).contiguous()
 
     A = chunk_scaled_dot_kkt_fwd(
-        k=k_for_triton,
+        k=k,
         beta=beta_hf,
         g_cumsum=g_hf,
         cu_seqlens=cu_seqlens,
