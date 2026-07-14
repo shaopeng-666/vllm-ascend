@@ -12,11 +12,14 @@ import torch
 from vllm.distributed import get_pcp_group
 from vllm.forward_context import get_forward_context
 
+from vllm_ascend.device.device_op import DeviceOperator
+from vllm_ascend.ops.triton.triton_utils import get_aicore_num
+
 from .chunk_delta_hupdate import chunk_gated_delta_rule_fwd_hupdate
-from .chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
+from .chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd_kernel
 from .cumsum import chunk_local_cumsum
 from .l2norm import l2norm_fwd
-from .utils import input_guard, prepare_chunk_indices, prepare_final_chunk_indices
+from .utils import input_guard, prepare_chunk_indices, prepare_final_chunk_indices, safe_exp
 
 
 def _as_host_tuple(values):
@@ -212,33 +215,65 @@ def chunk_gated_delta_rule_fwd(
     beta_hf = beta.transpose(1, 2).contiguous()
     v_hf = v.contiguous()
 
-    A = chunk_scaled_dot_kkt_fwd(
+    # Inline chunk_scaled_dot_kkt_fwd to eliminate function call overhead
+    B, Hg, T, K = k.shape
+    H = beta_hf.shape[1]
+    BT = chunk_size
+    NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
+    A = torch.empty(B, T, H, BT, device=k.device, dtype=torch.float32)
+    num_core = get_aicore_num()
+    bh_step = B * H
+    task_num = NT * bh_step
+    A = DeviceOperator.chunk_scaled_dot_kkt_fwd(
+        num_core=num_core,
+        bh_step=bh_step,
+        task_num=task_num,
         k=k,
         beta=beta_hf,
         g_cumsum=g_hf,
+        A=A,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
-        output_dtype=torch.float32,
+        T=T,
+        B=B,
+        H=H,
+        Hg=Hg,
+        K=K,
+        BT=BT,
+        BK=128,
     )
-    A = solve_tril(
-        A=A,
+    
+    # Inline solve_tril to eliminate function call overhead
+    A_for_kernel = A.to(k.dtype).contiguous()
+    A_tnd = A_for_kernel.reshape(-1, A_for_kernel.shape[-2], A_for_kernel.shape[-1])
+    out = torch.ops._C_ascend.npu_solve_tri(
+        A_tnd,
         cu_seqlens=cu_seqlens_host,
-        chunk_indices_large_block=chunk_indices_large_block,
-        chunk_indices_bt=chunk_indices_chunk64_host,
-        output_dtype=k.dtype,
+        chunk_indices=chunk_indices_chunk64_host,
+        layout="tnd",
     )
+    A = out.reshape_as(A_for_kernel)
 
     A_hf = A.transpose(1, 2).contiguous()
 
-    w, u = recompute_w_u_fwd(
-        k=k,
-        v=v_hf,
-        beta=beta_hf,
-        A=A_hf,
-        g_cumsum=g_hf,
+    # Inline recompute_w_u_fwd to eliminate function call overhead
+    k_hf = k.contiguous()
+    v_hf_input = v_hf.contiguous()
+    beta_hf_input = beta_hf.to(g_hf.dtype).contiguous()
+    A_hf_input = A_hf.contiguous()
+    g_hf_input = g_hf.contiguous()
+    w, u = torch.ops._C_ascend.npu_recompute_wu_fwd(
+        k_hf,
+        v_hf_input,
+        beta_hf_input,
+        A_hf_input,
+        g_hf_input,
         cu_seqlens=cu_seqlens_host,
         chunk_indices=chunk_indices_chunk64_host,
+        chunk_size=chunk_size,
     )
+    w = w.contiguous()
+    u = u.contiguous()
 
     q_ascendc = q.to(torch.bfloat16).contiguous()
     k_ascendc = k.to(torch.bfloat16).contiguous()
