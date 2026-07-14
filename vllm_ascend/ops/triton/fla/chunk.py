@@ -90,19 +90,27 @@ def recompute_w_u_fwd(
     chunk_indices = _prepare_chunk_indices_if_needed(cu_seqlens, chunk_indices, chunk_size)
     if qk_head_first:
         k_hf = k.contiguous()
+        v_hf = v.contiguous()
+        beta_hf = beta.to(g_cumsum.dtype).contiguous()
+        A_hf = A.contiguous()
+        g_hf = g_cumsum.contiguous()
     else:
         k_hf = k.transpose(1, 2).contiguous()
+        v_hf = v.transpose(1, 2).contiguous()
+        beta_hf = beta.to(g_cumsum.dtype).transpose(1, 2).contiguous()
+        A_hf = A.transpose(1, 2).contiguous()
+        g_hf = g_cumsum.transpose(1, 2).contiguous()
     if _dbg:
         _ln = inspect.currentframe().f_lineno
-        logger.warning("[chunk.py:%d] recompute input: k_hf=%s v=%s beta=%s A=%s g=%s qk_head_first=%s",
-                       _ln, tuple(k_hf.shape), tuple(v.shape), tuple(beta.shape),
-                       tuple(A.shape), tuple(g_cumsum.shape), qk_head_first)
+        logger.warning("[chunk.py:%d] recompute input: k_hf=%s v_hf=%s beta_hf=%s A_hf=%s g_hf=%s qk_head_first=%s",
+                       _ln, tuple(k_hf.shape), tuple(v_hf.shape), tuple(beta_hf.shape),
+                       tuple(A_hf.shape), tuple(g_hf.shape), qk_head_first)
     w, u = torch.ops._C_ascend.npu_recompute_wu_fwd(
         k_hf,
-        v.transpose(1, 2).contiguous(),
-        beta.to(g_cumsum.dtype).transpose(1, 2).contiguous(),
-        A.transpose(1, 2).contiguous(),
-        g_cumsum.transpose(1, 2).contiguous(),
+        v_hf,
+        beta_hf,
+        A_hf,
+        g_hf,
         cu_seqlens=_as_host_tuple(cu_seqlens),
         chunk_indices=_as_host_tuple(chunk_indices),
         chunk_size=chunk_size,
@@ -228,18 +236,29 @@ def chunk_gated_delta_rule_fwd(
     if _dbg:
         _ln = inspect.currentframe().f_lineno
         logger.warning("[chunk.py:%d] after cumsum: g=%s qk_head_first=%s", _ln, tuple(g.shape), qk_head_first)
-    # obtain WY representation. u is actually the new v.
-    k_for_triton = k.transpose(1, 2).contiguous() if qk_head_first else k
+
+    if qk_head_first:
+        g_hf = g.transpose(1, 2).contiguous()
+        beta_hf = beta.transpose(1, 2).contiguous()
+        v_hf = v.transpose(1, 2).contiguous()
+        k_for_triton = k.transpose(1, 2).contiguous()
+    else:
+        g_hf = None
+        beta_hf = None
+        v_hf = None
+        k_for_triton = k
+
     if _dbg:
         _ln = inspect.currentframe().f_lineno
         logger.warning("[chunk.py:%d] k_for_triton=%s k=%s", _ln, tuple(k_for_triton.shape), tuple(k.shape))
     A = chunk_scaled_dot_kkt_fwd(
         k=k_for_triton,
-        beta=beta,
-        g_cumsum=g,
+        beta=beta_hf if qk_head_first else beta,
+        g_cumsum=g_hf if qk_head_first else g,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         output_dtype=torch.float32,
+        head_first=qk_head_first,
     )
     if _dbg:
         _ln = inspect.currentframe().f_lineno
@@ -254,12 +273,18 @@ def chunk_gated_delta_rule_fwd(
     if _dbg:
         _ln = inspect.currentframe().f_lineno
         logger.warning("[chunk.py:%d] after solve_tril: A=%s", _ln, tuple(A.shape))
+
+    if qk_head_first:
+        A_hf = A.transpose(1, 2).contiguous()
+    else:
+        A_hf = None
+
     w, u = recompute_w_u_fwd(
         k=k if qk_head_first else k_for_triton,
-        v=v,
-        beta=beta,
-        A=A,
-        g_cumsum=g,
+        v=v_hf if qk_head_first else v,
+        beta=beta_hf if qk_head_first else beta,
+        A=A_hf if qk_head_first else A,
+        g_cumsum=g_hf if qk_head_first else g,
         cu_seqlens=cu_seqlens_host,
         chunk_indices=chunk_indices_chunk64_host,
         qk_head_first=qk_head_first,
@@ -273,12 +298,13 @@ def chunk_gated_delta_rule_fwd(
         k_ascendc = k.to(torch.bfloat16).contiguous()
         w_ascendc = w.to(torch.bfloat16).contiguous()
         u_ascendc = u.to(torch.bfloat16).contiguous()
+        g_ascendc = g_hf.contiguous()
     else:
         q_ascendc = q.to(torch.bfloat16).transpose(1, 2).contiguous()
         k_ascendc = k.to(torch.bfloat16).transpose(1, 2).contiguous()
         w_ascendc = w.to(torch.bfloat16).transpose(1, 2).contiguous()
         u_ascendc = u.to(torch.bfloat16).transpose(1, 2).contiguous()
-    g_ascendc = g.transpose(1, 2).contiguous()
+        g_ascendc = g.transpose(1, 2).contiguous()
     if _dbg:
         _ln = inspect.currentframe().f_lineno
         logger.warning("[chunk.py:%d] ascendc: q=%s k=%s w=%s u=%s g=%s",

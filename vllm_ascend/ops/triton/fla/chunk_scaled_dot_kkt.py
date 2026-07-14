@@ -101,6 +101,7 @@ def chunk_scaled_dot_kkt_fwd(
     chunk_indices: torch.Tensor | None = None,
     chunk_size: int = 64,
     output_dtype: torch.dtype = torch.float32,
+    head_first: bool = False,
 ) -> torch.Tensor:
     r"""
     Compute beta * K * K^T.
@@ -109,9 +110,9 @@ def chunk_scaled_dot_kkt_fwd(
         k (torch.Tensor):
             The key tensor of shape `[B, T, H, K]`.
         beta (torch.Tensor):
-            The beta tensor of shape `[B, T, H]`.
+            The beta tensor of shape `[B, T, H]` if not head_first else `[B, H, T]`.
         g (torch.Tensor):
-            The cumulative sum of the gate tensor of shape `[B, T, H]`. Default: `None`.
+            The cumulative sum of the gate tensor of shape `[B, T, H]` if not head_first else `[B, H, T]`. Default: `None`.
         gk (torch.Tensor):
             The cumulative sum of the gate tensor of shape `[B, T, H, K]` applied to the key tensor. Default: `None`.
         cu_seqlens (torch.LongTensor):
@@ -121,13 +122,15 @@ def chunk_scaled_dot_kkt_fwd(
             The chunk size. Default: 64.
         output_dtype (torch.dtype):
             The dtype of the output tensor. Default: `torch.float32`
+        head_first (bool):
+            If True, beta and g_cumsum are already in head-first `[B, H, T]` format.
 
     Returns:
         beta * K * K^T of shape `[B, T, H, BT]` where `BT` is the chunk size.
     """
     B, T, Hg, K = k.shape
 
-    H = beta.shape[-1]
+    H = beta.shape[1] if head_first else beta.shape[-1]
     BT = chunk_size
     if cu_seqlens is not None and chunk_indices is None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
@@ -146,13 +149,20 @@ def chunk_scaled_dot_kkt_fwd(
         logger.warning("[chunk_scaled_dot_kkt.py:%d] kkt input: k=%s beta=%s g_cumsum=%s",
                        _ln, tuple(k.shape), tuple(beta.shape), tuple(g_cumsum.shape))
 
+    if head_first:
+        beta_hf = beta.contiguous()
+        g_hf = g_cumsum.contiguous()
+    else:
+        beta_hf = torch.permute(beta, (2, 0, 1)).contiguous()
+        g_hf = torch.permute(g_cumsum, (2, 0, 1)).contiguous()
+
     A = DeviceOperator.chunk_scaled_dot_kkt_fwd(
         num_core=num_core,
         bh_step=bh_step,
         task_num=task_num,
         k=k,
-        beta=torch.permute(beta, (2, 0, 1)).contiguous(),
-        g_cumsum=torch.permute(g_cumsum, (2, 0, 1)).contiguous(),
+        beta=beta_hf,
+        g_cumsum=g_hf,
         A=A,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
