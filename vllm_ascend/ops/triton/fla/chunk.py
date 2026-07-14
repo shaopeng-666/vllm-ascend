@@ -11,9 +11,6 @@
 import torch
 from vllm.distributed import get_pcp_group
 from vllm.forward_context import get_forward_context
-from vllm.model_executor.layers.fla.ops.utils import SUPPRESS_LEVEL
-
-from vllm_ascend import envs as ascend_envs
 
 from .chunk_delta_hupdate import chunk_gated_delta_rule_fwd_hupdate
 from .chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
@@ -339,12 +336,7 @@ def chunk_gated_delta_rule_fwd(
     )
 
     o = o_ascendc.to(torch.bfloat16).transpose(1, 2).contiguous()
-
-    if SUPPRESS_LEVEL >= 3:
-        v_new = v_new.to(torch.bfloat16).transpose(1, 2).contiguous()
-        h = h.to(torch.bfloat16).transpose(1, 2).contiguous()
-        return g, o, A, final_state, w, h, v_new
-    return g, o, A, final_state, None, None, None
+    return o, final_state
 
 
 class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
@@ -367,7 +359,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         if use_qk_l2norm_in_kernel:
             q = l2norm_fwd(q)
             k = l2norm_fwd(k)
-        _, o, _, final_state, _, _, _ = chunk_gated_delta_rule_fwd(
+        o, final_state = chunk_gated_delta_rule_fwd(
             q=q,
             k=k,
             v=v,
