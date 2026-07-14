@@ -70,6 +70,22 @@ def _to_token_major(tensor: torch.Tensor, head_major: bool) -> torch.Tensor:
     return tensor.movedim(0, 1).contiguous() if head_major else tensor
 
 
+def _should_use_head_major_conv(
+    attn_metadata: GDNAttentionMetadata,
+    pcp_world_size: int,
+    head_k_dim: int,
+    head_v_dim: int,
+) -> bool:
+    # Decode runs recurrent_gated_delta_rule, which consumes TND directly.
+    # Reserve head-major Conv1D for batches that execute the chunk prefill path.
+    return (
+        ascend_envs.VLLM_ASCEND_GDN_CONV_HEAD_FIRST
+        and attn_metadata.num_prefills > 0
+        and pcp_world_size <= 1
+        and head_k_dim == head_v_dim
+    )
+
+
 class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
     def _split_ba_for_tp(self, ba: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if hasattr(self, "split_ba"):
@@ -215,10 +231,11 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         conv_weights = self.conv1d.weight.view(self.conv1d.weight.size(0), self.conv1d.weight.size(2))
         num_k_heads = self.num_k_heads // self.tp_size
         num_v_heads = self.num_v_heads // self.tp_size
-        use_head_major_conv = (
-            ascend_envs.VLLM_ASCEND_GDN_CONV_HEAD_FIRST
-            and get_pcp_group().world_size <= 1
-            and self.head_k_dim == self.head_v_dim
+        use_head_major_conv = _should_use_head_major_conv(
+            attn_metadata,
+            get_pcp_group().world_size,
+            self.head_k_dim,
+            self.head_v_dim,
         )
         # The head-aware Conv1D kernel needs every Q/K/V head, not only K heads.
         conv_head_num = 2 * num_k_heads + num_v_heads if use_head_major_conv else 0

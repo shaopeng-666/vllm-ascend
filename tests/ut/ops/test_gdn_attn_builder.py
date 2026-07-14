@@ -13,7 +13,12 @@ from vllm.v1.kv_cache_interface import MambaSpec
 
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.ops import gdn_attn_builder as ascend_gdn_attn_builder
-from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention, _allocate_conv_output, _split_head_major_qkv
+from vllm_ascend.ops.gdn import (
+    AscendGatedDeltaNetAttention,
+    _allocate_conv_output,
+    _should_use_head_major_conv,
+    _split_head_major_qkv,
+)
 from vllm_ascend.ops.gdn_attn_builder import (
     AscendGDNAttentionBackend,
     AscendGDNAttentionMetadataBuilder,
@@ -821,3 +826,21 @@ def test_head_major_conv_qkv_split_preserves_head_major_tensors():
 
     output = _allocate_conv_output(mixed_qkv.movedim(0, 1).reshape(num_tokens, -1), 7, head_dim)
     assert output.shape == (7, num_tokens, head_dim)
+
+
+@pytest.mark.parametrize(
+    ("num_prefills", "expected"),
+    [(0, False), (1, True)],
+)
+def test_head_major_conv_is_reserved_for_prefill(monkeypatch, num_prefills, expected):
+    monkeypatch.setenv("VLLM_ASCEND_GDN_CONV_HEAD_FIRST", "1")
+
+    assert (
+        _should_use_head_major_conv(
+            SimpleNamespace(num_prefills=num_prefills),
+            pcp_world_size=1,
+            head_k_dim=128,
+            head_v_dim=128,
+        )
+        is expected
+    )
