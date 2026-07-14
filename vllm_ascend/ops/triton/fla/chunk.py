@@ -179,39 +179,55 @@ def chunk_gated_delta_rule_fwd(
     cu_seqlens: torch.LongTensor | None = None,
     prebuilt_meta=None,
 ):
-    forward_context = get_forward_context()
-    num_decodes = 0
-    attn_metadata = forward_context.attn_metadata
-    if attn_metadata is not None and isinstance(attn_metadata, dict):
-        attn_metadata = next(iter(attn_metadata.values()), None)
-    if attn_metadata is not None:
-        num_decodes = attn_metadata.num_decodes
     chunk_size = 64
-    block_indices_cumsum = None if prebuilt_meta is None else prebuilt_meta.block_indices_cumsum
-    cu_seqlens_host = None if prebuilt_meta is None else prebuilt_meta.cu_seqlens_host
-    chunk_indices_chunk64 = None if prebuilt_meta is None else prebuilt_meta.chunk_indices_chunk64
-    chunk_indices_chunk64_host = None if prebuilt_meta is None else prebuilt_meta.chunk_indices_chunk64_host
-    chunk_offsets_chunk64 = None if prebuilt_meta is None else prebuilt_meta.chunk_offsets_chunk64
-    update_chunk_offsets_chunk64 = None if prebuilt_meta is None else prebuilt_meta.update_chunk_offsets_chunk64
-    final_chunk_indices_chunk64 = None if prebuilt_meta is None else prebuilt_meta.final_chunk_indices_chunk64
-    chunk_indices_large_block = None if prebuilt_meta is None else prebuilt_meta.chunk_indices_large_block
+    
+    # Unpack prebuilt_meta with tuple unpacking to reduce attribute access overhead
+    if prebuilt_meta is not None:
+        (block_indices_cumsum, cu_seqlens_host, chunk_indices_chunk64, 
+         chunk_indices_chunk64_host, chunk_offsets_chunk64, update_chunk_offsets_chunk64,
+         final_chunk_indices_chunk64, chunk_indices_large_block) = (
+            prebuilt_meta.block_indices_cumsum,
+            prebuilt_meta.cu_seqlens_host,
+            prebuilt_meta.chunk_indices_chunk64,
+            prebuilt_meta.chunk_indices_chunk64_host,
+            prebuilt_meta.chunk_offsets_chunk64,
+            prebuilt_meta.update_chunk_offsets_chunk64,
+            prebuilt_meta.final_chunk_indices_chunk64,
+            prebuilt_meta.chunk_indices_large_block,
+        )
+    else:
+        block_indices_cumsum = None
+        cu_seqlens_host = None
+        chunk_indices_chunk64 = None
+        chunk_indices_chunk64_host = None
+        chunk_offsets_chunk64 = None
+        update_chunk_offsets_chunk64 = None
+        final_chunk_indices_chunk64 = None
+        chunk_indices_large_block = None
 
-    cu_seqlens = None if cu_seqlens is None else cu_seqlens.to(torch.int64)
+    # Avoid unnecessary dtype conversion if already int64
+    if cu_seqlens is not None and cu_seqlens.dtype != torch.int64:
+        cu_seqlens = cu_seqlens.to(torch.int64)
+    
     if cu_seqlens is not None and chunk_indices_chunk64 is None and chunk_indices_chunk64_host is None:
         chunk_indices_chunk64 = prepare_chunk_indices(cu_seqlens, chunk_size)
+    
     chunk_indices = None if chunk_indices_chunk64 is None else chunk_indices_chunk64.to(torch.int64)
+    
     if cu_seqlens_host is None and cu_seqlens is not None:
         cu_seqlens_host = _as_host_tuple(cu_seqlens)
     if chunk_indices_chunk64_host is None and chunk_indices is not None:
         chunk_indices_chunk64_host = _as_host_tuple(chunk_indices)
-    g = chunk_local_cumsum(
+    
+    # Method 4: Use head_first=True to directly output head-first format, avoiding transpose
+    g_hf = chunk_local_cumsum(
         g,
         chunk_size=chunk_size,
         cu_seqlens=cu_seqlens,
         block_indices=block_indices_cumsum,
+        head_first=True,
     )
 
-    g_hf = g.transpose(1, 2).contiguous()
     beta_hf = beta.transpose(1, 2).contiguous()
     v_hf = v.contiguous()
 
