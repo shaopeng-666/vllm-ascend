@@ -205,7 +205,7 @@ def chunk_gated_delta_rule_fwd(
 
     g_hf = g.transpose(1, 2).contiguous()
     beta_hf = beta.transpose(1, 2).contiguous()
-    v_hf = v.transpose(1, 2).contiguous()
+    v_hf = v.contiguous()
 
     A = chunk_scaled_dot_kkt_fwd(
         k=k,
