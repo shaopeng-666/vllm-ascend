@@ -18,6 +18,7 @@ from vllm_ascend.ops.gdn import (
     _allocate_conv_output,
     _should_use_head_major_conv,
     _split_head_major_qkv,
+    _to_token_major,
 )
 from vllm_ascend.ops.gdn_attn_builder import (
     AscendGDNAttentionBackend,
@@ -844,3 +845,14 @@ def test_head_major_conv_is_reserved_for_prefill(monkeypatch, num_prefills, expe
         )
         is expected
     )
+
+
+def test_to_token_major_materializes_mixed_decode_head_major_slice():
+    mixed_qkv = torch.arange(1 * 4 * 6 * 5, dtype=torch.float32).view(1, 4, 6, 5)
+    decode_slice = mixed_qkv[:, :, :2]
+
+    token_major = _to_token_major(decode_slice, head_major=True)
+
+    assert token_major.shape == (2, 4, 5)
+    assert token_major.is_contiguous()
+    torch.testing.assert_close(token_major, decode_slice.squeeze(0).movedim(0, 1))

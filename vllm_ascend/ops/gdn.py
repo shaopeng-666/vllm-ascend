@@ -65,9 +65,24 @@ def _split_head_major_qkv(
 
 
 def _to_token_major(tensor: torch.Tensor, head_major: bool) -> torch.Tensor:
-    # The recurrent custom op only accepts TND. Prefill does not use this path.
+    # The recurrent custom op only accepts contiguous TND. Prefill does not use
+    # this path, but mixed batches can slice a non-contiguous BHTD decode view.
     tensor = tensor.squeeze(0)
-    return tensor.movedim(0, 1).contiguous() if head_major else tensor
+    if head_major:
+        tensor = tensor.movedim(0, 1)
+    return tensor.contiguous()
+
+
+def _prepare_recurrent_qkv(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    head_major: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    query = l2norm_fwd(_to_token_major(query, head_major))
+    key = l2norm_fwd(_to_token_major(key, head_major))
+    value = _to_token_major(value, head_major)
+    return query, key, value
 
 
 def _should_use_head_major_conv(
@@ -438,16 +453,20 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         # 2.1: Process the multi-query part
         if spec_sequence_masks is not None:
             actual_seq_lengths = attn_metadata.spec_decode_metadata.actual_seq_lengths
-            query_spec = l2norm_fwd(query_spec)
-            key_spec = l2norm_fwd(key_spec)
+            query_spec, key_spec, value_spec = _prepare_recurrent_qkv(
+                query_spec,
+                key_spec,
+                value_spec,
+                use_head_major_conv,
+            )
             # Dispatches to the vllm-ascend AscendC custom operator
             # (csrc/recurrent_gated_delta_rule), NOT the built-in CANN operator.
             # The custom op extends dtype support (e.g. float32 state) and is
             # loaded at runtime via ASCEND_CUSTOM_OPP_PATH.
             core_attn_out_spec = torch.ops._C_ascend.npu_recurrent_gated_delta_rule(
-                query=_to_token_major(query_spec, use_head_major_conv),
-                key=_to_token_major(key_spec, use_head_major_conv),
-                value=_to_token_major(value_spec, use_head_major_conv),
+                query=query_spec,
+                key=key_spec,
+                value=value_spec,
                 g=g_spec.squeeze(0),
                 beta=beta_spec.squeeze(0),
                 state=ssm_state,
@@ -473,12 +492,16 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     mixed_qkv_non_spec[:num_decode_tokens]
                 )
             actual_seq_lengths = attn_metadata.non_spec_decode_metadata.actual_seq_lengths
-            query_decode = l2norm_fwd(query_decode)
-            key_decode = l2norm_fwd(key_decode)
+            query_decode, key_decode, value_decode = _prepare_recurrent_qkv(
+                query_decode,
+                key_decode,
+                value_decode,
+                use_head_major_conv,
+            )
             core_attn_out_decode = torch.ops._C_ascend.npu_recurrent_gated_delta_rule(
-                query=_to_token_major(query_decode, use_head_major_conv),
-                key=_to_token_major(key_decode, use_head_major_conv),
-                value=_to_token_major(value_decode, use_head_major_conv),
+                query=query_decode,
+                key=key_decode,
+                value=value_decode,
                 g=g_non_spec[:, :num_decode_tokens].squeeze(0),
                 beta=beta_non_spec[:, :num_decode_tokens].squeeze(0),
                 state=ssm_state,
@@ -534,14 +557,18 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 )
         elif attn_metadata.num_decodes > 0:
             actual_seq_lengths = attn_metadata.non_spec_decode_metadata.actual_seq_lengths
-            query_non_spec = l2norm_fwd(query_non_spec)
-            key_non_spec = l2norm_fwd(key_non_spec)
+            query_non_spec, key_non_spec, value_non_spec = _prepare_recurrent_qkv(
+                query_non_spec,
+                key_non_spec,
+                value_non_spec,
+                use_head_major_conv,
+            )
             # Dispatches to the vllm-ascend AscendC custom operator
             # (csrc/recurrent_gated_delta_rule), NOT the built-in CANN operator.
             core_attn_out_non_spec = torch.ops._C_ascend.npu_recurrent_gated_delta_rule(
-                query=_to_token_major(query_non_spec, use_head_major_conv),
-                key=_to_token_major(key_non_spec, use_head_major_conv),
-                value=_to_token_major(value_non_spec, use_head_major_conv),
+                query=query_non_spec,
+                key=key_non_spec,
+                value=value_non_spec,
                 g=g_non_spec.squeeze(0) if g_non_spec is not None else g_non_spec,
                 beta=beta_non_spec.squeeze(0) if beta_non_spec is not None else beta_non_spec,
                 state=ssm_state,
