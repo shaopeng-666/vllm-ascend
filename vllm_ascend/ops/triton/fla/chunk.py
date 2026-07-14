@@ -48,22 +48,14 @@ def solve_tril(
 ) -> torch.Tensor:
     del chunk_indices_large_block
     output_dtype = A.dtype if output_dtype is None else output_dtype
-    
-    # 优化：避免重复的 dtype 转换
-    if A.dtype != output_dtype:
-        A_for_kernel = A.to(output_dtype).contiguous()
-    else:
-        A_for_kernel = A if A.is_contiguous() else A.contiguous()
-    
+    A_for_kernel = A.to(output_dtype).contiguous()
     if cu_seqlens is None:
         return torch.ops._C_ascend.npu_solve_tri(A_for_kernel, layout="bsnd")
 
-    # 优化：内联 _prepare_chunk_indices_if_needed
     chunk_size = A_for_kernel.shape[-1]
     if cu_seqlens is not None and chunk_indices_bt is None:
         chunk_indices_bt = prepare_chunk_indices(cu_seqlens, chunk_size)
-    
-    # 优化：cu_seqlens 和 chunk_indices_bt 已经是 tuple（来自 prebuilt_meta），直接用
+
     A_tnd = A_for_kernel.reshape(-1, A_for_kernel.shape[-2], A_for_kernel.shape[-1])
     out = torch.ops._C_ascend.npu_solve_tri(
         A_tnd,
@@ -84,18 +76,13 @@ def recompute_w_u_fwd(
     chunk_indices=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     chunk_size = A.shape[-1]
-    
-    # 优化：内联 _prepare_chunk_indices_if_needed
     if cu_seqlens is not None and chunk_indices is None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
-    
     k_hf = k.contiguous()
     v_hf = v.contiguous()
     beta_hf = beta.to(g_cumsum.dtype).contiguous()
     A_hf = A.contiguous()
     g_hf = g_cumsum.contiguous()
-    
-    # 优化：cu_seqlens 和 chunk_indices 已经是 tuple（来自 prebuilt_meta），直接用
     w, u = torch.ops._C_ascend.npu_recompute_wu_fwd(
         k_hf,
         v_hf,
@@ -123,12 +110,8 @@ def chunk_gated_delta_rule_fwd_h(
     chunk_offsets: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     del chunk_offsets
-    
-    # 优化：内联 _prepare_chunk_indices_if_needed
     if cu_seqlens is not None and chunk_indices is None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
-    
-    # 优化：cu_seqlens 和 chunk_indices 已经是 tuple（来自 prebuilt_meta），直接用
     h, v_new, final_state = torch.ops._C_ascend.chunk_gated_delta_rule_fwd_h(
         k.to(torch.bfloat16).transpose(1, 2).contiguous(),
         w.to(torch.bfloat16).transpose(1, 2).contiguous(),
@@ -161,15 +144,10 @@ def chunk_fwd_o(
     del chunk_offsets
     if scale is None:
         scale = k.shape[-1] ** -0.5
-    
-    # 优化：内联 _prepare_chunk_indices_if_needed
     chunk_indices = None
     if cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
-    
     h_for_kernel = h.transpose(1, 2).contiguous() if h.dim() == 5 else h
-    
-    # 优化：cu_seqlens 和 chunk_indices 已经是 tuple（来自 prebuilt_meta），直接用
     out = torch.ops._C_ascend.chunk_fwd_o(
         q.to(torch.bfloat16).transpose(1, 2).contiguous(),
         k.to(torch.bfloat16).transpose(1, 2).contiguous(),
