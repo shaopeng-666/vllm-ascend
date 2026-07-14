@@ -8,8 +8,6 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # ruff: noqa: E501
 # mypy: ignore-errors
-import warnings
-
 import torch
 from vllm.distributed import get_pcp_group
 from vllm.forward_context import get_forward_context
@@ -82,7 +80,7 @@ def recompute_w_u_fwd(
     return torch.ops._C_ascend.npu_recompute_wu_fwd(
         k,
         v,
-        beta.to(g_cumsum.dtype).contiguous(),
+        beta.to(g_cumsum.dtype),
         A,
         g_cumsum,
         cu_seqlens=_as_host_tuple(cu_seqlens),
@@ -164,7 +162,6 @@ def chunk_gated_delta_rule_fwd(
     output_final_state: bool,
     cu_seqlens: torch.LongTensor | None = None,
     prebuilt_meta=None,
-    head_first: bool = False,
 ):
     forward_context = get_forward_context()
     num_decodes = 0
@@ -191,38 +188,22 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens_host = _as_host_tuple(cu_seqlens)
     if chunk_indices_chunk64_host is None and chunk_indices is not None:
         chunk_indices_chunk64_host = _as_host_tuple(chunk_indices)
-    if head_first:
-        # Preserve Conv1D's BHTD layout for recompute, fwd-h, and fwd-o.
-        # KKT/solve-tri remain token-major, so only that side path converts.
-        # The varlen cumsum and KKT helpers are token-major. Keep this
-        # auxiliary gate/WY path BTH while Q/K/V stay BHTD end-to-end.
-        g_bth = chunk_local_cumsum(
-            g.movedim(1, 2).contiguous(),
-            chunk_size=chunk_size,
-            cu_seqlens=cu_seqlens,
-            block_indices=block_indices_cumsum,
-        )
-        q_bhtd = q.to(torch.bfloat16).contiguous()
-        k_bhtd = k.to(torch.bfloat16).contiguous()
-        v_bhtd = v.contiguous()
-        beta_bht = beta
-        k_bthd = k_bhtd.movedim(1, 2).contiguous()
-        beta_bth = beta_bht.movedim(1, 2).contiguous()
-        g_bht = g_bth.movedim(1, 2).contiguous()
-    else:
-        g_bth = chunk_local_cumsum(
-            g,
-            chunk_size=chunk_size,
-            cu_seqlens=cu_seqlens,
-            block_indices=block_indices_cumsum,
-        )
-        q_bhtd = q.to(torch.bfloat16).movedim(1, 2).contiguous()
-        k_bhtd = k.to(torch.bfloat16).movedim(1, 2).contiguous()
-        v_bhtd = v.movedim(1, 2).contiguous()
-        beta_bht = beta.movedim(2, 1).contiguous()
-        g_bht = g_bth.movedim(2, 1).contiguous()
-        k_bthd = k
-        beta_bth = beta
+    # Conv1D and the AscendC recompute/fwd-h/fwd-o kernels consume BHTD.
+    # g/beta retain the BTH layout emitted by fused_gdn_gating. Only KKT and
+    # the AscendC gate input require materialized layout conversions.
+    g_bth = chunk_local_cumsum(
+        g,
+        chunk_size=chunk_size,
+        cu_seqlens=cu_seqlens,
+        block_indices=block_indices_cumsum,
+    )
+    q_bhtd = q.to(torch.bfloat16)
+    k_bhtd = k.to(torch.bfloat16)
+    v_bhtd = v
+    k_bthd = k_bhtd.movedim(1, 2).contiguous()
+    beta_bht = beta.movedim(1, 2)
+    beta_bth = beta
+    g_bht = g_bth.movedim(1, 2).contiguous()
 
     # Obtain WY representation. u is actually the new v.
     A = chunk_scaled_dot_kkt_fwd(
@@ -367,7 +348,6 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         output_final_state: bool,
         cu_seqlens: torch.LongTensor | None = None,
         prebuilt_meta=None,
-        head_first: bool = False,
         use_qk_l2norm_in_kernel: bool = False,
     ):
         if use_qk_l2norm_in_kernel:
@@ -384,7 +364,6 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
             prebuilt_meta=prebuilt_meta,
-            head_first=head_first,
         )
         ctx.scale = scale
         ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
@@ -403,7 +382,6 @@ def chunk_gated_delta_rule(
     output_final_state: bool = False,
     cu_seqlens: torch.LongTensor | None = None,
     prebuilt_meta=None,
-    head_first: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
     chunk_indices: torch.Tensor | None = None,
     chunk_offsets: torch.Tensor | None = None,
@@ -412,15 +390,15 @@ def chunk_gated_delta_rule(
     r"""
     Args:
         q (torch.Tensor):
-            queries of shape `[B, T, H, K]` if `head_first=False` else `[B, H, T, K]`.
+            queries of shape `[B, H, T, K]`.
         k (torch.Tensor):
-            keys of shape `[B, T, H, K]` if `head_first=False` else `[B, H, T, K]`.
+            keys of shape `[B, H, T, K]`.
         v (torch.Tensor):
-            values of shape `[B, T, H, V]` if `head_first=False` else `[B, H, T, V]`.
+            values of shape `[B, H, T, V]`.
         g (torch.Tensor):
-            (forget) gating tensor (in log space!) of shape `[B, T, H]` if `head_first=False` else `[B, H, T]`.
+            (forget) gating tensor (in log space!) of shape `[B, T, H]`.
         beta (torch.Tensor):
-            betas of shape `[B, T, H]` if `head_first=False` else `[B, H, T]`.
+            betas of shape `[B, T, H]`.
         scale (Optional[int]):
             Scale factor for the RetNet attention scores.
             If not provided, it will default to `1 / sqrt(K)`. Default: `None`.
@@ -433,13 +411,9 @@ def chunk_gated_delta_rule(
         cu_seqlens (torch.LongTensor):
             Cumulative sequence lengths of shape `[N+1]` used for variable-length training,
             consistent with the FlashAttention API.
-        head_first (Optional[bool]):
-            Whether the inputs are in the head-first format, which is not supported for variable-length inputs.
-            Default: `False`.
-
     Returns:
         o (torch.Tensor):
-            Outputs of shape `[B, T, H, V]` if `head_first=False` else `[B, H, T, V]`.
+            Outputs of shape `[B, T, H, V]`.
         final_state (torch.Tensor):
             Final state of shape `[N, H, K, V]` if `output_final_state=True` else `None`.
 
@@ -450,9 +424,9 @@ def chunk_gated_delta_rule(
         >>> from fla.ops.gated_delta_rule import chunk_gated_delta_rule
         # inputs with equal lengths
         >>> B, T, H, K, V = 4, 2048, 4, 512, 512
-        >>> q = torch.randn(B, T, H, K, dtype=torch.bfloat16, device='cuda')
-        >>> k = F.normalize(torch.randn(B, T, H, K, dtype=torch.bfloat16, device='cuda'), p=2, dim=-1)
-        >>> v = torch.randn(B, T, H, V, dtype=torch.bfloat16, device='cuda')
+        >>> q = torch.randn(B, H, T, K, dtype=torch.bfloat16, device='cuda')
+        >>> k = F.normalize(torch.randn(B, H, T, K, dtype=torch.bfloat16, device='cuda'), p=2, dim=-1)
+        >>> v = torch.randn(B, H, T, V, dtype=torch.bfloat16, device='cuda')
         >>> beta = torch.rand(B, T, H, dtype=torch.bfloat16, device='cuda').sigmoid()
         >>> g = F.logsigmoid(torch.rand(B, T, H, dtype=torch.bfloat16, device='cuda'))
         >>> h0 = torch.randn(B, H, K, V, dtype=torch.bfloat16, device='cuda')
@@ -462,7 +436,8 @@ def chunk_gated_delta_rule(
             output_final_state=True
         )
         # for variable-length inputs, the batch size `B` is expected to be 1 and `cu_seqlens` is required
-        >>> q, k, v, beta, g = map(lambda x: rearrange(x, 'b t ... -> 1 (b t) ...'), (q, k, v, beta, g))
+        >>> q, k, v = map(lambda x: rearrange(x, 'b h t d -> 1 h (b t) d'), (q, k, v))
+        >>> beta, g = map(lambda x: rearrange(x, 'b t h -> 1 (b t) h'), (beta, g))
         # for a batch with 4 sequences, `cu_seqlens` with 5 start/end positions are expected
         >>> cu_seqlens = q.new_tensor([0, 2048, 4096, 6144, 8192], dtype=torch.long)
         >>> o_var, ht_var = chunk_gated_delta_rule(
@@ -474,16 +449,18 @@ def chunk_gated_delta_rule(
     """
     assert q.dtype == k.dtype == v.dtype
     assert q.dtype != torch.float32, "ChunkGatedDeltaRuleFunction does not support float32. Please use bfloat16."
-    assert len(beta.shape) == 3, "beta must be of shape [B, T, H] if head_first=False, or [B, H, T] otherwise."
+    assert len(beta.shape) == 3, "beta must be of shape [B, T, H]."
 
-    if not head_first and q.shape[1] < q.shape[2]:
-        warnings.warn(
-            f"chunk_gated_delta_rule: Input tensor shape suggests potential format mismatch: seq_len ({q.shape[1]}) < num_heads ({q.shape[2]}). "
-            "This may indicate the inputs were passed in head-first format [B, H, T, ...] "
-            "when head_first=False was specified. "
-            "Please verify your input tensor format matches the expected shape [B, T, H, ...].",
-            stacklevel=2,
-        )
+    if (
+        q.shape[0] != g.shape[0]
+        or q.shape[2] != g.shape[1]
+        or k.shape[0] != g.shape[0]
+        or k.shape[2] != g.shape[1]
+        or v.shape[0] != g.shape[0]
+        or v.shape[2] != g.shape[1]
+        or beta.shape != g.shape
+    ):
+        raise ValueError("chunk_gated_delta_rule expects BHTD Q/K/V and BTH g/beta inputs.")
     if cu_seqlens is not None:
         if q.shape[0] != 1:
             raise ValueError(
@@ -508,7 +485,6 @@ def chunk_gated_delta_rule(
         output_final_state,
         cu_seqlens,
         prebuilt_meta,
-        head_first,
         use_qk_l2norm_in_kernel,
     )
     return o, final_state

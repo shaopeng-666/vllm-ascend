@@ -14,9 +14,9 @@ class TestChunkGatedDeltaRule(PytestBase):
         mock_forward_context = MagicMock()
         mock_forward_context.attn_metadata = mock_attn_metadata
 
-        q = torch.randn(1, 17, 4, 128, dtype=torch.bfloat16).npu()
-        k = torch.randn(1, 17, 4, 128, dtype=torch.bfloat16).npu()
-        v = torch.randn(1, 17, 8, 128, dtype=torch.bfloat16).npu()
+        q = torch.randn(1, 4, 17, 128, dtype=torch.bfloat16).npu()
+        k = torch.randn(1, 4, 17, 128, dtype=torch.bfloat16).npu()
+        v = torch.randn(1, 8, 17, 128, dtype=torch.bfloat16).npu()
         g = torch.randn(1, 17, 8, dtype=torch.float32).npu()
         beta = torch.randn(1, 17, 8, dtype=torch.bfloat16).npu()
         initial_state = torch.randn(3, 8, 128, 128, dtype=torch.bfloat16).npu()
@@ -40,7 +40,6 @@ class TestChunkGatedDeltaRule(PytestBase):
                 initial_state=initial_state,
                 output_final_state=True,
                 cu_seqlens=q_start_loc,
-                head_first=False,
                 use_qk_l2norm_in_kernel=True,
             )
 
@@ -104,7 +103,7 @@ def test_chunk_gated_delta_rule_head_first_varlen_matches_token_major():
         patch("vllm_ascend.ops.triton.fla.chunk.get_forward_context", return_value=mock_forward_context),
         patch("vllm_ascend.ops.triton.fla.chunk.get_pcp_group", return_value=mock_pcp_group),
     ):
-        token_major_out, token_major_state = chunk_gated_delta_rule(
+        token_major_out, token_major_state = chunk_gated_delta_rule_pytorch(
             q=q,
             k=k,
             v=v,
@@ -120,12 +119,11 @@ def test_chunk_gated_delta_rule_head_first_varlen_matches_token_major():
             q=q.movedim(1, 2).contiguous(),
             k=k.movedim(1, 2).contiguous(),
             v=v.movedim(1, 2).contiguous(),
-            g=g.movedim(1, 2).contiguous(),
-            beta=beta.movedim(1, 2).contiguous(),
+            g=g,
+            beta=beta,
             initial_state=initial_state,
             output_final_state=True,
             cu_seqlens=cu_seqlens,
-            head_first=True,
             use_qk_l2norm_in_kernel=True,
         )
 

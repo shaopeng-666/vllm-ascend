@@ -540,13 +540,13 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 q=query_non_spec,
                 k=key_non_spec,
                 v=value_non_spec,
-                g=(g_non_spec.movedim(1, 2).contiguous() if use_head_major_conv else g_non_spec),
-                beta=(beta_non_spec.movedim(1, 2).contiguous() if use_head_major_conv else beta_non_spec),
+                # Q/K/V are head-major; the gate path stays token-major.
+                g=g_non_spec,
+                beta=beta_non_spec,
                 initial_state=initial_state,
                 output_final_state=True,
                 cu_seqlens=prefill_query_start_loc,
                 prebuilt_meta=attn_metadata.non_spec_prefill_metadata.chunk,
-                head_first=use_head_major_conv,
                 use_qk_l2norm_in_kernel=True,
             )
             ssm_state[prefill_state_indices] = last_recurrent_state.transpose(-1, -2).contiguous().to(ssm_state.dtype)
