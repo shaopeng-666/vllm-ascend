@@ -73,9 +73,12 @@ def chunk_scaled_dot_kkt_fwd_kernel(
             k_offset = (i_b * Hg + i_h // (H // Hg)) * T_max * K
         o_t = tl.arange(0, BT)
         o_t_fp32 = o_t.to(tl.float32)
+        token_offsets = i_t * BT + o_t
+        token_mask = token_offsets < T
 
-        p_beta = tl.make_block_ptr(beta + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
-        b_beta = tl.load(p_beta, boundary_check=(0,))
+        # A3's block-pointer lowering does not support this strided 1D BTH
+        # access. Use explicit loads to avoid materializing an HBT copy.
+        b_beta = tl.load(beta + (bos + token_offsets) * H + i_h, mask=token_mask, other=0.0)
 
         b_A = tl.zeros([BT, BT], dtype=tl.float32)
         for i_k in range(tl.cdiv(K, BK)):
@@ -86,8 +89,7 @@ def chunk_scaled_dot_kkt_fwd_kernel(
             b_A += tl.dot(b_k, tl.trans(b_k))
 
         if USE_G:
-            p_g = tl.make_block_ptr(g_cumsum + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
-            b_g = tl.load(p_g, boundary_check=(0,))
+            b_g = tl.load(g_cumsum + (bos + token_offsets) * H + i_h, mask=token_mask, other=0.0)
             b_g_diff = b_g[:, None] - b_g[None, :]
             b_A *= safe_exp(b_g_diff)
 
