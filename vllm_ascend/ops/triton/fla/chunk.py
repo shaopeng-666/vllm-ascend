@@ -200,7 +200,6 @@ def chunk_gated_delta_rule_fwd(
     q_bhtd = q.to(torch.bfloat16)
     k_bhtd = k.to(torch.bfloat16)
     v_bhtd = v
-    beta_bht = beta.movedim(1, 2)
     g_bht = g_bth.movedim(1, 2).contiguous()
 
     # Obtain WY representation. u is actually the new v.
@@ -220,6 +219,9 @@ def chunk_gated_delta_rule_fwd(
         output_dtype=k.dtype,
     )
     A_bhtc = A.movedim(1, 2).contiguous()
+    # recompute's ACLNN adapter requires physical BHT inputs. Materialize this
+    # after KKT so the BTH beta path remains transpose-free.
+    beta_bht = beta.movedim(1, 2).contiguous()
 
     w, u = recompute_w_u_fwd(
         k=k_bhtd,

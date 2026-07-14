@@ -549,6 +549,7 @@ def test_chunk_fwd_preserves_head_major_k_for_kkt_and_ascendc_calls(monkeypatch:
     assert captured["recompute"][0].shape == (1, 2, 5, 4)
     assert captured["recompute"][1].shape == (1, 3, 5, 4)
     assert captured["recompute"][2].shape == (1, 3, 5)
+    assert captured["recompute"][2].is_contiguous()
     assert captured["recompute"][3].shape == (1, 3, 5, 2)
     assert captured["recompute"][4].shape == (1, 3, 5)
     assert captured["fwd_h"][0].shape == (1, 2, 5, 4)
