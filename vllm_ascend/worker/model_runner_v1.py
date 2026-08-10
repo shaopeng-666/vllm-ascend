@@ -19,6 +19,7 @@
 
 import logging
 import math
+import os
 import sys
 import time
 from collections import defaultdict
@@ -1840,6 +1841,44 @@ class NPUModelRunner(GPUModelRunner):
                     if not has_kv_transfer_group():
                         return EMPTY_MODEL_RUNNER_OUTPUT
                     return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+                if (
+                    os.getenv("VLLM_ASCEND_C8_NZ_DEBUG", "0") == "1"
+                    and get_tp_group().rank_in_group == 0
+                ):
+                    debug_step = getattr(self, "_c8_nz_request_debug_step", 0)
+                    self._c8_nz_request_debug_step = debug_step + 1
+                    debug_first = int(
+                        os.getenv("VLLM_ASCEND_C8_NZ_DEBUG_FIRST_STEPS", "8")
+                    )
+                    debug_every = max(
+                        1,
+                        int(os.getenv("VLLM_ASCEND_C8_NZ_DEBUG_EVERY", "64")),
+                    )
+                    if debug_step < debug_first or debug_step % debug_every == 0:
+                        computed = self.input_batch.num_computed_tokens_cpu[:num_reqs]
+                        prompts = self.input_batch.num_prompt_tokens[:num_reqs]
+                        logger.warning(
+                            "[C8REQ] dp=%d step=%d reqs=%d ids=%s "
+                            "scheduled=%s computed=%s prompts=%s "
+                            "common_prefix_blocks=%s prefix_cache=%s",
+                            get_dp_group().rank_in_group,
+                            debug_step,
+                            num_reqs,
+                            list(req_ids),
+                            list(tokens),
+                            computed.tolist(),
+                            prompts.tolist(),
+                            getattr(
+                                scheduler_output,
+                                "num_common_prefix_blocks",
+                                None,
+                            ),
+                            getattr(
+                                self.cache_config,
+                                "enable_prefix_caching",
+                                None,
+                            ),
+                        )
                 self._start_dump_data()
                 num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
                 max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
