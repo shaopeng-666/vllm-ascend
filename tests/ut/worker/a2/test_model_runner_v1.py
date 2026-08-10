@@ -441,6 +441,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         runner.c8_k_cache_dtype = torch.int8
         runner.c8_k_scale_cache_dtype = torch.float16
         runner._get_attention_kv_cache_dims = lambda _layer_name, _spec: (512, 64)
+        runner._get_mla_fa_quant_cache_dtypes = MagicMock(return_value=None)
 
         attn_layer_name = "model.layers.1.self_attn.attn"
         indexer_layer_name = "model.layers.1.self_attn.indexer.k_cache"
