@@ -22,7 +22,7 @@
 - tracked 源码：精确恢复到 commit `0065f5f3bd88c1608932273dd9543d1919a55bbb`；
 - Git 历史：四个 bundle 和完整 commit chain；
 - 源码差异：`d37a76b...` 到 `0065f5f3...` 的 binary-safe patch；
-- 数据：完整 99 条 GPQA snapshot 和 case21 原始记录；
+- 数据：PR 内含 case21 原始记录；完整 99 条 GPQA snapshot 因 Git HTTP 403 仅保留在原始离线包中；
 - 历史结果：本地留存的 DP4 六轮 pairdiag 以及一个 DP2 GPQA32 结果，API 地址已脱敏；
 - 客户端和启动脚本：已参数化，无真实基础设施值；
 - 采集脚本：网络恢复后可补齐 source/environment 现场。

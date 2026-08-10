@@ -4,11 +4,11 @@
 
 | 请求项 | 本包材料 | 状态与边界 |
 |---|---|---|
-| `codex-c8-full` tracked 源码现场 | `source/codex-c8-full-0065f5f3.tar.gz`、四个 Git bundle、binary-safe patch、`COMMIT-CHAIN.txt`、`RECONSTRUCTION.md` | 已交付 tracked tree 与可恢复历史；旧机 dirty/untracked、原 branch/remote 精确值缺失 |
+| `codex-c8-full` tracked 源码现场 | 四个 Git bundle、binary-safe patch、`COMMIT-CHAIN.txt`、`RECONSTRUCTION.md` | 已交付可恢复的 tracked tree 与历史；冗余 tar 快照因 Git HTTP 403 未进入 PR；旧机 dirty/untracked、原 branch/remote 精确值缺失 |
 | 基准 commit、HEAD、提交链、submodule | `source/COMMIT-CHAIN.txt`、`source/RECONSTRUCTION.md` | 已记录；submodule 内容未打入归档 |
 | C8/KDA/PR #13225 修改分类 | `source/PROBES.md`、`source/UNTRACKED-STATUS.txt` | C8 tracked probe 已定位；旧稿所述 KDA trigger probe 未恢复 |
 | 参数化复现客户端与依赖 | `scripts/run_gpqa_stream_watch_liveprobe.py`、`scripts/requirements.txt`、`scripts/README.md` | 已交付；API、数据和输出路径不含真实机器值 |
-| GPQA case21 与 SHA-256 | `data/GPQA_case21.jsonl`、`SHA256SUMS` | 已交付；另附历史 99 条 snapshot |
+| GPQA case21 与 SHA-256 | `data/GPQA_case21.jsonl`、`SHA256SUMS` | 已交付当前边界复现所需 case21；历史 99 条 snapshot 因 Git HTTP 403 仅保留在原始离线包中 |
 | smoke、16/17/32 路命令 | `kimi-k3-c8-two-node-handoff.md`、`README.md`、客户端 `--help` 参数 | 已交付模板；16/17/32 是客户端并发目标，不等同服务端同时 active 数 |
 | `X-data-parallel-rank`、`cache_salt`、异常检测 | `scripts/README.md` 与客户端源码 | 已说明；unique salt 只隔离跨请求 prefix hash，不关闭 cache 管理 |
 | C8 on/off 精确切换 | `kimi-k3-c8-two-node-handoff.md` 第 6 节、`source/PROBES.md` | 已定位到 checkpoint ModelSlim quant metadata；因缺 quant config，不能伪造单一 C8-off 开关 |

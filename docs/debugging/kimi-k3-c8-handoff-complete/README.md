@@ -4,7 +4,7 @@
 
 这是一份可离线移交给另一个 Codex 窗口的脱敏交付包。它包含可恢复精确 tracked 源码的 Git bundle 和 binary-safe patch、复现客户端、GPQA 数据、现存历史结果、两机启动脚本、环境采集脚本和 SHA-256 校验。
 
-PR 交付说明：原始离线包中的 `source/codex-c8-full-0065f5f3.tar.gz` 是同一 tracked tree 的 12 MB 冗余快照；Git 上传该压缩工件时返回 HTTP 403，因此仓库版展开提交其余 35 个文件，不提交该 tar。源码仍可按 `source/RECONSTRUCTION.md` 使用 bundle 或 patch 精确恢复；仓库内 `SHA256SUMS` 只覆盖实际提交的 35 个文件。
+PR 交付说明：Git 上传包含 `source/codex-c8-full-0065f5f3.tar.gz`（12 MB 冗余源码快照）或 `data/GPQA_diamond.partial_99.sha4e606bdc.jsonl`（4.63 MB 历史全量快照）的 pack 时返回 HTTP 403。因此仓库版提交原始离线包的其余 34 个条目，并额外保留两个顶层启动脚本副本方便直接评审。源码可按 `source/RECONSTRUCTION.md` 使用 bundle 或 patch 精确恢复；当前 C8 边界复现所需 case21 已提交。`SHA256SUMS` 只列实际提交的原始包路径，不含这两个未上传工件和两个顶层便捷副本。
 
 重要边界：本包不是旧服务器目录的完整镜像。生成时旧、新两组服务器及服务端口从当前 Codex 均不可达，旧机的 dirty/untracked 文件、KDA 文件触发 probe、环境快照、DP2 case21 边界原始结果和 rank 日志无法补采。缺口逐项记录在 `MISSING-MATERIALS.md`。
 
@@ -48,8 +48,7 @@ kimi-k3-c8-handoff-complete/
 │   ├── README.md
 │   └── requirements.txt
 ├── data/
-│   ├── GPQA_case21.jsonl
-│   └── GPQA_diamond.partial_99.sha4e606bdc.jsonl
+│   └── GPQA_case21.jsonl
 ├── results/
 │   ├── RESULTS.md
 │   ├── dp2_c8_gpqa32_r1_t2048.sanitized.json
