@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import os
 from typing import TYPE_CHECKING, NamedTuple, TypeVar
 
 import numpy as np
@@ -7,6 +8,7 @@ import torch.nn.functional as F
 import torch_npu
 import vllm.envs as envs_vllm
 from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.distributed import get_tp_group
 from vllm.logger import logger
 from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadataBuilder
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
@@ -1735,6 +1737,46 @@ class AscendMLAImpl(MLAAttentionImpl):
                     block_size,
                     16,
                 )
+                debug_enabled = (
+                    os.getenv(
+                        "VLLM_ASCEND_C8_NZ_DEBUG",
+                        os.getenv("VLLM_ASCEND_C8_KV_DEBUG", "0"),
+                    )
+                    == "1"
+                    and os.getenv("VLLM_ASCEND_C8_NZ_HOST_READBACK", "1") == "1"
+                    and os.getenv(
+                        "VLLM_ASCEND_C8_NZ_DEBUG_LAYER",
+                        "model.layers.4.",
+                    )
+                    in str(self.layer_name)
+                    and get_tp_group().rank_in_group == 0
+                )
+                if debug_enabled and not getattr(self, "_c8_nz_debug_config_logged", False):
+                    self._c8_nz_debug_config_logged = True
+                    logger.warning(
+                        "[C8NZCFG] layer=%s block_size=%d kv_heads=%d "
+                        "latent_base(shape=%s stride=%s dtype=%s format=%d) "
+                        "latent_view(shape=%s stride=%s format=%d) "
+                        "pe_base(shape=%s stride=%s dtype=%s format=%d) "
+                        "pe_view(shape=%s stride=%s format=%d)",
+                        self.layer_name,
+                        block_size,
+                        self.num_kv_heads,
+                        tuple(kv_cache[0].shape),
+                        tuple(kv_cache[0].stride()),
+                        kv_cache[0].dtype,
+                        int(torch_npu.get_npu_format(kv_cache[0])),
+                        tuple(latent_cache_nz.shape),
+                        tuple(latent_cache_nz.stride()),
+                        int(torch_npu.get_npu_format(latent_cache_nz)),
+                        tuple(kv_cache[1].shape),
+                        tuple(kv_cache[1].stride()),
+                        kv_cache[1].dtype,
+                        int(torch_npu.get_npu_format(kv_cache[1])),
+                        tuple(rope_cache_nz.shape),
+                        tuple(rope_cache_nz.stride()),
+                        int(torch_npu.get_npu_format(rope_cache_nz)),
+                    )
                 torch_npu.npu_scatter_pa_kv_cache(
                     key=cache_kv_c.contiguous(),
                     value=cache_kv_c.contiguous(),
@@ -1751,6 +1793,62 @@ class AscendMLAImpl(MLAAttentionImpl):
                     slot_mapping=slots.contiguous(),
                     cache_mode="PA_NZ",
                 )
+                if debug_enabled and not torch.npu.is_current_stream_capturing():
+                    step = getattr(self, "_c8_nz_debug_step", 0)
+                    self._c8_nz_debug_step = step + 1
+                    first = int(os.getenv("VLLM_ASCEND_C8_NZ_DEBUG_FIRST_STEPS", "8"))
+                    every = max(1, int(os.getenv("VLLM_ASCEND_C8_NZ_DEBUG_EVERY", "64")))
+                    if step < first or step % every == 0:
+                        try:
+                            scatter_records = getattr(
+                                self,
+                                "_c8_nz_scatter_records",
+                                [],
+                            )
+                            scatter_records.append((step, slots.detach().clone()))
+                            self._c8_nz_scatter_records = scatter_records[-16:]
+                            valid = slots >= 0
+                            valid_slots = slots[valid].to(torch.long)
+                            block_ids = torch.div(valid_slots, block_size, rounding_mode="floor")
+                            offsets = torch.remainder(valid_slots, block_size)
+                            actual_nope = latent_cache_nz[block_ids, :, :, offsets, :]
+                            actual_pe = rope_cache_nz[block_ids, :, :, offsets, :]
+                            expected_nope = cache_kv_c[valid].view_as(actual_nope)
+                            expected_pe = k_pe[valid].view_as(actual_pe)
+                            nope_bad = (
+                                (actual_nope != expected_nope)
+                                .reshape(valid_slots.numel(), -1)
+                                .any(dim=1)
+                            )
+                            pe_bad = (
+                                (actual_pe != expected_pe)
+                                .reshape(valid_slots.numel(), -1)
+                                .any(dim=1)
+                            )
+                            logger.warning(
+                                "[C8NZDBG] layer=%s step=%d tokens=%d slots=%s "
+                                "nope_bad=%d pe_bad=%d nope_sum=%d pe_sum=%.6f",
+                                self.layer_name,
+                                step,
+                                valid_slots.numel(),
+                                (
+                                    valid_slots.cpu().tolist()
+                                    if valid_slots.numel() <= 16
+                                    else valid_slots[:8].cpu().tolist()
+                                    + ["..."]
+                                    + valid_slots[-8:].cpu().tolist()
+                                ),
+                                int(nope_bad.sum().item()),
+                                int(pe_bad.sum().item()),
+                                int(actual_nope.to(torch.int64).sum().item()),
+                                float(actual_pe.to(torch.float32).sum().item()),
+                            )
+                        except Exception:
+                            logger.exception(
+                                "[C8NZDBG] scatter readback failed layer=%s step=%d",
+                                self.layer_name,
+                                step,
+                            )
             else:
                 # reshape_and_cache requires key and value to have the same dtype.
                 DeviceOperator.reshape_and_cache(
@@ -1881,6 +1979,51 @@ class AscendMLAImpl(MLAAttentionImpl):
     ) -> torch.Tensor:
         decode_meta = attn_metadata.decode
         assert decode_meta is not None
+        if (
+            os.getenv(
+                "VLLM_ASCEND_C8_NZ_DEBUG",
+                os.getenv("VLLM_ASCEND_C8_KV_DEBUG", "0"),
+            ) == "1"
+            and os.getenv("VLLM_ASCEND_C8_NZ_HOST_READBACK", "1") == "1"
+            and not torch.npu.is_current_stream_capturing()
+            and bool(getattr(self, "_c8_nz_scatter_records", []))
+            and len(decode_meta.seq_lens_list) == q_nope.size(0)
+        ):
+            try:
+                scatter_records = self._c8_nz_scatter_records
+                record_index = next(
+                    index
+                    for index, (_, record_slots) in enumerate(scatter_records)
+                    if int((record_slots >= 0).sum().item()) == q_nope.size(0)
+                )
+                write_step, record_slots = scatter_records[record_index]
+                del scatter_records[: record_index + 1]
+                write_slots = record_slots[record_slots >= 0].to(torch.long)
+                seq_lens = torch.tensor(
+                    decode_meta.seq_lens_list,
+                    dtype=torch.long,
+                    device=decode_meta.block_table.device,
+                )
+                positions = seq_lens - 1
+                rows = torch.arange(q_nope.size(0), device=decode_meta.block_table.device)
+                block_indices = torch.div(positions, block_size, rounding_mode="floor")
+                fia_blocks = decode_meta.block_table[rows, block_indices].to(torch.long)
+                fia_slots = fia_blocks * block_size + torch.remainder(positions, block_size)
+                logger.warning(
+                    "[C8NZMAP] layer=%s step=%d write_slots=%s fia_slots=%s "
+                    "mismatches=%d seq_lens=%s",
+                    self.layer_name,
+                    write_step,
+                    write_slots.cpu().tolist(),
+                    fia_slots.cpu().tolist(),
+                    int((write_slots != fia_slots).sum().item()),
+                    seq_lens.cpu().tolist(),
+                )
+                self._c8_nz_last_step = write_step
+            except Exception:
+                logger.exception(
+                    "[C8NZMAP] FIA slot validation failed layer=%s", self.layer_name
+                )
         # TODO: The CANN package is expected to support num_heads that are not
         # powers of 2 in 2026 Q2. Once supported, all padding operations under
         # `if self.head_padding > 0` in this function can be removed.
@@ -1907,6 +2050,106 @@ class AscendMLAImpl(MLAAttentionImpl):
         else:
             k_nope = k_nope.view(-1, self.num_kv_heads, block_size, self.kv_lora_rank)
             k_pe = k_pe.view(-1, self.num_kv_heads, block_size, self.qk_rope_head_dim)
+
+        if (
+            os.getenv(
+                "VLLM_ASCEND_C8_NZ_DEBUG",
+                os.getenv("VLLM_ASCEND_C8_KV_DEBUG", "0"),
+            )
+            == "1"
+            and os.getenv("VLLM_ASCEND_C8_NZ_HOST_READBACK", "1") == "1"
+            and not torch.npu.is_current_stream_capturing()
+            and self.fa_quant_layer
+            and get_ascend_device_type() == AscendDeviceType.A3
+            and os.getenv(
+                "VLLM_ASCEND_C8_NZ_DEBUG_LAYER",
+                "model.layers.4.",
+            )
+            in str(self.layer_name)
+            and get_tp_group().rank_in_group == 0
+            and getattr(self, "_c8_nz_last_step", 0)
+            < int(os.getenv("VLLM_ASCEND_C8_NZ_DEBUG_PAIR_STEPS", "4"))
+        ):
+            try:
+                pair = [
+                    int(value)
+                    for value in os.getenv(
+                        "VLLM_ASCEND_C8_NZ_DEBUG_PAIR",
+                        "0,1",
+                    ).split(",")
+                ]
+                if len(pair) != 2:
+                    raise ValueError("VLLM_ASCEND_C8_NZ_DEBUG_PAIR must contain two row indices")
+                row_a, row_b = pair
+                if max(pair) >= len(decode_meta.seq_lens_list):
+                    raise IndexError(
+                        f"pair rows {pair} exceed decode batch {len(decode_meta.seq_lens_list)}"
+                    )
+
+                def _history(row: int):
+                    seq_len = int(decode_meta.seq_lens_list[row])
+                    positions = torch.arange(
+                        seq_len,
+                        dtype=torch.long,
+                        device=decode_meta.block_table.device,
+                    )
+                    logical_blocks = torch.div(
+                        positions,
+                        block_size,
+                        rounding_mode="floor",
+                    )
+                    physical_blocks = decode_meta.block_table[
+                        row,
+                        logical_blocks,
+                    ].to(torch.long)
+                    offsets = torch.remainder(positions, block_size)
+                    nope = k_nope[
+                        physical_blocks,
+                        :,
+                        :,
+                        offsets,
+                        :,
+                    ].reshape(seq_len, -1)
+                    pe = k_pe[
+                        physical_blocks,
+                        :,
+                        :,
+                        offsets,
+                        :,
+                    ].reshape(seq_len, -1)
+                    return seq_len, nope, pe
+
+                len_a, nope_a, pe_a = _history(row_a)
+                len_b, nope_b, pe_b = _history(row_b)
+                if len_a == len_b:
+                    nope_mismatch = int((nope_a != nope_b).sum().item())
+                    pe_mismatch = int((pe_a != pe_b).sum().item())
+                else:
+                    nope_mismatch = pe_mismatch = -1
+                logger.warning(
+                    "[C8NZPAIR] layer=%s step=%d rows=%s seq_lens=%s "
+                    "nope_mismatch=%d pe_mismatch=%d "
+                    "nope_sum=%s pe_sum=%s",
+                    self.layer_name,
+                    getattr(self, "_c8_nz_last_step", -1),
+                    pair,
+                    [len_a, len_b],
+                    nope_mismatch,
+                    pe_mismatch,
+                    [
+                        int(nope_a.to(torch.int64).sum().item()),
+                        int(nope_b.to(torch.int64).sum().item()),
+                    ],
+                    [
+                        float(pe_a.to(torch.float32).sum().item()),
+                        float(pe_b.to(torch.float32).sum().item()),
+                    ],
+                )
+            except Exception:
+                logger.exception(
+                    "[C8NZPAIR] cache history comparison failed layer=%s",
+                    self.layer_name,
+                )
 
         attn_output_shape: tuple | None = None
         if (
