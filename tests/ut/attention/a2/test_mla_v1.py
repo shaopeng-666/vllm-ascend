@@ -2464,13 +2464,15 @@ class TestAscendMLAImpl(TestBase):
 
         torch.testing.assert_close(k_pe, raw_k_pe)
         torch.testing.assert_close(k_nope, kv_c_normed)
-        mock_npu_quantize.assert_called_once_with(
-            kv_c_normed,
-            self.impl.fak_descale_reciprocal,
-            None,
-            torch.qint8,
-            -1,
-            False,
+        mock_npu_quantize.assert_called_once()
+        quantize_args = mock_npu_quantize.call_args.args
+        torch.testing.assert_close(quantize_args[0], kv_c_normed)
+        torch.testing.assert_close(
+            quantize_args[1], self.impl.fak_descale_reciprocal
+        )
+        self.assertEqual(
+            quantize_args[2:],
+            (None, torch.qint8, -1, False),
         )
         self.assertEqual(mock_scatter_pa_kv_cache.call_count, 2)
         latent_call, position_call = mock_scatter_pa_kv_cache.call_args_list
