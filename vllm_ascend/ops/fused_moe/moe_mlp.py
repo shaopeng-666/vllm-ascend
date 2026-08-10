@@ -14,6 +14,7 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 
+import os
 
 import torch
 import torch_npu
@@ -31,6 +32,7 @@ from vllm_ascend.ops.activation import (
     AscendSwigluOAIAndMul,
     AscendSwigluStepAndMul,
     SituActivationConfig,
+    situ_and_mul,
 )
 from vllm_ascend.ops.fused_moe.moe_runtime_args import MoEMlpComputeInput
 from vllm_ascend.quantization.quant_type import QuantType
@@ -204,6 +206,21 @@ def _w4a8_situ_apply_mlp(
             linear_beta=activation.linear_beta or 0.0,
             activate_left=True,
             dst_type=SITU_MX_DST_TYPE_E4M3FN,
+        )
+    elif os.getenv("VLLM_ASCEND_C8_NZ_DEBUG_FALLBACK_SITU", "0") == "1":
+        # Compatibility path for runtime images without dequant_situ_quant.
+        # It preserves the W4A8 contract by applying SiTU in BF16 and then
+        # dynamically quantizing its output before the W4 grouped matmul.
+        situ_output = situ_and_mul(
+            gate_up_out,
+            beta=activation.beta,
+            linear_beta=activation.linear_beta,
+        )
+        hidden_states, situ_out_scale = DeviceOperator.npu_dynamic_quant(
+            hidden_states=situ_output,
+            dynamic_scale=None,
+            act_quant_type=act_quant_type,
+            use_mxfp_quant=False,
         )
     else:
         hidden_states, situ_out_scale = torch.ops._C_ascend.dequant_situ_quant(
