@@ -1,0 +1,47 @@
+Latest recovered tracked tree:
+0065f5f3bd88c1608932273dd9543d1919a55bbb debug(mla): gate C8 cache host readback
+0a6742d79196a0a6069ff797d7ac28695e1ce1ed debug(mla): skip host sync during graph capture
+f7dde85c80ee58b9e34f7f0a54e47667f3d7f19b codex-situ-reference-fallback
+60462f4791b92b61133d54d37173b6d7814cf3df codex-fix-sfa-fixture
+8ea6fb0 codex-fix-tensor-mock-assert
+33b7265 codex-c8-diagnostics
+a97deb4c071fd062713405003632ac5fe65ef25e Merge remote-tracking branch 'refs/remotes/codex/pr-13225' into HEAD
+9bb9f4e fix(kimi-k3): make W4A8 group list graph safe
+888b442 fix(kimi-k3): quantize shared experts with W4A8
+b39ea21 fix(kimi-k3): correct C8 cache gather and GDN decode padding
+821eae9 Revert "fix(mla): gather ND-tagged PA-NZ cache explicitly"
+a51c482 fix(mla): use block offsets for PA-NZ gather
+128b29f fix(mla): gather ND-tagged PA-NZ cache explicitly
+5ef33a3 fix(mla): cast compact C8 cache to NZ for gather
+d8afe3c fix(mla): pass K3 A3 C8 decode cache as ND
+f37fc12 fix(mla): keep K3 A3 C8 cache in ND layout
+223331d fix(mla): register K3 A3 C8 cache as NZ
+6f05de5 fix(mla): use 4D PA-NZ cache views for gather
+49aaa20 fix(mla): preserve PA-NZ cache head dimension
+c523486 fix(mla): split A3 C8 chunk cache gathers
+2da67df Revert "fix(mla): allocate K3 A3 C8 cache in NZ format"
+f56176b fix(mla): allocate K3 A3 C8 cache in NZ format
+7265b89 fix(mla): use CANN gather cache mode inference
+8bf11bd revert(mla): remove K3 A3 one-token prefill bypass
+1240f49 fix(mla): bypass K3 A3 one-token prefill FIA
+24a582e fix(mla): bypass K3 A3 C8 one-token prefill FIA
+1ec48b1 fix(mla): set K3 A3 C8 scatter cache mode
+c9279e0 fix(mla): gather K3 A3 C8 cache in NZ layout
+7958c3d fix(mla): write K3 A3 C8 cache in NZ layout
+b81659d fix(quant): detect K3 shared per-channel weights
+302ca89 fix(mla): pad FIA query descales with heads
+de0853a fix(moe): fallback K3 shared W4A8 to weight-only matmul
+19cea4c feat(model): add Kimi K3 reduced layer loading
+dd1418d fix(quantization): prepare K3 W4 shared weights before packing
+be0f794 feat(quantization): support per-channel W4A8 weight quantization
+2d14ded fix(moe): prepare Kimi shared W4A8 weights
+23783aa fix(quantization): make FAQuant cache mapping idempotent
+2c2b785 feat(attention): add A3 C8 support for Kimi K3 MLA
+
+Public prerequisite commits used by the bundles:
+23cfbd5bae8028dc31d8ddd66673f985cf66e5f5 feat: support Kimi-K3 model
+d37a76b431378096538c1818cb92fba51c5801f0 fix: DSpark's adaptation issues
+
+Submodule at latest tree:
+csrc/third_party/catlass 41bf90da655bba3c66d0acd7e00abe33960ecfd6
+

@@ -1,0 +1,14 @@
+The exact old-server untracked file list is unavailable.
+
+Reason: the remote hosts were unreachable when this package was built, and Git
+bundles contain committed objects/refs only. They cannot recover untracked files
+or a working-tree-only dirty diff.
+
+Known consequence: symbols previously described as KDAPAIR or trigger-file KDA
+probes are absent from commit 0065f5f3bd88c1608932273dd9543d1919a55bbb and all
+other recovered tracked commits. Treat those probes as missing until the old
+working tree is read directly.
+
+Use scripts/export_source_state.sh on each reachable host before restarting or
+editing the old checkout.
+

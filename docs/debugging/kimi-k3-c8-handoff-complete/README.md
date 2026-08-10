@@ -2,7 +2,9 @@
 
 生成时间：2026-08-10（Asia/Shanghai）
 
-这是一份可离线移交给另一个 Codex 窗口的脱敏交付包。它包含已经恢复的精确 tracked 源码、Git bundle、补丁、复现客户端、GPQA 数据、现存历史结果、两机启动脚本、环境采集脚本和 SHA-256 校验。
+这是一份可离线移交给另一个 Codex 窗口的脱敏交付包。它包含可恢复精确 tracked 源码的 Git bundle 和 binary-safe patch、复现客户端、GPQA 数据、现存历史结果、两机启动脚本、环境采集脚本和 SHA-256 校验。
+
+PR 交付说明：原始离线包中的 `source/codex-c8-full-0065f5f3.tar.gz` 是同一 tracked tree 的 12 MB 冗余快照；Git 上传该压缩工件时返回 HTTP 403，因此仓库版展开提交其余 35 个文件，不提交该 tar。源码仍可按 `source/RECONSTRUCTION.md` 使用 bundle 或 patch 精确恢复；仓库内 `SHA256SUMS` 只覆盖实际提交的 35 个文件。
 
 重要边界：本包不是旧服务器目录的完整镜像。生成时旧、新两组服务器及服务端口从当前 Codex 均不可达，旧机的 dirty/untracked 文件、KDA 文件触发 probe、环境快照、DP2 case21 边界原始结果和 rank 日志无法补采。缺口逐项记录在 `MISSING-MATERIALS.md`。
 
@@ -10,7 +12,7 @@
 
 1. `STATUS-AND-NEXT-STEPS.md`：当前判断、实验边界和下一步优先级；
 2. `REQUEST-COVERAGE.md`：对补充材料请求逐项映射已交付文件和缺口；
-3. `source/RECONSTRUCTION.md`：精确 tracked 源码的两种恢复方式；
+3. `source/RECONSTRUCTION.md`：精确 tracked 源码的 bundle/patch 恢复方式；
 4. `scripts/kimi-k3-c8-dp2tp16-serve.sh`：`graph16`、`audit_graph32`、`eager` 三种服务模式；
 5. `scripts/run_gpqa_stream_watch_liveprobe.py`：参数化 GPQA/SSE 客户端；
 6. `results/RESULTS.md`：历史结果的证据边界；
@@ -27,7 +29,6 @@ kimi-k3-c8-handoff-complete/
 ├── MISSING-MATERIALS.md
 ├── SHA256SUMS
 ├── source/
-│   ├── codex-c8-full-0065f5f3.tar.gz
 │   ├── codex-c8-full-d37a76b-to-0065f5f3.patch
 │   ├── codex-c8-full-f7dde85c8.bundle
 │   ├── codex-c8-full-60462f479.bundle
@@ -59,10 +60,19 @@ kimi-k3-c8-handoff-complete/
 
 ## 最短复现路径
 
-在 Linux/NPU 环境中：
+在 Linux/NPU 环境中，先从公开前置 commit 应用 binary-safe patch：
 
 ```bash
-tar -xzf source/codex-c8-full-0065f5f3.tar.gz
+git init recovered-c8
+cd recovered-c8
+git fetch https://github.com/vllm-project/vllm-ascend.git \
+  d37a76b431378096538c1818cb92fba51c5801f0
+git checkout -b recovered-c8-probe \
+  d37a76b431378096538c1818cb92fba51c5801f0
+git apply --check \
+  ../source/codex-c8-full-d37a76b-to-0065f5f3.patch
+git apply ../source/codex-c8-full-d37a76b-to-0065f5f3.patch
+cd ..
 chmod +x scripts/*.sh
 python3 -m venv .venv-client
 source .venv-client/bin/activate
