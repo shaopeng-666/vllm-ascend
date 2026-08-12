@@ -16,27 +16,46 @@
 #
 
 import torch
-from vllm.model_executor.layers.activation import QuickGELU, SiluAndMul
+import torch_npu
+from vllm.model_executor.layers.activation import QuickGELU, SiluAndMul, SiluAndMulWithClamp, SwigluOAIAndMul
 
-from vllm_ascend.utils import is_310p
+from vllm_ascend.utils import get_weight_prefetch_method
 
 
-def silu_and_mul_forward_oot(self, x: torch.Tensor) -> torch.Tensor:
-    import torch_npu
+class AscendQuickGELU(QuickGELU):
+    def forward_oot(self, x: torch.tensor) -> torch.Tensor:
+        out = torch_npu.npu_fast_gelu(x)
+        return out
 
-    if is_310p():
-        out = torch_npu.npu_swiglu(x.to(torch.float32)).to(torch.float16)
-    else:
+
+class AscendSiluAndMul(SiluAndMul):
+    def forward_oot(self, x: torch.Tensor) -> torch.Tensor:
+        weight_prefetch_method = get_weight_prefetch_method()
+        weight_prefetch_method.maybe_prefetch_mlp_weight_preprocess(weight_prefetch_method.MLP_DOWN, x)
         out = torch_npu.npu_swiglu(x)
-    return out
+        weight_prefetch_method.maybe_prefetch_mlp_weight_postprocess(out)
+        return out
 
 
-def quick_gelu_forward_oot(self, x: torch.tensor) -> torch.Tensor:
-    import torch_npu
+class AscendSiluAndMulWithClamp(SiluAndMulWithClamp):
+    def forward_oot(self, x: torch.Tensor) -> torch.Tensor:
+        weight_prefetch_method = get_weight_prefetch_method()
+        weight_prefetch_method.maybe_prefetch_mlp_weight_preprocess(weight_prefetch_method.MLP_DOWN, x)
+        d = x.shape[-1] // 2
+        gate = torch.clamp(x[..., :d], max=self.swiglu_limit)
+        up = torch.clamp(x[..., d:], min=-self.swiglu_limit, max=self.swiglu_limit)
+        x = torch.cat([gate, up], dim=-1)
+        out = torch_npu.npu_swiglu(x)
+        weight_prefetch_method.maybe_prefetch_mlp_weight_postprocess(out)
+        return out
 
-    out = torch_npu.npu_fast_gelu(x)
-    return out
 
+class AscendSwigluOAIAndMul:
+    def swiglu_oai_forward(x: torch.Tensor, alpha: float = 1.702, limit: float = 7.0) -> torch.Tensor:
+        class MinimalSwigluOAIAndMul:
+            def __init__(self):
+                self.alpha = alpha
+                self.limit = limit
 
-QuickGELU.forward_oot = quick_gelu_forward_oot
-SiluAndMul.forward_oot = silu_and_mul_forward_oot
+        layer = MinimalSwigluOAIAndMul()
+        return SwigluOAIAndMul.forward_native(layer, x)

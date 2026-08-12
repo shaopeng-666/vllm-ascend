@@ -1,9 +1,10 @@
-# Using OpenCompass 
-This document will guide you have a accuracy testing using [OpenCompass](https://github.com/open-compass/opencompass).
+# Using OpenCompass
 
-## 1. Online Serving
+This document guides you to conduct accuracy testing using [OpenCompass](https://github.com/open-compass/opencompass).
 
-You can run docker container to start the vLLM server on a single NPU:
+## 1. Online Server
+
+You can run a docker container to start the vLLM server on a single NPU:
 
 ```{code-block} bash
    :substitutions:
@@ -13,6 +14,7 @@ export DEVICE=/dev/davinci7
 export IMAGE=quay.io/ascend/vllm-ascend:|vllm_ascend_version|
 docker run --rm \
 --name vllm-ascend \
+--shm-size=1g \
 --device $DEVICE \
 --device /dev/davinci_manager \
 --device /dev/devmm_svm \
@@ -29,27 +31,31 @@ docker run --rm \
 -it $IMAGE \
 vllm serve Qwen/Qwen2.5-7B-Instruct --max_model_len 26240
 ```
-If your service start successfully, you can see the info shown below:
-```
+
+The vLLM server is started successfully, if you see information as below:
+
+```shell
 INFO:     Started server process [6873]
 INFO:     Waiting for application startup.
 INFO:     Application startup complete.
 ```
 
-Once your server is started, you can query the model with input prompts in new terminal:
-```
+Once your server is started, you can query the model with input prompts in a new terminal.
+
+```shell
 curl http://localhost:8000/v1/completions \
     -H "Content-Type: application/json" \
     -d '{
         "model": "Qwen/Qwen2.5-7B-Instruct",
         "prompt": "The future of AI is",
-        "max_tokens": 7,
+        "max_completion_tokens": 7,
         "temperature": 0
     }'
 ```
 
-## 2. Run ceval accuracy test using OpenCompass
-Install OpenCompass and configure the environment variables in the container.
+## 2. Run C-Eval (a Chinese language model evaluation benchmark) using OpenCompass for accuracy testing
+
+Install OpenCompass and configure the environment variables in the container:
 
 ```bash
 # Pin Python 3.10 due to:
@@ -61,7 +67,7 @@ export DATASET_SOURCE=ModelScope
 git clone https://github.com/open-compass/opencompass.git
 ```
 
-Add `opencompass/configs/eval_vllm_ascend_demo.py` with the following content:
+Add the following content to `opencompass/configs/eval_vllm_ascend_demo.py`:
 
 ```python
 from mmengine.config import read_base
@@ -103,14 +109,14 @@ models = [
 
 Run the following command:
 
-```
+```shell
 python3 run.py opencompass/configs/eval_vllm_ascend_demo.py --debug
 ```
 
-After 1-2 mins, the output is as shown below:
+After 1 to 2 minutes, the output is shown below:
 
-```
-The markdown format results is as below:
+```shell
+The markdown format results are as below:
 
 | dataset | version | metric | mode | Qwen2.5-7B-Instruct-vLLM-API |
 |----- | ----- | ----- | ----- | -----|

@@ -1,193 +1,157 @@
-import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
-from vllm.distributed.parallel_state import GroupCoordinator
+from vllm.config import ParallelConfig
 
-import vllm_ascend
 from vllm_ascend.distributed.parallel_state import (
-    destory_ascend_model_parallel, get_ep_group, get_etp_group,
-    init_ascend_model_parallel, model_parallel_initialized)
+    _FLASHCOMM2_ODP,
+    _FLASHCOMM2_OTP,
+    _LMTP,
+    _MC2,
+    _OTP,
+    _P_TP,
+    destroy_ascend_model_parallel,
+    get_flashcomm2_odp_group,
+    get_flashcomm2_otp_group,
+    get_global_rank,
+    get_lmhead_tp_group,
+    get_mc2_group,
+    get_otp_group,
+    get_p_tp_group,
+    init_ascend_model_parallel,
+)
 
 
-class TestParallelState(unittest.TestCase):
+@pytest.fixture
+def parallel_config():
+    return ParallelConfig(
+        data_parallel_size=2,
+        tensor_parallel_size=4,
+        pipeline_parallel_size=2,
+    )
 
-    @patch('vllm_ascend.distributed.parallel_state._EP',
-           new_callable=lambda: MagicMock(spec=GroupCoordinator))
-    def test_get_ep_group_when_initialized(self, mock_ep):
-        # Act
-        result = get_ep_group()
 
-        # Assert
-        assert isinstance(result, GroupCoordinator)
+@pytest.fixture
+def mock_distributed():
+    with (
+        patch("torch.distributed.is_initialized", return_value=True),
+        patch("torch.distributed.get_world_size", return_value=16),
+        patch("torch.distributed.get_backend", return_value="nccl"),
+        patch("vllm_ascend.distributed.parallel_state.get_world_group") as mock_group,
+        patch("vllm_ascend.distributed.parallel_state.get_tp_group") as mock_tp_group,
+    ):
+        mock_group.return_value.local_rank = 0
+        mock_group.return_value.device_group = MagicMock()
+        mock_tp_group.return_value.world_size = 4
+        yield
 
-    @patch('vllm_ascend.distributed.parallel_state._EP', None)
-    def test_get_ep_group_when_not_initialized(self):
-        # Act & Assert
-        with pytest.raises(AssertionError) as excinfo:
-            get_ep_group()
-        assert "expert model parallel group is not initialized" in str(
-            excinfo.value)
 
-    @patch('vllm_ascend.distributed.parallel_state._ETP',
-           new_callable=lambda: MagicMock(spec=GroupCoordinator))
-    def test_get_etp_group_when_initialized(self, mock_etp):
-        # Act
-        result = get_etp_group()
+def test_init_ascend_model_parallel(mock_distributed, parallel_config):
+    mock_ascend_config = MagicMock()
+    mock_ascend_config.finegrained_tp_config.lmhead_tensor_parallel_size = 2
+    mock_ascend_config.finegrained_tp_config.oproj_tensor_parallel_size = 2
+    mock_ascend_config.finegrained_tp_config.embedding_tensor_parallel_size = 2
+    mock_ascend_config.finegrained_tp_config.mlp_tensor_parallel_size = 2
+    mock_ascend_config.flashcomm2_oproj_tensor_parallel_size = 2
+    mock_ascend_config.pd_tp_ratio = 2
+    mock_ascend_config.num_head_replica = 0
+    mock_ascend_config.pd_head_ratio = 2
+    mock_ascend_config.enable_flashcomm2_parallel_size = 2
+    mock_ascend_config.enable_context_parallel = False
+    mock_vllm_config = MagicMock()
+    mock_vllm_config.kv_transfer_config.is_kv_producer = True
+    with (
+        patch("vllm_ascend.distributed.parallel_state.model_parallel_initialized", return_value=False),
+        patch("vllm_ascend.distributed.parallel_state.init_model_parallel_group"),
+        patch("vllm_ascend.distributed.parallel_state.get_current_vllm_config", return_value=mock_vllm_config),
+        patch("vllm_ascend.distributed.parallel_state.get_ascend_config", return_value=mock_ascend_config),
+        patch("vllm_ascend.utils.get_ascend_config", return_value=mock_ascend_config),
+    ):
+        init_ascend_model_parallel(parallel_config)
 
-        # Assert
-        assert isinstance(result, GroupCoordinator)
+        mc2_group = get_mc2_group()
+        lmheadtp_group = get_lmhead_tp_group()
+        otp_group = get_otp_group()
+        flashcomm2_otp_group = get_flashcomm2_otp_group()
+        flashcomm2_odp_group = get_flashcomm2_odp_group()
+        p_tp_group = get_p_tp_group()
+        assert mc2_group is not None
+        assert otp_group is not None
+        assert flashcomm2_otp_group is not None
+        assert flashcomm2_odp_group is not None
+        assert lmheadtp_group is not None
+        assert p_tp_group is not None
 
-    @patch('vllm_ascend.distributed.parallel_state._ETP', None)
-    def test_get_etp_group_when_not_initialized(self):
-        # Act & Assert
-        with pytest.raises(AssertionError) as excinfo:
-            get_etp_group()
-        assert "expert tensor parallel group is not initialized" in str(
-            excinfo.value)
+        destroy_ascend_model_parallel()
+        assert _MC2 is None
+        assert _LMTP is None
+        assert _OTP is None
+        assert _FLASHCOMM2_OTP is None
+        assert _FLASHCOMM2_ODP is None
+        assert _P_TP is None
 
-    @patch('vllm_ascend.distributed.parallel_state._ETP', None)
-    @patch('vllm_ascend.distributed.parallel_state._EP', None)
-    def test_model_parallel_initialized_when_both_none(self):
-        # Act & Assert
-        assert not model_parallel_initialized()
 
-    @patch('vllm_ascend.distributed.parallel_state._ETP',
-           new_callable=lambda: MagicMock(spec=GroupCoordinator))
-    @patch('vllm_ascend.distributed.parallel_state._EP', None)
-    def test_model_parallel_initialized_when_ep_none(self, mock_etp):
-        # Act & Assert
-        assert not model_parallel_initialized()
+def _build_parallel_config(
+    tensor_parallel_size=1,
+    pipeline_parallel_size=1,
+    prefill_context_parallel_size=1,
+    data_parallel_index=0,
+):
+    return SimpleNamespace(
+        tensor_parallel_size=tensor_parallel_size,
+        pipeline_parallel_size=pipeline_parallel_size,
+        prefill_context_parallel_size=prefill_context_parallel_size,
+        data_parallel_index=data_parallel_index,
+    )
 
-    @patch('vllm_ascend.distributed.parallel_state._ETP', None)
-    @patch('vllm_ascend.distributed.parallel_state._EP',
-           new_callable=lambda: MagicMock(spec=GroupCoordinator))
-    def test_model_parallel_initialized_when_etp_none(self, mock_ep):
-        # Act & Assert
-        assert not model_parallel_initialized()
 
-    @patch('vllm_ascend.distributed.parallel_state._ETP',
-           new_callable=lambda: MagicMock(spec=GroupCoordinator))
-    @patch('vllm_ascend.distributed.parallel_state._EP',
-           new_callable=lambda: MagicMock(spec=GroupCoordinator))
-    def test_model_parallel_initialized_when_etp_initialized(
-            self, mock_ep, mock_etp):
-        # Act & Assert
-        assert model_parallel_initialized()
+@pytest.mark.parametrize(
+    "parallel_config_kwargs, rank_in_group, expected",
+    [
+        # No parallelism at all (single card): replica_size == 1.
+        (dict(tensor_parallel_size=1), 0, 0),
+        # TP only: rank_in_group is the local rank within the single replica.
+        (dict(tensor_parallel_size=4), 0, 0),
+        (dict(tensor_parallel_size=4), 3, 3),
+        # Dense DP: world group spans one replica, rank_in_group is local and
+        # data_parallel_index supplies the DP offset.
+        (dict(tensor_parallel_size=4, data_parallel_index=0), 2, 2),
+        (dict(tensor_parallel_size=4, data_parallel_index=1), 2, 6),
+        # MoE DP / external_launcher: world group spans all DP ranks, so
+        # rank_in_group is already global; the modulo strips the DP offset and
+        # data_parallel_index re-adds it (result equals rank_in_group).
+        (dict(tensor_parallel_size=4, data_parallel_index=1), 6, 6),
+        (dict(tensor_parallel_size=4, data_parallel_index=1), 7, 7),
+        # TP * PP * prefill-CP all contribute to replica_size; DCP/EP do not.
+        (dict(tensor_parallel_size=2, pipeline_parallel_size=2, data_parallel_index=1), 1, 5),
+        (
+            dict(
+                tensor_parallel_size=2, pipeline_parallel_size=2, prefill_context_parallel_size=2, data_parallel_index=1
+            ),
+            3,
+            11,
+        ),
+    ],
+)
+def test_get_global_rank(parallel_config_kwargs, rank_in_group, expected):
+    parallel_config = _build_parallel_config(**parallel_config_kwargs)
+    with patch("vllm_ascend.distributed.parallel_state.get_world_group") as mock_group:
+        mock_group.return_value.rank_in_group = rank_in_group
+        assert get_global_rank(parallel_config) == expected
 
-    @patch('vllm_ascend.distributed.parallel_state._ETP',
-           new_callable=lambda: MagicMock(spec=GroupCoordinator))
-    @patch('vllm_ascend.distributed.parallel_state._EP',
-           new_callable=lambda: MagicMock(spec=GroupCoordinator))
-    def test_destroy_when_both_exist(self, mock_ep, mock_etp):
-        # Act
-        destory_ascend_model_parallel()
-        # Assert
-        mock_ep.destroy.assert_called_once()
-        mock_etp.destroy.assert_called_once()
-        assert vllm_ascend.distributed.parallel_state._ETP is None
-        assert vllm_ascend.distributed.parallel_state._EP is None
 
-    @patch('vllm_ascend.distributed.parallel_state._ETP', None)
-    @patch('vllm_ascend.distributed.parallel_state._EP',
-           new_callable=lambda: MagicMock())
-    def test_destory_ascend_model_parallel_when_etp_none(self, mock_ep):
-        # Act
-        destory_ascend_model_parallel()
-        # Assert
-        mock_ep.destroy.assert_called_once()
-        assert vllm_ascend.distributed.parallel_state._EP is None
-        assert vllm_ascend.distributed.parallel_state._ETP is None
-
-    @patch('vllm_ascend.distributed.parallel_state._ETP',
-           new_callable=lambda: MagicMock())
-    @patch('vllm_ascend.distributed.parallel_state._EP', None)
-    def test_destory_ascend_model_parallel_when_ep_none(self, mock_etp):
-        # Act
-        destory_ascend_model_parallel()
-        # Assert
-        mock_etp.destroy.assert_called_once()
-        assert vllm_ascend.distributed.parallel_state._ETP is None
-        assert vllm_ascend.distributed.parallel_state._EP is None
-
-    @patch('vllm_ascend.distributed.parallel_state._ETP', None)
-    @patch('vllm_ascend.distributed.parallel_state._EP', None)
-    def test_destory_ascend_model_parallel_when_both_none(self):
-        # Act
-        destory_ascend_model_parallel()
-        # Assert
-        assert vllm_ascend.distributed.parallel_state._ETP is None
-        assert vllm_ascend.distributed.parallel_state._EP is None
-
-    @patch('torch.distributed.is_initialized', return_value=True)
-    @patch('torch.distributed.get_world_size', return_value=8)
-    @patch('vllm_ascend.distributed.parallel_state.get_world_group',
-           return_value=MagicMock(device_group='npu:0', local_rank=0))
-    @patch('torch.distributed.get_backend', return_value='hccl')
-    @patch('vllm_ascend.distributed.parallel_state.init_model_parallel_group')
-    @patch('vllm_ascend.distributed.parallel_state.model_parallel_initialized',
-           return_value=False)
-    def test_init_ascend_model_parallel_normal_case(
-            self, mock_mp_init, mock_init_group, mock_get_backend,
-            mock_world_group, mock_get_world_size, mock_is_init):
-        """Test normal initialization with default parameters"""
-        # Act
-        init_ascend_model_parallel()
-        # Assert
-        mock_init_group.assert_any_call([[0, 1, 2, 3, 4, 5, 6, 7]],
-                                        0,
-                                        'hccl',
-                                        group_name="ep")
-        mock_init_group.assert_any_call([[0]], 0, 'hccl', group_name="etp")
-        self.assertIsNotNone(vllm_ascend.distributed.parallel_state._EP)
-        self.assertIsNotNone(vllm_ascend.distributed.parallel_state._ETP)
-
-    @patch('vllm_ascend.distributed.parallel_state.model_parallel_initialized',
-           return_value=True)
-    def test_init_ascend_model_parallel_skip_if_initialized(
-            self, mock_mp_init):
-        """Test skipping when model parallel already initialized"""
-        with patch.object(vllm_ascend.distributed.parallel_state,
-                          '_EP') as mock_ep, patch.object(
-                              vllm_ascend.distributed.parallel_state,
-                              '_ETP') as mock_etp:
-            # Act
-            init_ascend_model_parallel()
-            # Assert
-            mock_ep.assert_not_called()
-            mock_etp.assert_not_called()
-
-    @patch('torch.distributed.is_initialized', return_value=False)
-    def test_init_ascend_model_parallel_assert_dist_not_init(
-            self, mock_is_init):
-        """Test assertion when distributed not initialized"""
-        # Act & Assert
-        with self.assertRaises(AssertionError):
-            init_ascend_model_parallel()
-
-    @patch('torch.distributed.is_initialized', return_value=True)
-    @patch('torch.distributed.get_world_size', return_value=8)
-    @patch('vllm_ascend.distributed.parallel_state.get_world_group',
-           return_value=MagicMock(device_group='npu:0', local_rank=1))
-    @patch('torch.distributed.get_backend', return_value='hccl')
-    @patch('vllm_ascend.distributed.parallel_state.init_model_parallel_group')
-    @patch('vllm_ascend.distributed.parallel_state.model_parallel_initialized',
-           return_value=False)
-    def test_init_ascend_model_parallel_custom_params(
-            self, mock_mp_init, mock_init_group, mock_get_backend,
-            mock_world_group, mock_get_world_size, mock_is_init):
-        """Test initialization with custom parallel sizes"""
-        # Act
-        init_ascend_model_parallel(expert_parallel_size=2,
-                                   expert_tensor_parallel_size=4,
-                                   world_size=8,
-                                   backend='hccl')
-        #Assert
-        mock_init_group.assert_any_call([[0, 4], [1, 5], [2, 6], [3, 7]],
-                                        1,
-                                        'hccl',
-                                        group_name="ep")
-        mock_init_group.assert_any_call([[0, 1, 2, 3], [4, 5, 6, 7]],
-                                        1,
-                                        'hccl',
-                                        group_name="etp")
+def test_get_global_rank_defaults_to_current_config():
+    parallel_config = _build_parallel_config(tensor_parallel_size=4, data_parallel_index=1)
+    mock_vllm_config = MagicMock()
+    mock_vllm_config.parallel_config = parallel_config
+    with (
+        patch(
+            "vllm_ascend.distributed.parallel_state.get_current_vllm_config",
+            return_value=mock_vllm_config,
+        ),
+        patch("vllm_ascend.distributed.parallel_state.get_world_group") as mock_group,
+    ):
+        mock_group.return_value.rank_in_group = 3
+        # data_parallel_index(1) * replica_size(4) + 3 == 7
+        assert get_global_rank() == 7

@@ -28,16 +28,28 @@
     return PyModule_Create(&module);                                           \
   }
 
-
-namespace vllm_ascend {
-AscendType get_dtype_from_torch(at::ScalarType scalarType)
+class TrochBindException : public std::exception
 {
-    if (scalarType == at::ScalarType::Float) {
-        return AscendType::FP32;
-    } else if (scalarType == at::ScalarType::BFloat16) {
-        return AscendType::BF16;
-    } else {
-        return AscendType::FP16;
+private:
+    std::string message = {};
+
+public:
+    explicit TrochBindException(const char *name, const char *file, const int line, const std::string &error)
+    {
+        message = std::string("Failed: ") + name + " error " + file + ":" + std::to_string(line) +
+                  " error message or error code is '" + error + "'";
     }
-}
-} // namespace vllm_ascend
+
+    const char *what() const noexcept override
+    {
+        return message.c_str();
+    }
+};
+
+#define TORCH_BIND_ASSERT(cond)                                           \
+    ;                                                                  \
+    do {                                                               \
+        if (not(cond)) {                                               \
+            throw TrochBindException("Assertion", __FILE__, __LINE__, #cond); \
+        }                                                              \
+    } while (0)

@@ -21,11 +21,11 @@
 </p>
 :::
 
-vLLM Ascend plugin (vllm-ascend) is a community maintained hardware plugin for running vLLM on the Ascend NPU.
+vLLM Ascend plugin (vllm-ascend) is a community-maintained hardware plugin for running vLLM on the Ascend NPU.
 
 This plugin is the recommended approach for supporting the Ascend backend within the vLLM community. It adheres to the principles outlined in the [[RFC]: Hardware pluggable](https://github.com/vllm-project/vllm/issues/11162), providing a hardware-pluggable interface that decouples the integration of the Ascend NPU with vLLM.
 
-By using vLLM Ascend plugin, popular open-source models, including Transformer-like, Mixture-of-Expert, Embedding, Multi-modal LLMs can run seamlessly on the Ascend NPU.
+By using vLLM Ascend plugin, popular open-source models, including Transformer-like, Mixture-of-Experts, Embedding, Multi-modal LLMs can run seamlessly on the Ascend NPU.
 
 ## Documentation
 
@@ -35,7 +35,9 @@ By using vLLM Ascend plugin, popular open-source models, including Transformer-l
 :maxdepth: 1
 quick_start
 installation
-tutorials/index.md
+tutorials/models/index
+tutorials/features/index
+tutorials/hardwares/index
 faqs
 :::
 
@@ -43,13 +45,10 @@ faqs
 :::{toctree}
 :caption: User Guide
 :maxdepth: 1
-user_guide/suppoted_features
-user_guide/supported_models
-user_guide/env_vars
-user_guide/additional_config
-user_guide/sleep_mode
-user_guide/graph_mode.md
-user_guide/quantization.md
+user_guide/support_matrix/index
+user_guide/configuration/index
+user_guide/feature_guide/index
+user_guide/deployment_guide/index
 user_guide/release_notes
 :::
 
@@ -58,10 +57,9 @@ user_guide/release_notes
 :caption: Developer Guide
 :maxdepth: 1
 developer_guide/contribution/index
-developer_guide/feature_guide/index
+developer_guide/Design_Documents/index
 developer_guide/evaluation/index
-developer_guide/performance/index
-developer_guide/modeling/index
+developer_guide/performance_and_debug/index
 :::
 
 % How to involve vLLM Ascend
@@ -70,6 +68,8 @@ developer_guide/modeling/index
 :maxdepth: 1
 community/governance
 community/contributors
+community/issue-workflow-guidelines
+community/slash-commands
 community/versioning_policy
 community/user_stories/index
 :::
