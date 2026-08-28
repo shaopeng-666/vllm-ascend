@@ -23,6 +23,34 @@ from vllm.assets.image import ImageAsset
 from tests.e2e.conftest import VllmRunner, qwen_prompt, wait_until_npu_memory_free
 
 
+QWEN35_TEXT_ONLY_MODEL = "codecho/Qwen3.5-0.8B-text-only"
+
+
+@wait_until_npu_memory_free()
+def test_native_text_only_checkpoint():
+    """Verify that a native Qwen3.5 text-only checkpoint can generate."""
+    model_path = hf_snapshot_download(
+        QWEN35_TEXT_ONLY_MODEL,
+        local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+    )
+    prompts = [
+        "Hello, my name is",
+        "The capital of France is",
+        "2 + 2 =",
+        "The future of AI is",
+    ]
+
+    with VllmRunner(
+        model_path,
+        dtype="bfloat16",
+        max_model_len=2048,
+    ) as runner:
+        outputs = runner.generate_greedy(prompts, max_tokens=8)
+
+    assert len(outputs) == len(prompts)
+    assert all(output_ids and output_str.strip() for output_ids, output_str in outputs)
+
+
 @wait_until_npu_memory_free()
 def test_mamba_ssm_multimodal_reasoning_mtp_full_decode_only():
     """Verify Mamba/SSM multimodal reasoning with MTP and full decode only."""
