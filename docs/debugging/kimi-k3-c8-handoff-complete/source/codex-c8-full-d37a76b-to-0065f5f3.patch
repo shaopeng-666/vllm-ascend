@@ -1,0 +1,2644 @@
+diff --git a/tests/ut/attention/a2/test_mla_v1.py b/tests/ut/attention/a2/test_mla_v1.py
+index 80e751c..0f5f417 100755
+--- a/tests/ut/attention/a2/test_mla_v1.py
++++ b/tests/ut/attention/a2/test_mla_v1.py
+@@ -22,6 +22,7 @@ from vllm_ascend.attention.mla_v1 import (
+     PrefillMLAPreprocessResult,
+ )
+ from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
++from vllm_ascend.utils import AscendDeviceType
+ 
+ 
+ class TestAscendMLABackend(TestBase):
+@@ -1071,8 +1072,10 @@ class TestAscendMLAImpl(TestBase):
+     @patch("vllm_ascend.attention.mla_v1.enable_fa_quant", return_value=True)
+     @patch("vllm_ascend.attention.mla_v1.enabling_mlapo", return_value=True)
+     @patch("vllm_ascend.attention.mla_v1.get_current_vllm_config")
+-    def test_kimi_k3_no_rope_keeps_mlapo_enabled(
++    @patch("vllm_ascend.attention.mla_v1.get_ascend_device_type", return_value=AscendDeviceType.A2)
++    def test_kimi_k3_no_rope_disables_c8_and_mlapo_on_a2(
+         self,
++        mock_get_device_type,
+         mock_get_current_vllm_config,
+         mock_enabling_mlapo,
+         mock_enable_fa_quant,
+@@ -1112,7 +1115,63 @@ class TestAscendMLAImpl(TestBase):
+         )
+ 
+         self.assertFalse(impl.fa_quant_layer)
+-        self.assertTrue(impl.enable_mlapo)
++        self.assertFalse(impl.enable_mlapo)
++        self.assertEqual(impl.dtype, self.impl.vllm_config.model_config.dtype)
++
++    @patch("vllm_ascend.attention.mla_v1.enable_fa_quant", return_value=False)
++    @patch("vllm_ascend.attention.mla_v1.enabling_mlapo", return_value=False)
++    @patch("vllm_ascend.attention.mla_v1.get_current_vllm_config")
++    @patch("vllm_ascend.attention.mla_v1.get_ascend_device_type", return_value=AscendDeviceType.A3)
++    def test_kimi_k3_no_rope_enables_a3_c8_without_kv_consumer(
++        self,
++        mock_get_device_type,
++        mock_get_current_vllm_config,
++        mock_enabling_mlapo,
++        mock_enable_fa_quant,
++    ):
++        quant_config = SimpleNamespace(
++            enable_fa_quant=True,
++            is_fa_quant_layer=MagicMock(return_value=True),
++        )
++        self.impl.vllm_config.quant_config = quant_config
++        mock_get_current_vllm_config.return_value = self.impl.vllm_config
++        kwargs = {
++            "kv_lora_rank": 32,
++            "qk_nope_head_dim": 64,
++            "qk_rope_head_dim": 32,
++            "qk_head_dim": 96,
++            "v_head_dim": 128,
++            "q_lora_rank": 64,
++            "q_proj": MagicMock(),
++            "q_b_proj": MagicMock(),
++            "kv_b_proj": MagicMock(),
++            "o_proj": MagicMock(),
++            "kv_a_proj_with_mqa": MagicMock(),
++            "fused_qkv_a_proj": MagicMock(),
++            "kv_a_layernorm": MagicMock(),
++            "rotary_emb": None,
++            "use_mla_rope": False,
++            "layer_name": "model.layers.3.self_attn.attn",
++        }
++
++        impl = AscendMLAImpl(
++            num_heads=12,
++            head_size=96,
++            scale=0.1,
++            num_kv_heads=1,
++            alibi_slopes=None,
++            sliding_window=None,
++            kv_cache_dtype="auto",
++            blocksparse_params=None,
++            logits_soft_cap=None,
++            attn_type=None,
++            kv_sharing_target_layer_name=None,
++            **kwargs,
++        )
++
++        self.assertTrue(impl.fa_quant_layer)
++        self.assertEqual(impl.dtype, torch.int8)
++        quant_config.is_fa_quant_layer.assert_called_once_with(kwargs["layer_name"])
+ 
+     @patch("vllm_ascend.attention.mla_v1.maybe_save_kv_layer_to_connector")
+     @patch("torch.ops.vllm.maybe_all_gather_and_maybe_unpad")
+@@ -1557,6 +1616,7 @@ class TestAscendMLAImpl(TestBase):
+         mock_layer = MagicMock()
+         mock_layer.quant_kscale = torch.randn(128)
+         mock_layer.fak_descale_float = torch.randn(1)
++        mock_layer.fak_descale_reciprocal = torch.randn(1)
+         self.impl.vllm_config = MagicMock()
+         self.impl.vllm_config.compilation_config = MagicMock()
+         self.impl.vllm_config.compilation_config.static_forward_context = {"layer_0": mock_layer}
+@@ -1568,6 +1628,7 @@ class TestAscendMLAImpl(TestBase):
+         self.assertTrue(hasattr(self.impl, "wu_q"))
+         self.assertTrue(hasattr(self.impl, "wd_q"))
+         self.assertTrue(hasattr(self.impl, "wd_kv"))
++        self.assertIs(self.impl.fak_descale_reciprocal, mock_layer.fak_descale_reciprocal)
+ 
+     @patch("vllm_ascend.attention.mla_v1.trans_rope_weight")
+     @patch("vllm_ascend.attention.mla_v1.transdata")
+@@ -2058,6 +2119,92 @@ class TestAscendMLAImpl(TestBase):
+ 
+         self.assertEqual(out.shape, prefix_out.shape)
+ 
++    @patch("vllm_ascend.attention.mla_v1.get_ascend_device_type", return_value=AscendDeviceType.A3)
++    @patch("vllm_ascend.attention.mla_v1.torch_npu.npu_format_cast", side_effect=lambda cache, *_: cache)
++    @patch("vllm_ascend.attention.mla_v1.DeviceOperator.kv_cache_load")
++    @patch("torch_npu.npu_attention_update")
++    @patch("torch_npu.npu_fused_infer_attention_score")
++    def test_compute_prefill_context_dequantizes_a3_c8_latent_cache(
++        self,
++        mock_fia,
++        mock_update,
++        mock_cache_load,
++        _mock_format_cast,
++        mock_get_device_type,
++    ):
++        self.impl.fa_quant_layer = True
++        self.impl.use_mla_rope = False
++        self.impl.num_heads = 2
++        self.impl.num_kv_heads = 1
++        self.impl.kv_lora_rank = 32
++        self.impl.qk_nope_head_dim = 32
++        self.impl.qk_rope_head_dim = 16
++        self.impl.v_head_dim = 3
++        self.impl.vllm_config.model_config.dtype = torch.bfloat16
++        self.impl.fak_descale_float = torch.tensor([0.25])
++
++        quantized_kv = torch.arange(32, dtype=torch.int8).view(1, 32)
++        loaded_k_pe = torch.ones(1, self.impl.qk_rope_head_dim, dtype=torch.bfloat16)
++
++        def load_cache(*args, key, value, **_):
++            if key.dtype == torch.int8:
++                key.copy_(quantized_kv.view_as(key))
++                value.copy_(quantized_kv.view_as(value))
++            else:
++                key.copy_(loaded_k_pe.view_as(key))
++                value.copy_(loaded_k_pe.view_as(value))
++
++        mock_cache_load.side_effect = load_cache
++        captured_kv_b_inputs = []
++
++        def kv_b_proj(value):
++            captured_kv_b_inputs.append(value)
++            return (torch.zeros(1, self.impl.num_heads, self.impl.qk_nope_head_dim + self.impl.v_head_dim),)
++
++        self.impl.kv_b_proj = MagicMock(side_effect=kv_b_proj)
++        mock_fia.return_value = (
++            torch.zeros(1, self.impl.num_heads, self.impl.v_head_dim),
++            torch.zeros(self.impl.num_heads, 1),
++        )
++        mock_update.return_value = (torch.zeros(self.impl.num_heads, self.impl.v_head_dim), None)
++
++        chunked_context = MagicMock()
++        chunked_context.seq_tot = [1]
++        chunked_context.starts = [torch.tensor([0])]
++        chunked_context.chunk_seq_lens_npu = [torch.tensor([1])]
++        chunked_context.chunk_actual_seq_lengths_kv_list = [[1]]
++        prefill_metadata = MagicMock(
++            actual_seq_lengths_q=[1],
++            block_table=torch.tensor([[0]]),
++            chunked_context=chunked_context,
++        )
++        attn_metadata = MagicMock(prefill=prefill_metadata)
++        kv_cache = (
++            torch.empty(1, 1, 1, self.impl.kv_lora_rank, dtype=torch.int8),
++            torch.empty(1, 1, 1, self.impl.qk_rope_head_dim, dtype=torch.bfloat16),
++        )
++        q_nope = torch.zeros(1, self.impl.num_heads, self.impl.qk_nope_head_dim, dtype=torch.bfloat16)
++        q_pe = torch.zeros(1, self.impl.num_heads, self.impl.qk_rope_head_dim, dtype=torch.bfloat16)
++        prefix_output = torch.zeros(1, self.impl.num_heads, self.impl.v_head_dim)
++        prefix_lse = torch.zeros(self.impl.num_heads, 1)
++
++        self.impl._compute_prefill_context(
++            q_nope,
++            q_pe,
++            kv_cache,
++            self.impl.qk_rope_head_dim,
++            attn_metadata,
++            prefix_output,
++            prefix_lse,
++        )
++
++        self.assertEqual(mock_cache_load.call_count, 2)
++        latent_call, rope_call = mock_cache_load.call_args_list
++        self.assertEqual(latent_call.args[0].shape, (1, 1, 1, 32))
++        self.assertEqual(rope_call.args[0].shape, (1, 1, 1, 16))
++        expected = (quantized_kv.squeeze().to(torch.float32) * self.impl.fak_descale_float).to(torch.bfloat16)
++        torch.testing.assert_close(captured_kv_b_inputs[0], expected)
++
+     @patch("vllm_ascend.attention.mla_v1.get_current_vllm_config")
+     @patch("torch_npu.npu_gather_pa_kv_cache")
+     @patch("torch_npu.npu_attention_update")
+@@ -2293,6 +2440,77 @@ class TestAscendMLAImpl(TestBase):
+         self.assertIs(cache_call["value_cache"], kv_cache[1])
+         self.assertIs(cache_call["slot_mapping"], slots)
+ 
++    @patch("vllm_ascend.attention.mla_v1.get_ascend_device_type", return_value=AscendDeviceType.A3)
++    @patch("vllm_ascend.attention.mla_v1.torch_npu.npu_scatter_pa_kv_cache")
++    @patch("vllm_ascend.attention.mla_v1.torch_npu.npu_quantize")
++    def test_kimi_k3_exec_kv_prefill_quantizes_and_writes_a3_nz_cache(
++        self,
++        mock_npu_quantize,
++        mock_scatter_pa_kv_cache,
++        mock_get_device_type,
++    ):
++        self.impl.use_mla_rope = False
++        self.impl.fa_quant_layer = True
++        self.impl.num_kv_heads = 1
++        self.impl.kv_lora_rank = 32
++        self.impl.qk_rope_head_dim = 16
++        self.impl.fak_descale_reciprocal = torch.tensor([4.0])
++        self.impl.dtype = torch.int8
++        kv_no_split = torch.arange(96, dtype=torch.bfloat16).view(2, 1, 48)
++        kv_c_normed = kv_no_split[..., :32] + 100
++        raw_k_pe = kv_no_split[..., 32:]
++        quantized_kv_c = torch.zeros(kv_c_normed.shape, dtype=torch.int8)
++        self.impl.kv_a_layernorm = MagicMock(return_value=kv_c_normed)
++        mock_npu_quantize.return_value = quantized_kv_c
++        kv_cache = (
++            torch.empty(2, 4, 1, 32, dtype=torch.int8),
++            torch.empty(2, 4, 1, 16, dtype=torch.bfloat16),
++        )
++        slots = torch.tensor([3, 7])
++
++        k_pe, k_nope = self.impl.exec_kv_prefill(
++            kv_no_split,
++            MagicMock(),
++            MagicMock(),
++            kv_cache,
++            slots,
++        )
++
++        torch.testing.assert_close(k_pe, raw_k_pe)
++        torch.testing.assert_close(k_nope, kv_c_normed)
++        mock_npu_quantize.assert_called_once()
++        quantize_args = mock_npu_quantize.call_args.args
++        torch.testing.assert_close(quantize_args[0], kv_c_normed)
++        torch.testing.assert_close(
++            quantize_args[1], self.impl.fak_descale_reciprocal
++        )
++        self.assertEqual(
++            quantize_args[2:],
++            (None, torch.qint8, -1, False),
++        )
++        self.assertEqual(mock_scatter_pa_kv_cache.call_count, 2)
++        latent_call, position_call = mock_scatter_pa_kv_cache.call_args_list
++        latent_call = latent_call.kwargs
++        position_call = position_call.kwargs
++
++        torch.testing.assert_close(latent_call["key"], quantized_kv_c)
++        torch.testing.assert_close(latent_call["value"], quantized_kv_c)
++        self.assertEqual(latent_call["key_cache"].shape, (2, 1, 1, 4, 32))
++        self.assertIs(latent_call["key_cache"]._base, kv_cache[0])
++        self.assertIs(latent_call["value_cache"]._base, kv_cache[0])
++        torch.testing.assert_close(latent_call["slot_mapping"], slots)
++        self.assertEqual(latent_call["key"].dtype, latent_call["value"].dtype)
++        self.assertEqual(latent_call["cache_mode"], "PA_NZ")
++
++        torch.testing.assert_close(position_call["key"], raw_k_pe)
++        torch.testing.assert_close(position_call["value"], raw_k_pe)
++        self.assertEqual(position_call["key_cache"].shape, (2, 1, 1, 4, 16))
++        self.assertIs(position_call["key_cache"]._base, kv_cache[1])
++        self.assertIs(position_call["value_cache"]._base, kv_cache[1])
++        torch.testing.assert_close(position_call["slot_mapping"], slots)
++        self.assertEqual(position_call["key"].dtype, position_call["value"].dtype)
++        self.assertEqual(position_call["cache_mode"], "PA_NZ")
++
+     @patch("torch_npu.npu_kv_rmsnorm_rope_cache")
+     @patch("vllm_ascend.attention.mla_v1.DeviceOperator.reshape_and_cache")
+     def test_kimi_k3_exec_kv_decode_returns_full_raw_position_cache(
+@@ -2327,6 +2545,45 @@ class TestAscendMLAImpl(TestBase):
+         torch.testing.assert_close(cache_call["value"], raw_k_pe)
+         self.assertIs(cache_call["slot_mapping"], slots)
+ 
++    @patch("vllm_ascend.attention.mla_v1.get_ascend_device_type", return_value=AscendDeviceType.A3)
++    @patch("vllm_ascend.attention.mla_v1.torch_npu.npu_dynamic_quant")
++    def test_kimi_k3_decode_a3_c8_quantizes_latent_query_to_int8(
++        self,
++        mock_dynamic_quant,
++        mock_get_device_type,
++    ):
++        num_tokens = 2
++        self.impl.use_mla_rope = False
++        self.impl.fa_quant_layer = True
++        self.impl.dtype = torch.int8
++        self.impl.fak_descale_float = torch.tensor([0.25])
++        q_c = torch.randn(num_tokens, self.impl.q_lora_rank)
++        kv_no_split = torch.randn(num_tokens, self.impl.kv_lora_rank + self.impl.qk_rope_head_dim)
++        ql_nope = torch.randn(num_tokens, self.impl.num_heads, self.impl.kv_lora_rank)
++        raw_q_pe = torch.randn(num_tokens, self.impl.num_heads, self.impl.qk_rope_head_dim)
++        quantized_ql_nope = torch.zeros(ql_nope.shape, dtype=torch.int8)
++        query_scale = torch.full((num_tokens, self.impl.num_heads), 0.5)
++        self.impl._q_proj_and_k_up_proj = MagicMock(return_value=(ql_nope, raw_q_pe))
++        self.impl.rope_single = MagicMock(side_effect=lambda value, cos, sin: value)
++        mock_dynamic_quant.return_value = (quantized_ql_nope, query_scale)
++        k_pe_cache = MagicMock(name="k_pe_cache")
++        k_nope_cache = MagicMock(name="k_nope_cache")
++        self.impl.exec_kv_decode = MagicMock(return_value=(k_pe_cache, k_nope_cache))
++        attn_metadata = MagicMock(
++            num_decode_tokens=num_tokens,
++            slot_mapping=torch.tensor([3, 7]),
++        )
++
++        result = self.impl.mla_preprocess_decode(q_c, kv_no_split, MagicMock(), attn_metadata)
++
++        self.assertIs(result.ql_nope, quantized_ql_nope)
++        expected_q_pe = (raw_q_pe / query_scale.unsqueeze(-1) / self.impl.fak_descale_float).to(torch.bfloat16)
++        torch.testing.assert_close(result.q_pe, expected_q_pe)
++        self.assertIs(result.k_nope, k_nope_cache)
++        self.assertIs(result.k_pe, k_pe_cache)
++        self.assertIs(result.dequant_scale_q_nope, query_scale)
++        mock_dynamic_quant.assert_called_once_with(ql_nope, dst_type=torch.int8)
++
+     @patch("torch_npu.npu_kv_rmsnorm_rope_cache")
+     def test_exec_kv_prefill_with_fa_quant(self, mock_kv_rmsnorm_rope_cache):
+         # if fa_quant_layer is True
+@@ -2599,3 +2856,67 @@ class TestAscendMLAImpl(TestBase):
+         self.assertEqual(result.shape[0], B)
+         self.assertEqual(result.shape[1], self.impl.num_kv_heads)
+         self.assertEqual(result.shape[2], HD)
++
++    @patch("vllm_ascend.attention.mla_v1.get_ascend_device_type", return_value=AscendDeviceType.A3)
++    @patch("vllm_ascend.ascend_forward_context.get_forward_context")
++    @patch("torch_npu.npu_fused_infer_attention_score_v2")
++    def test_forward_decode_a3_fa_quant_pads_query_descale_with_heads(
++        self,
++        mock_npu_fused_infer_attention_score_v2,
++        mock_get_forward_context,
++        _mock_get_device_type,
++    ):
++        """FIA's per-token-per-head query descale must match padded Q heads."""
++        num_heads = 6
++        padded_heads = 8
++        block_size = 128
++        self.impl.num_heads = num_heads
++        self.impl.num_heads_padded = padded_heads
++        self.impl.head_padding = padded_heads - num_heads
++        self.impl.num_kv_heads = 1
++        self.impl.kv_lora_rank = 512
++        self.impl.qk_nope_head_dim = 512
++        self.impl.qk_rope_head_dim = 64
++        self.impl.enable_kv_nz = False
++        self.impl.enable_mla_fia_split = False
++        self.impl.fa_quant_layer = True
++        self.impl.use_mla_rope = False
++        self.impl.speculative_config = None
++        self.impl.fak_descale_float = torch.ones(1)
++        self.impl._v_up_proj = MagicMock(return_value=torch.empty(1, num_heads, self.impl.v_head_dim))
++
++        q_nope = torch.randn(1, num_heads, self.impl.qk_nope_head_dim)
++        q_pe = torch.randn(1, num_heads, self.impl.qk_rope_head_dim)
++        k_nope = torch.randint(
++            -128,
++            127,
++            (block_size, self.impl.num_kv_heads, self.impl.kv_lora_rank),
++            dtype=torch.int8,
++        )
++        k_pe = torch.randn(block_size, self.impl.num_kv_heads, self.impl.qk_rope_head_dim)
++        descale = torch.ones(1, num_heads)
++        attn_metadata = MagicMock()
++        attn_metadata.attn_state = AscendAttentionState.DecodeOnly
++        attn_metadata.decode = MagicMock()
++        attn_metadata.decode.block_table = torch.zeros((1, 1), dtype=torch.int32)
++        attn_metadata.decode.seq_lens_list = [block_size]
++
++        mock_get_forward_context.return_value = MagicMock(capturing=False)
++        mock_npu_fused_infer_attention_score_v2.return_value = [
++            torch.empty(padded_heads, 1, 1, self.impl.kv_lora_rank),
++            None,
++        ]
++
++        self.impl._forward_decode(q_nope, q_pe, k_nope, k_pe, block_size, attn_metadata, descale)
++
++        call_args = mock_npu_fused_infer_attention_score_v2.call_args
++        self.assertEqual(call_args.args[0].shape, (1, 1, padded_heads, self.impl.qk_nope_head_dim))
++        self.assertEqual(call_args.args[1].shape, (1, 1, 16, block_size, 32))
++        self.assertEqual(call_args.kwargs["key_rope"].shape, (1, 1, 4, block_size, 16))
++        expected_descale = torch.nn.functional.pad(
++            descale.view(1, 1, num_heads),
++            (0, padded_heads - num_heads),
++            "constant",
++            0,
++        )
++        torch.testing.assert_close(call_args.kwargs["dequant_scale_query"], expected_descale)
+diff --git a/tests/ut/models/test_kimi_k3.py b/tests/ut/models/test_kimi_k3.py
+index 7c2e572..7349605 100644
+--- a/tests/ut/models/test_kimi_k3.py
++++ b/tests/ut/models/test_kimi_k3.py
+@@ -15,6 +15,8 @@ from vllm_ascend.models.kimi_k3 import (
+     KimiK3MoE,
+     KimiK3TextModel,
+     KimiK3VisionEncoderLayer,
++    _get_decoder_layer_idx_from_weight_name,
++    _get_kimi_k3_num_loaded_layers,
+     _move_module_to_device,
+     _resolve_packed_expert_weight_name,
+     _routed_latent_quant_config,
+@@ -62,6 +64,123 @@ def test_kimi_k3_unquantized_model_keeps_latent_projections_unquantized():
+     assert _routed_latent_quant_config(None) is None
+ 
+ 
++@pytest.mark.parametrize(
++    ("env_value", "expected"),
++    [
++        ("0", 4),
++        ("3", 3),
++    ],
++)
++def test_kimi_k3_layer_reduction_config(
++    monkeypatch: pytest.MonkeyPatch,
++    env_value: str,
++    expected: int,
++):
++    monkeypatch.setenv("VLLM_ASCEND_KIMI_K3_MAX_LOADED_LAYERS", env_value)
++
++    assert _get_kimi_k3_num_loaded_layers(4) == expected
++
++
++@pytest.mark.parametrize("env_value", ["-1", "5", "True", "3.0"])
++def test_kimi_k3_layer_reduction_config_rejects_invalid_values(
++    monkeypatch: pytest.MonkeyPatch,
++    env_value: str,
++):
++    monkeypatch.setenv("VLLM_ASCEND_KIMI_K3_MAX_LOADED_LAYERS", env_value)
++
++    with pytest.raises(ValueError, match="VLLM_ASCEND_KIMI_K3_MAX_LOADED_LAYERS"):
++        _get_kimi_k3_num_loaded_layers(4)
++
++
++def test_kimi_k3_text_model_instantiates_only_requested_decoder_layers(
++    monkeypatch: pytest.MonkeyPatch,
++):
++    class StubModule(nn.Module):
++        pass
++
++    captured: dict[str, int] = {}
++
++    def fake_make_layers(num_hidden_layers, layer_fn, prefix):
++        del layer_fn, prefix
++        captured["num_hidden_layers"] = num_hidden_layers
++        return 0, num_hidden_layers, nn.ModuleList(
++            [StubModule() for _ in range(num_hidden_layers)]
++        )
++
++    monkeypatch.setattr(
++        kimi_k3,
++        "get_pp_group",
++        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
++    )
++    monkeypatch.setattr(
++        kimi_k3,
++        "VocabParallelEmbedding",
++        lambda *args, **kwargs: StubModule(),
++    )
++    monkeypatch.setattr(kimi_k3, "RMSNorm", lambda *args, **kwargs: StubModule())
++    monkeypatch.setattr(
++        kimi_k3,
++        "ReplicatedLinear",
++        lambda *args, **kwargs: StubModule(),
++    )
++    monkeypatch.setattr(kimi_k3, "make_layers", fake_make_layers)
++    monkeypatch.setenv("VLLM_ASCEND_KIMI_K3_MAX_LOADED_LAYERS", "2")
++
++    config = SimpleNamespace(
++        vocab_size=16,
++        hidden_size=8,
++        num_hidden_layers=4,
++        rms_norm_eps=1e-6,
++    )
++    vllm_config = SimpleNamespace(
++        model_config=SimpleNamespace(hf_text_config=config),
++    )
++
++    model = KimiK3TextModel(vllm_config=vllm_config, prefix="model")
++
++    assert model.num_loaded_layers == 2
++    assert captured["num_hidden_layers"] == 2
++    assert len(model.layers) == 2
++
++
++@pytest.mark.parametrize(
++    ("weight_name", "expected_layer"),
++    [
++        ("model.layers.2.mlp.gate_proj.weight", 2),
++        ("layers.3.self_attn.q_proj.weight", 3),
++        ("language_model.model.layers.4.mlp.up_proj.weight", 4),
++        ("model.layers.invalid.mlp.gate_proj.weight", None),
++        ("model.embed_tokens.weight", None),
++    ],
++)
++def test_kimi_k3_layer_reduction_parses_loader_prefixes(
++    weight_name: str,
++    expected_layer: int | None,
++):
++    assert _get_decoder_layer_idx_from_weight_name(weight_name) == expected_layer
++
++
++def test_kimi_k3_layer_reduction_skips_weights_for_omitted_layers(
++    monkeypatch: pytest.MonkeyPatch,
++):
++    model = KimiK3TextModel.__new__(KimiK3TextModel)
++    nn.Module.__init__(model)
++    model.config = SimpleNamespace(num_experts=0)
++    model.num_loaded_layers = 2
++    model.named_parameters = lambda: iter(())
++    monkeypatch.setattr(
++        kimi_k3,
++        "fused_moe_make_expert_params_mapping",
++        lambda *args, **kwargs: [],
++    )
++
++    loaded = model.load_weights(
++        [("model.layers.2.mlp.gate_proj.weight", torch.tensor([1.0]))]
++    )
++
++    assert loaded == set()
++
++
+ @pytest.mark.parametrize(
+     ("name", "params", "expected"),
+     [
+diff --git a/tests/ut/ops/test_fused_moe.py b/tests/ut/ops/test_fused_moe.py
+index c0ab9f1..711c1d7 100644
+--- a/tests/ut/ops/test_fused_moe.py
++++ b/tests/ut/ops/test_fused_moe.py
+@@ -438,7 +438,7 @@ def test_unquantized_shared_situ_uses_split_bf16_path(monkeypatch):
+     runner._shared_experts_part2.assert_called_once_with(hidden_states, gate_up)
+ 
+ 
+-def test_w8a8_shared_situ_uses_dequant_situ_quant(monkeypatch):
++def test_per_channel_w8a8_shared_situ_uses_dequant_situ_quant(monkeypatch):
+     runner = AscendMoERunner.__new__(AscendMoERunner)
+     nn.Module.__init__(runner)
+     hidden_states = torch.randn(2, 4, dtype=torch.bfloat16)
+@@ -455,12 +455,13 @@ def test_w8a8_shared_situ_uses_dequant_situ_quant(monkeypatch):
+     down_proj = MagicMock()
+     down_proj.weight = torch.ones(2, 4, dtype=torch.int8)
+     down_proj.weight_scale = torch.ones(4, dtype=torch.bfloat16)
++    down_proj.weight_scale_fp32 = torch.ones(4, dtype=torch.float32)
+     runner._shared_experts = SimpleNamespace(
+         gate_up_proj=gate_up_proj,
+         down_proj=down_proj,
+         act_fn=AscendSituAndMul(beta=4.0, linear_beta=25.0),
+     )
+-    runner.quant_type = QuantType.W4A8
++    runner.quant_type = QuantType.W8A8
+     runner.multistream_overlap_shared_expert = False
+     stream = MagicMock()
+     events = fused_moe_module.FusedMoEEvents(
+@@ -498,12 +499,122 @@ def test_w8a8_shared_situ_uses_dequant_situ_quant(monkeypatch):
+     down_proj.assert_not_called()
+     fast_dynamic_quant.assert_called_once_with(hidden_states)
+     assert fast_quant_matmul.call_count == 2
++    gate_up_call = fast_quant_matmul.call_args_list[0]
++    assert gate_up_call.args == (quantized_input, gate_up_proj.weight, gate_up_proj.weight_scale)
++    assert gate_up_call.kwargs["pertoken_scale"] is None
++    assert gate_up_call.kwargs["output_dtype"] == torch.int32
+     situ_call = custom_ops.dequant_situ_quant.call_args.kwargs
+     assert situ_call["x"] is gate_up
+     assert situ_call["weight_scale"] is gate_up_proj.weight_scale_fp32
+     assert situ_call["activation_scale"] is input_scale
+     assert situ_call["beta"] == 4.0
+     assert situ_call["linear_beta"] == 25.0
++    down_call = fast_quant_matmul.call_args_list[1]
++    assert down_call.args == (quantized_situ, down_proj.weight, down_proj.weight_scale)
++    assert down_call.kwargs["pertoken_scale"] is situ_scale
++    assert down_call.kwargs["output_dtype"] == hidden_states.dtype
++
++
++def test_per_channel_w4a8_shared_experts_use_weight_only_fallback(monkeypatch):
++    runner = AscendMoERunner.__new__(AscendMoERunner)
++    nn.Module.__init__(runner)
++    hidden_states = torch.randn(2, 4, dtype=torch.bfloat16)
++    gate_up = torch.randn(2, 8, dtype=torch.bfloat16)
++    down_out = torch.randn(2, 4, dtype=torch.bfloat16)
++    runner._shared_experts = SimpleNamespace(
++        gate_up_proj=SimpleNamespace(
++            weight_scale=torch.ones(8),
++            weight_scale_fp32=torch.ones(8),
++        ),
++        down_proj=SimpleNamespace(
++            weight_scale=torch.ones(4),
++            weight_scale_fp32=torch.ones(4),
++        ),
++        act_fn=AscendSituAndMul(beta=4.0, linear_beta=25.0),
++    )
++    runner._shared_experts_part1 = MagicMock(return_value=gate_up)
++    runner._shared_experts_part2 = MagicMock(return_value=down_out)
++    runner.quant_type = QuantType.W4A8
++    runner.multistream_overlap_shared_expert = False
++    events = fused_moe_module.FusedMoEEvents(
++        before_routed_experts=MagicMock(),
++        before_dispatch=MagicMock(),
++        before_combine=MagicMock(),
++    )
++    quant_matmul = MagicMock()
++
++    monkeypatch.setattr(fused_moe_module, "npu_stream_switch", lambda *_args, **_kwargs: nullcontext())
++    monkeypatch.setattr(fused_moe_module, "shared_expert_dp_enabled", lambda: True)
++    monkeypatch.setattr(fused_moe_module, "shared_experts_calculation_stream", MagicMock())
++    monkeypatch.setattr(
++        fused_moe_module.torch.npu,
++        "current_stream",
++        MagicMock(return_value=MagicMock()),
++    )
++    monkeypatch.setattr(fused_moe_module.torch_npu, "npu_quant_matmul", quant_matmul)
++    monkeypatch.setattr(
++        fused_moe_module,
++        "_EXTRA_CTX",
++        SimpleNamespace(
++            flash_comm_v1_enabled=False,
++            moe_comm_type=MoECommType.ALLGATHER,
++        ),
++    )
++
++    output = runner._forward_shared_experts(hidden_states, events)
++
++    assert output is down_out
++    runner._shared_experts_part1.assert_called_once_with(hidden_states)
++    runner._shared_experts_part2.assert_called_once_with(hidden_states, gate_up)
++    quant_matmul.assert_not_called()
++
++
++def test_per_group_w4a8_shared_experts_use_quantized_linear_path(monkeypatch):
++    runner = AscendMoERunner.__new__(AscendMoERunner)
++    nn.Module.__init__(runner)
++    hidden_states = torch.randn(2, 4, dtype=torch.bfloat16)
++    gate_up = torch.randn(2, 8, dtype=torch.bfloat16)
++    down_out = torch.randn(2, 4, dtype=torch.bfloat16)
++    runner._shared_experts = SimpleNamespace(
++        gate_up_proj=SimpleNamespace(weight_scale=torch.ones(1)),
++        down_proj=SimpleNamespace(weight_scale=torch.ones(1)),
++        act_fn=nn.Identity(),
++    )
++    runner._shared_experts_part1 = MagicMock(return_value=gate_up)
++    runner._shared_experts_part2 = MagicMock(return_value=down_out)
++    runner.quant_type = QuantType.W4A8
++    runner.multistream_overlap_shared_expert = False
++    events = fused_moe_module.FusedMoEEvents(
++        before_routed_experts=MagicMock(),
++        before_dispatch=MagicMock(),
++        before_combine=MagicMock(),
++    )
++    quant_matmul = MagicMock()
++
++    monkeypatch.setattr(fused_moe_module, "npu_stream_switch", lambda *_args, **_kwargs: nullcontext())
++    monkeypatch.setattr(fused_moe_module, "shared_expert_dp_enabled", lambda: True)
++    monkeypatch.setattr(fused_moe_module, "shared_experts_calculation_stream", MagicMock())
++    monkeypatch.setattr(
++        fused_moe_module.torch.npu,
++        "current_stream",
++        MagicMock(return_value=MagicMock()),
++    )
++    monkeypatch.setattr(fused_moe_module.torch_npu, "npu_quant_matmul", quant_matmul)
++    monkeypatch.setattr(
++        fused_moe_module,
++        "_EXTRA_CTX",
++        SimpleNamespace(
++            flash_comm_v1_enabled=False,
++            moe_comm_type=MoECommType.ALLGATHER,
++        ),
++    )
++
++    output = runner._forward_shared_experts(hidden_states, events)
++
++    assert output is down_out
++    runner._shared_experts_part1.assert_called_once_with(hidden_states)
++    runner._shared_experts_part2.assert_called_once_with(hidden_states, gate_up)
++    quant_matmul.assert_not_called()
+ 
+ 
+ @pytest.mark.parametrize("quant_type", [QuantType.W4A8MXFP, QuantType.W8A8MXFP])
+diff --git a/tests/ut/quantization/methods/a2/test_w4a8.py b/tests/ut/quantization/methods/a2/test_w4a8.py
+index 5d0ea50..db445ac 100644
+--- a/tests/ut/quantization/methods/a2/test_w4a8.py
++++ b/tests/ut/quantization/methods/a2/test_w4a8.py
+@@ -1,3 +1,4 @@
++from types import SimpleNamespace
+ from unittest.mock import MagicMock, Mock, patch
+ 
+ import regex as re
+@@ -54,6 +55,145 @@ class TestAscendW4A8DynamicLinearMethod(TestBase):
+         self.assertEqual(params["scale_bias"].dtype, torch.float32)
+         self.assertEqual(params["scale_bias"].shape, (32, 16))
+ 
++    def test_per_channel_weight_uses_only_first_level_scale(self):
++        self.method.group_size = 0
++        self.method.is_per_channel_weight = True
++        self.method.new_quant_version = True
++
++        params = self.method.get_pergroup_param(8, 32, torch.bfloat16)
++
++        self.assertEqual(params["weight_scale"].shape, (32, 1))
++        self.assertEqual(params["weight_offset"].shape, (32, 1))
++        self.assertNotIn("weight_scale_second", params)
++        self.assertNotIn("weight_offset_second", params)
++        self.assertEqual(params["scale_bias"].shape, (32, 1))
++
++    @patch("torch_npu.npu_quant_matmul")
++    @patch("torch_npu.npu_dynamic_quant")
++    def test_apply_per_channel_weight_uses_per_token_activation_scale(self, mock_dynamic_quant, mock_matmul):
++        self.method.group_size = 0
++        self.method.is_per_channel_weight = True
++        layer = torch.nn.Module()
++        layer.weight = torch.nn.Parameter(torch.empty(8, 4, dtype=torch.int32), requires_grad=False)
++        layer.weight_scale = torch.nn.Parameter(torch.ones(8, dtype=torch.bfloat16), requires_grad=False)
++        x = torch.randn(2, 4, dtype=torch.bfloat16)
++        quantized_x = torch.ones(2, 4, dtype=torch.int8)
++        pertoken_scale = torch.ones(2, dtype=torch.float32)
++        mock_dynamic_quant.return_value = (quantized_x, pertoken_scale)
++        mock_matmul.return_value = torch.empty(2, 8, dtype=torch.bfloat16)
++
++        self.method.apply(layer, x)
++
++        mock_dynamic_quant.assert_called_once_with(x)
++        self.assertEqual(mock_matmul.call_args.args, (quantized_x, layer.weight, layer.weight_scale))
++        self.assertIs(mock_matmul.call_args.kwargs["pertoken_scale"], pertoken_scale)
++        self.assertEqual(mock_matmul.call_args.kwargs["output_dtype"], x.dtype)
++
++    @patch("torch_npu.npu_grouped_matmul")
++    @patch("torch_npu.npu_dynamic_quant")
++    def test_apply_kimi_shared_expert_uses_w4a8_grouped_matmul(self, mock_dynamic_quant, mock_grouped_matmul):
++        self.method.enable_per_channel_for_kimi_shared_expert()
++        layer = torch.nn.Module()
++        layer.weight = torch.nn.Parameter(torch.empty(1, 4, 1, dtype=torch.int32), requires_grad=False)
++        layer.weight_scale = torch.nn.Parameter(torch.ones(8, dtype=torch.int64), requires_grad=False)
++        layer.scale_bias = torch.nn.Parameter(torch.arange(8, dtype=torch.float32), requires_grad=False)
++        x = torch.randn(2, 1, 4, dtype=torch.bfloat16)
++        quantized_x = torch.ones(2, 4, dtype=torch.int8)
++        pertoken_scale = torch.ones(2, dtype=torch.float32)
++        expected_2d = torch.empty(2, 8, dtype=torch.bfloat16)
++        mock_dynamic_quant.return_value = (quantized_x, pertoken_scale)
++        mock_grouped_matmul.return_value = [expected_2d]
++
++        # A host-backed ``torch.tensor(..., device="npu")`` is illegal during
++        # ACL Graph capture. Keep this unit test sensitive to that regression;
++        # the implementation should create group_list with a device fill op.
++        with patch(
++            "torch.tensor",
++            side_effect=AssertionError("host tensor construction is not graph-safe"),
++        ):
++            output = self.method.apply(layer, x)
++
++        self.assertEqual(output.shape, (2, 1, 8))
++        mock_dynamic_quant.assert_called_once()
++        torch.testing.assert_close(mock_dynamic_quant.call_args.args[0], x.reshape(2, 4))
++        mock_grouped_matmul.assert_called_once()
++        call = mock_grouped_matmul.call_args.kwargs
++        self.assertIs(call["x"][0], quantized_x)
++        self.assertIs(call["weight"][0], layer.weight)
++        torch.testing.assert_close(call["scale"][0], layer.weight_scale.reshape(1, 1, -1))
++        torch.testing.assert_close(call["bias"][0], layer.scale_bias.reshape(1, -1))
++        self.assertIs(call["per_token_scale"][0], pertoken_scale)
++        torch.testing.assert_close(call["group_list"], torch.tensor([2]))
++        self.assertEqual(call["split_item"], 2)
++        self.assertEqual(call["group_type"], 0)
++        self.assertEqual(call["group_list_type"], 1)
++        self.assertEqual(call["output_dtype"], x.dtype)
++
++    @patch("torch_npu.npu_grouped_matmul")
++    @patch("torch_npu.npu_dynamic_quant")
++    def test_apply_kimi_shared_expert_selects_tp_scale_bias(self, mock_dynamic_quant, mock_grouped_matmul):
++        self.method.enable_per_channel_for_kimi_shared_expert()
++        layer = torch.nn.Module()
++        layer.weight = torch.nn.Parameter(torch.empty(1, 4, 1, dtype=torch.int32), requires_grad=False)
++        layer.weight_scale = torch.nn.Parameter(torch.ones(8, dtype=torch.int64), requires_grad=False)
++        layer.scale_bias = torch.nn.Parameter(
++            torch.arange(8 * 16, dtype=torch.float32).reshape(8, 16),
++            requires_grad=False,
++        )
++        x = torch.randn(2, 4, dtype=torch.bfloat16)
++        mock_dynamic_quant.return_value = (
++            torch.ones(2, 4, dtype=torch.int8),
++            torch.ones(2, dtype=torch.float32),
++        )
++        mock_grouped_matmul.return_value = [torch.empty(2, 8)]
++
++        self.method.apply(layer, x, tp_rank=3)
++
++        grouped_bias = mock_grouped_matmul.call_args.kwargs["bias"][0]
++        torch.testing.assert_close(grouped_bias, layer.scale_bias[:, 3].reshape(1, -1))
++
++    @patch("vllm_ascend.quantization.methods.w4a8.get_tensor_model_parallel_world_size", return_value=1)
++    @patch("vllm_ascend.quantization.methods.w4a8.get_current_vllm_config")
++    def test_kimi_k3_text_config_marks_only_shared_expert(self, mock_get_current_vllm_config, _mock_get_tp_world_size):
++        """Text-only K3 loading exposes kimi_linear as its immediate config."""
++        mock_get_current_vllm_config.return_value = SimpleNamespace(
++            quant_config=SimpleNamespace(quant_description={"group_size": 256}),
++            model_config=SimpleNamespace(
++                hf_config=SimpleNamespace(model_type="kimi_linear"),
++                hf_text_config=SimpleNamespace(
++                    model_type="kimi_linear",
++                    mla_use_output_gate=True,
++                    routed_expert_hidden_size=3584,
++                ),
++            ),
++        )
++        method = AscendW4A8DynamicLinearMethod()
++        shared_layer = SimpleNamespace(prefix="model.layers.0.block_sparse_moe.shared_experts.gate_up_proj")
++        routed_layer = SimpleNamespace(prefix="model.layers.0.block_sparse_moe.experts")
++
++        self.assertTrue(method._uses_per_channel_shared_expert(shared_layer))
++        self.assertFalse(method._uses_per_channel_shared_expert(routed_layer))
++
++    @patch("vllm_ascend.quantization.methods.w4a8.maybe_trans_nz", side_effect=identity)
++    def test_process_per_channel_weight_without_second_level_scale(self, _mock_maybe_trans_nz):
++        self.method.group_size = 0
++        self.method.is_per_channel_weight = True
++        self.method.new_quant_version = True
++        layer = torch.nn.Module()
++        layer.weight = torch.nn.Parameter(torch.zeros((16, 8), dtype=torch.int8), requires_grad=False)
++        layer.weight_scale = torch.nn.Parameter(torch.ones((32, 1), dtype=torch.bfloat16), requires_grad=False)
++        layer.weight_offset = torch.nn.Parameter(torch.empty((32, 1), dtype=torch.float32), requires_grad=False)
++        layer.scale_bias = torch.nn.Parameter(torch.zeros((32, 1), dtype=torch.float32), requires_grad=False)
++
++        self.method.process_weights_after_loading(layer)
++
++        self.assertEqual(layer.weight.data.shape, (8, 4))
++        self.assertEqual(layer.weight_scale.data.shape, (32,))
++        self.assertEqual(layer.weight_scale.dtype, torch.bfloat16)
++        self.assertEqual(layer.weight_scale_fp32.dtype, torch.float32)
++        torch.testing.assert_close(layer.weight_scale_fp32, layer.weight_scale.data.float())
++        self.assertFalse(hasattr(layer, "weight_scale_second"))
++
+     @patch("vllm_ascend.quantization.methods.w4a8.maybe_trans_nz")
+     @patch("torch_npu.npu_convert_weight_to_int4pack")
+     @patch("torch.Tensor.npu")
+@@ -128,6 +268,48 @@ class TestAscendW4A8DynamicLinearMethod(TestBase):
+         ):
+             self.method.process_weights_after_loading(layer)
+ 
++    @patch("vllm_ascend.quantization.methods.w4a8.maybe_trans_nz")
++    @patch("torch_npu.npu_convert_weight_to_int4pack")
++    def test_process_kimi_shared_expert_prepares_grouped_nz_weight(self, mock_int4pack, mock_maybe_trans_nz):
++        self.method.enable_per_channel_for_kimi_shared_expert()
++        self.method.new_quant_version = True
++        mock_maybe_trans_nz.side_effect = identity
++        layer = torch.nn.Module()
++        layer.weight = torch.nn.Parameter(torch.zeros((16, 8), dtype=torch.int8), requires_grad=False)
++        layer.weight_scale = torch.nn.Parameter(
++            torch.tensor([[1.0], [2.0]] + [[1.0]] * 30, dtype=torch.float32),
++            requires_grad=False,
++        )
++        layer.weight_offset = torch.nn.Parameter(torch.zeros((32, 1), dtype=torch.bfloat16), requires_grad=False)
++        layer.scale_bias = torch.nn.Parameter(torch.zeros((32, 1), dtype=torch.float32), requires_grad=False)
++
++        self.method.process_weights_after_loading(layer)
++
++        mock_int4pack.assert_not_called()
++        mock_maybe_trans_nz.assert_called_once()
++        nz_input = mock_maybe_trans_nz.call_args.args[0]
++        self.assertEqual(nz_input.shape, torch.Size([1, 8, 16]))
++        self.assertEqual(nz_input.dtype, torch.int8)
++        self.assertEqual(layer.weight.shape, torch.Size([1, 8, 4]))
++        self.assertEqual(layer.weight.dtype, torch.int32)
++        self.assertEqual(layer.weight_scale_fp32.dtype, torch.float32)
++        self.assertEqual(layer.weight_scale_fp32.shape, torch.Size([32]))
++        self.assertEqual(layer.weight_scale.dtype, torch.int64)
++        expected_scale_bits = layer.weight_scale_fp32.numpy().view("uint32").astype("int64")
++        torch.testing.assert_close(layer.weight_scale, torch.from_numpy(expected_scale_bits))
++        self.assertEqual(layer.scale_bias.shape, torch.Size([32]))
++
++    def test_process_kimi_shared_expert_rejects_old_quant_version(self):
++        self.method.enable_per_channel_for_kimi_shared_expert()
++        self.method.new_quant_version = False
++        layer = torch.nn.Module()
++        layer.weight = torch.nn.Parameter(torch.zeros((32, 8), dtype=torch.int8), requires_grad=False)
++        layer.weight_scale = torch.nn.Parameter(torch.ones((32, 1), dtype=torch.float32), requires_grad=False)
++        layer.weight_offset = torch.nn.Parameter(torch.zeros((32, 1), dtype=torch.float32), requires_grad=False)
++
++        with self.assertRaisesRegex(ValueError, "requires quantization version 1.0.0"):
++            self.method.process_weights_after_loading(layer)
++
+ 
+ class TestAscendW4A8DynamicLinearMethodWithNpu(TestBase):
+     @patch("vllm_ascend.quantization.methods.w4a8.get_tensor_model_parallel_world_size")
+diff --git a/tests/ut/quantization/methods/test_kv_c8.py b/tests/ut/quantization/methods/test_kv_c8.py
+index 9353f94..9f3ee7f 100644
+--- a/tests/ut/quantization/methods/test_kv_c8.py
++++ b/tests/ut/quantization/methods/test_kv_c8.py
+@@ -151,7 +151,7 @@ class TestAscendFAQuantAttentionMethodInit(unittest.TestCase):
+         self.mock_hf_config = Mock()
+         self.mock_hf_config.kv_lora_rank = 128
+         self.mock_hf_config.qk_rope_head_dim = 64
+-        self.mock_config.model_config.hf_config = self.mock_hf_config
++        self.mock_config.model_config.hf_text_config = self.mock_hf_config
+         self.mock_get_config.return_value = self.mock_config
+ 
+         # Import the class after patching
+@@ -192,7 +192,7 @@ class TestAscendFAQuantAttentionMethodCreateWeights(unittest.TestCase):
+         self.mock_hf_config = Mock()
+         self.mock_hf_config.kv_lora_rank = 128
+         self.mock_hf_config.qk_rope_head_dim = 64
+-        self.mock_config.model_config.hf_config = self.mock_hf_config
++        self.mock_config.model_config.hf_text_config = self.mock_hf_config
+         self.mock_get_config.return_value = self.mock_config
+ 
+         # Import the class
+@@ -308,7 +308,7 @@ class TestAscendFAQuantAttentionMethodProcessWeights(unittest.TestCase):
+         self.mock_hf_config = Mock()
+         self.mock_hf_config.kv_lora_rank = 64
+         self.mock_hf_config.qk_rope_head_dim = 32
+-        self.mock_config.model_config.hf_config = self.mock_hf_config
++        self.mock_config.model_config.hf_text_config = self.mock_hf_config
+         self.mock_get_config.return_value = self.mock_config
+ 
+         # Import the class
+@@ -363,7 +363,7 @@ class TestIntegration(unittest.TestCase):
+         self.mock_hf_config = Mock()
+         self.mock_hf_config.kv_lora_rank = 64
+         self.mock_hf_config.qk_rope_head_dim = 32
+-        self.mock_config.model_config.hf_config = self.mock_hf_config
++        self.mock_config.model_config.hf_text_config = self.mock_hf_config
+         self.mock_get_config.return_value = self.mock_config
+ 
+         # Mock distributed functions
+diff --git a/tests/ut/quantization/test_modelslim_config.py b/tests/ut/quantization/test_modelslim_config.py
+index 367b434..7560e29 100644
+--- a/tests/ut/quantization/test_modelslim_config.py
++++ b/tests/ut/quantization/test_modelslim_config.py
+@@ -19,6 +19,7 @@ from vllm_ascend.quantization.modelslim_config import (
+     get_linear_quant_type,
+     get_packed_modules_mapping,
+ )
++from vllm_ascend.quantization.methods.w4a8 import AscendW4A8DynamicLinearMethod
+ from vllm_ascend.utils import ASCEND_QUANTIZATION_METHOD
+ 
+ 
+@@ -192,6 +193,57 @@ class TestAscendModelSlimConfig(TestBase):
+             "experts.0.down_proj",
+         ]
+ 
++    def test_kimi_k3_shared_expert_w4a8_uses_per_channel_scheme(self):
++        prefix = "model.layers.0.mlp.shared_experts.gate_up_proj"
++        config = AscendModelSlimConfig({f"{prefix}.weight": "W4A8_DYNAMIC"})
++        vllm_config = MagicMock()
++        vllm_config.model_config.hf_config.model_type = "kimi_k3"
++        vllm_config.model_config.hf_text_config = MagicMock()
++        linear = MagicMock(spec=LinearBase)
++        scheme = MagicMock(spec=AscendW4A8DynamicLinearMethod)
++
++        with (
++            patch(
++                "vllm_ascend.quantization.modelslim_config.get_current_vllm_config",
++                return_value=vllm_config,
++            ),
++            patch(
++                "vllm_ascend.quantization.modelslim_config.create_scheme_for_layer",
++                return_value=scheme,
++            ),
++            patch("vllm_ascend.quantization.method_adapters.AscendLinearMethod", return_value=MagicMock()),
++        ):
++            config.get_quant_method(linear, prefix)
++
++        scheme.enable_per_channel_for_kimi_shared_expert.assert_called_once_with()
++
++    def test_kimi_k3_text_config_shared_expert_w4a8_uses_per_channel_scheme(self):
++        """Keep the K3 override when vLLM exposes only the nested text config."""
++        prefix = "model.layers.0.block_sparse_moe.shared_experts.gate_up_proj"
++        config = AscendModelSlimConfig({f"{prefix}.weight": "W4A8_DYNAMIC"})
++        vllm_config = MagicMock()
++        vllm_config.model_config.hf_config.model_type = "kimi_linear"
++        vllm_config.model_config.hf_text_config.model_type = "kimi_linear"
++        vllm_config.model_config.hf_text_config.mla_use_output_gate = True
++        vllm_config.model_config.hf_text_config.routed_expert_hidden_size = 3584
++        linear = MagicMock(spec=LinearBase)
++        scheme = MagicMock(spec=AscendW4A8DynamicLinearMethod)
++
++        with (
++            patch(
++                "vllm_ascend.quantization.modelslim_config.get_current_vllm_config",
++                return_value=vllm_config,
++            ),
++            patch(
++                "vllm_ascend.quantization.modelslim_config.create_scheme_for_layer",
++                return_value=scheme,
++            ),
++            patch("vllm_ascend.quantization.method_adapters.AscendLinearMethod", return_value=MagicMock()),
++        ):
++            config.get_quant_method(linear, prefix)
++
++        scheme.enable_per_channel_for_kimi_shared_expert.assert_called_once_with()
++
+     def test_missing_linear_weight_without_gate_capability_does_not_fall_back(self):
+         config = AscendModelSlimConfig({})
+         config.packed_modules_mapping = {}
+@@ -597,6 +649,15 @@ class TestGetCacheScaleMapper(TestBase):
+             mapper._map_name("model.layers.1.fa_v.offset"),
+             "model.layers.1.mla_attn.mla_attn.fa_v.offset",
+         )
++        # Kimi K3 multimodal loading invokes AutoWeightsLoader for both the
++        # outer model and language_model. A second application must preserve
++        # the parameter name registered on the inner MLAAttention module.
++        checkpoint_name = "language_model.model.layers.23.self_attn.fa_q.offset"
++        mapped_name = mapper._map_name(checkpoint_name)
++        self.assertEqual(
++            mapper._map_name(mapped_name),
++            "language_model.model.layers.23.self_attn.mla_attn.mla_attn.fa_q.offset",
++        )
+ 
+     def test_indexer_quant_returns_mapper(self):
+         config = AscendModelSlimConfig(
+@@ -615,6 +676,11 @@ class TestGetCacheScaleMapper(TestBase):
+             mapper._map_name("model.layers.1.indexer.k_rot"),
+             "model.layers.1.mla_attn.mla_attn.indexer.k_rot",
+         )
++        mapped_name = mapper._map_name("model.layers.1.indexer.q_rot")
++        self.assertEqual(
++            mapper._map_name(mapped_name),
++            "model.layers.1.mla_attn.mla_attn.indexer.q_rot",
++        )
+ 
+ 
+ class TestApplyVllmMapper(TestBase):
+diff --git a/tests/ut/worker/a2/test_model_runner_v1.py b/tests/ut/worker/a2/test_model_runner_v1.py
+index 15264d1..f26515f 100644
+--- a/tests/ut/worker/a2/test_model_runner_v1.py
++++ b/tests/ut/worker/a2/test_model_runner_v1.py
+@@ -144,6 +144,109 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
+         self.assertEqual(k_cache.shape, (2, 16, 8, 64))
+         self.assertEqual(v_cache.shape, (2, 16, 8, 64))
+ 
++    @patch("vllm_ascend.worker.model_runner_v1.enable_fa_quant", return_value=True)
++    @patch("vllm_ascend.worker.model_runner_v1.has_ec_transfer", return_value=False)
++    @patch("vllm_ascend.worker.model_runner_v1.get_layers_from_vllm_config")
++    def test_a3_fa_quant_mla_cache_accounts_for_mixed_dtype_bytes(
++        self,
++        mock_get_layers,
++        _mock_has_ec_transfer,
++        _mock_enable_fa_quant,
++    ):
++        runner = self._build_runner()
++        runner.block_size = 16
++        runner.shared_kv_cache_layers = {}
++        runner.model_config.dtype = torch.bfloat16
++        runner.attn_backend.get_kv_cache_shape.side_effect = (
++            lambda num_blocks, block_size, num_kv_heads, head_size: (
++                num_blocks,
++                block_size,
++                num_kv_heads,
++                head_size,
++            )
++        )
++
++        layer_name = "model.layers.5.self_attn.attn"
++        attn_module = MLAAttention.__new__(MLAAttention)
++        torch.nn.Module.__init__(attn_module)
++        attn_module.head_size = 576
++        attn_module.kv_lora_rank = 512
++        attn_module.qk_rope_head_dim = 64
++        attn_module.impl = SimpleNamespace(
++            fa_quant_layer=True,
++            dtype=torch.int8,
++        )
++        attn_module.get_kv_cache_spec = MagicMock(
++            return_value=AscendMLAAttentionSpec(
++                block_size=runner.block_size,
++                num_kv_heads=1,
++                head_size=576,
++                dtype=torch.bfloat16,
++                cache_dtype_str="auto",
++            )
++        )
++        mock_get_layers.return_value = {layer_name: attn_module}
++        layer_spec = runner.get_kv_cache_spec()[layer_name]
++        spec = AscendMLAAttentionSpec.merge([layer_spec])
++        expected_bytes_per_token = 512 + 64 * 2
++        self.assertEqual(spec.dtype, torch.int8)
++        self.assertEqual(spec.head_size, expected_bytes_per_token)
++        self.assertEqual(spec.page_size_bytes, runner.block_size * expected_bytes_per_token)
++
++        num_blocks = 2
++        kv_cache_config = KVCacheConfig(
++            num_blocks=num_blocks,
++            kv_cache_tensors=[
++                KVCacheTensor(
++                    size=spec.page_size_bytes * num_blocks,
++                    shared_by=[layer_name],
++                )
++            ],
++            kv_cache_groups=[
++                KVCacheGroupSpec(
++                    layer_names=[layer_name],
++                    kv_cache_spec=spec,
++                )
++            ],
++        )
++        raw_caches = runner._allocate_kv_cache_tensors(kv_cache_config)
++        raw_k_cache, raw_v_cache = raw_caches[layer_name]
++        runner.vllm_config.quant_config.get_kv_quant_split_factor.assert_not_called()
++        self.assertEqual(raw_k_cache.numel(), num_blocks * runner.block_size * 512)
++        self.assertEqual(raw_v_cache.numel(), num_blocks * runner.block_size * 64 * 2)
++
++        runner._kv_cache_spec_attn_group_iterator = lambda: [
++            SimpleNamespace(
++                kv_cache_spec=spec,
++                backend=runner.attn_backend,
++                layer_names=[layer_name],
++            )
++        ]
++        k_cache, v_cache = runner._reshape_kv_cache_tensors(
++            kv_cache_config,
++            raw_caches,
++        )[layer_name]
++        runner.vllm_config.quant_config.get_kv_quant_dtype.assert_not_called()
++        self.assertEqual(k_cache.dtype, torch.int8)
++        self.assertEqual(k_cache.shape, (num_blocks, runner.block_size, 1, 512))
++        self.assertEqual(v_cache.dtype, torch.bfloat16)
++        self.assertEqual(v_cache.shape, (num_blocks, runner.block_size, 1, 64))
++        runner.use_hybrid_blocks = True
++        runner.hybrid_with_attn_and_mamba = True
++        runner.attn_backend.get_supported_kernel_block_sizes.return_value = [runner.block_size]
++        hybrid_raw_cache = torch.zeros(
++            spec.page_size_bytes * num_blocks,
++            dtype=torch.int8,
++        )
++        hybrid_k_cache, hybrid_v_cache = runner._reshape_kv_cache_tensors(
++            kv_cache_config,
++            {layer_name: hybrid_raw_cache},
++        )[layer_name]
++        self.assertEqual(hybrid_k_cache.dtype, torch.int8)
++        self.assertEqual(hybrid_k_cache.shape, (num_blocks, runner.block_size, 1, 512))
++        self.assertEqual(hybrid_v_cache.dtype, torch.bfloat16)
++        self.assertEqual(hybrid_v_cache.shape, (num_blocks, runner.block_size, 1, 64))
++
+     @patch("vllm_ascend.worker.model_runner_v1.has_ec_transfer", return_value=False)
+     @patch("vllm_ascend.worker.model_runner_v1.get_layers_from_vllm_config")
+     def test_sparse_layer_without_indexer_allocates_only_mla_kv_cache(
+@@ -338,6 +441,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
+         runner.c8_k_cache_dtype = torch.int8
+         runner.c8_k_scale_cache_dtype = torch.float16
+         runner._get_attention_kv_cache_dims = lambda _layer_name, _spec: (512, 64)
++        runner._get_mla_fa_quant_cache_dtypes = MagicMock(return_value=None)
+ 
+         attn_layer_name = "model.layers.1.self_attn.attn"
+         indexer_layer_name = "model.layers.1.self_attn.indexer.k_cache"
+diff --git a/vllm_ascend/attention/mla_v1.py b/vllm_ascend/attention/mla_v1.py
+index 87573b6..53cca55 100644
+--- a/vllm_ascend/attention/mla_v1.py
++++ b/vllm_ascend/attention/mla_v1.py
+@@ -1,4 +1,5 @@
+ from dataclasses import dataclass
++import os
+ from typing import TYPE_CHECKING, NamedTuple, TypeVar
+ 
+ import numpy as np
+@@ -7,6 +8,7 @@ import torch.nn.functional as F
+ import torch_npu
+ import vllm.envs as envs_vllm
+ from vllm.config import VllmConfig, get_current_vllm_config
++from vllm.distributed import get_tp_group
+ from vllm.logger import logger
+ from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadataBuilder
+ from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+@@ -933,11 +935,28 @@ class AscendMLAImpl(MLAAttentionImpl):
+ 
+         self.layer_name = kwargs.get("layer_name")
+         self.fa_quant_layer = enable_fa_quant(self.vllm_config, self.layer_name)
+-        if not self.use_mla_rope and self.fa_quant_layer:
+-            # The FA-quant prolog still requires RoPE tensors. MLAPO accepts
+-            # None for both cos and sin and keeps K3's positional slice in
+-            # checkpoint order.
+-            logger.warning_once("FA quant is disabled for MLA layers with RoPE disabled.")
++        # A3's generic FA-quant gate is restricted to KV consumers because it
++        # normally takes the fused MLA-prolog path. K3 must bypass that prolog:
++        # its no-RoPE positional slice cannot be reordered by the fused kernel.
++        # Keep the exception local so other MLA models retain their A3 behavior.
++        if (
++            not self.fa_quant_layer
++            and not self.use_mla_rope
++            and get_ascend_device_type() == AscendDeviceType.A3
++            and self.vllm_config.quant_config is not None
++            and getattr(self.vllm_config.quant_config, "enable_fa_quant", False)
++        ):
++            self.fa_quant_layer = self.vllm_config.quant_config.is_fa_quant_layer(self.layer_name)
++        if not self.use_mla_rope and self.enable_mlapo:
++            # MLAPO fuses rotary reordering into the q/kv prolog. K3's
++            # positional slice must remain in checkpoint order.
++            logger.warning_once("MLAPO is disabled for MLA layers with RoPE disabled.")
++            self.enable_mlapo = False
++        if not self.use_mla_rope and self.fa_quant_layer and get_ascend_device_type() not in {
++            AscendDeviceType.A3,
++            AscendDeviceType.A5,
++        }:
++            logger.warning_once("FA quant for no-RoPE MLA layers is supported only on A3/A5; falling back to BF16.")
+             self.fa_quant_layer = False
+         if self.fa_quant_layer:
+             self.dtype = torch.float8_e4m3fn if get_ascend_device_type() == AscendDeviceType.A5 else torch.int8
+@@ -1207,6 +1226,7 @@ class AscendMLAImpl(MLAAttentionImpl):
+             layer = self.vllm_config.compilation_config.static_forward_context[self.layer_name]
+             self.quant_kscale = layer.quant_kscale
+             self.fak_descale_float = layer.fak_descale_float
++            self.fak_descale_reciprocal = layer.fak_descale_reciprocal
+ 
+     def _prepare_mlapo_rope_weight(self, weight: torch.Tensor) -> torch.Tensor:
+         if not self.use_mla_rope:
+@@ -1331,6 +1351,74 @@ class AscendMLAImpl(MLAAttentionImpl):
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+         return kv_c_normed, k_pe
+ 
++    def _uses_a3_kimi_c8_cache(self) -> bool:
++        """Whether K3's A3 C8 cache needs its mixed dtypes loaded separately."""
++        return (
++            bool(self.fa_quant_layer)
++            and not self.use_mla_rope
++            and get_ascend_device_type() == AscendDeviceType.A3
++        )
++
++    @staticmethod
++    def _compact_block_table_for_nz_gather(
++        cache: torch.Tensor,
++        block_table: torch.Tensor,
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        """Return referenced cache blocks and a block table indexed into them.
++
++        K3 A3 C8 writes PA-NZ bytes into the regular vLLM cache pool.  The
++        Gather wrapper determines PA-NZ from the source tensor's format, so
++        chunked prefill works on a temporary compact cache segment rather than
++        format-casting the complete layer cache.
++        """
++        table_long = block_table.to(torch.long)
++        block_ids = torch.unique(table_long[table_long >= 0], sorted=True)
++        if block_ids.numel() == 0:
++            raise ValueError("Chunked-context block table does not reference any KV cache block.")
++        if int(block_ids[-1]) >= cache.shape[0]:
++            raise ValueError(
++                f"Block table references block {int(block_ids[-1])}, but cache has only {cache.shape[0]} blocks."
++            )
++
++        remap = torch.full((cache.shape[0],), -1, dtype=torch.long, device=cache.device)
++        remap[block_ids] = torch.arange(block_ids.numel(), dtype=torch.long, device=cache.device)
++        safe_table = table_long.clamp_min(0)
++        compact_table = remap[safe_table]
++        compact_table = torch.where(table_long >= 0, compact_table, table_long)
++        return block_ids, compact_table.to(dtype=block_table.dtype)
++
++    @staticmethod
++    def _format_compact_a3_kimi_c8_cache_for_gather(
++        cache: torch.Tensor,
++        block_ids: torch.Tensor,
++        *,
++        num_kv_heads: int,
++        head_dim: int,
++        nz_width: int,
++    ) -> torch.Tensor:
++        """Convert referenced PA-NZ cache blocks back to logical ND for Gather.
++
++        A3 C8 Scatter writes PA-NZ bytes through a 5-D view of the shared ND
++        cache allocation.  Selecting from the registered 4-D tensor directly
++        therefore treats physical PA-NZ bytes as logical ND values.  Reinterpret
++        the storage with the same PA-NZ view used by Scatter before compacting,
++        then transpose it back to the Normal-cache layout expected by Gather.
++        """
++        block_size = cache.shape[1]
++        physical_pa_nz = cache.view(
++            cache.shape[0],
++            num_kv_heads,
++            head_dim // nz_width,
++            block_size,
++            nz_width,
++        )
++        compact_pa_nz = physical_pa_nz.index_select(0, block_ids)
++        return (
++            compact_pa_nz.permute(0, 3, 1, 2, 4)
++            .contiguous()
++            .view(block_ids.numel(), block_size, num_kv_heads, head_dim)
++        )
++
+     def _compute_prefill_context(
+         self,
+         q_nope: torch.Tensor,
+@@ -1349,8 +1437,32 @@ class AscendMLAImpl(MLAAttentionImpl):
+         iters = len(prefill_metadata.chunked_context.seq_tot)
+         cache_kv_c = kv_c_and_k_pe_cache[0]
+         cache_k_pe = kv_c_and_k_pe_cache[1]
+-        num_heads = cache_k_pe.size(2)
+-        latent_kv_dim = kv_c_and_k_pe_cache[0].size(-1)
++        is_a3_c8_cache = self._uses_a3_kimi_c8_cache()
++        if is_a3_c8_cache:
++            num_heads = self.num_kv_heads
++            latent_kv_dim = self.kv_lora_rank
++            block_ids, gather_block_table = self._compact_block_table_for_nz_gather(
++                cache_kv_c,
++                prefill_metadata.block_table,
++            )
++            cache_kv_c_for_load = self._format_compact_a3_kimi_c8_cache_for_gather(
++                cache_kv_c,
++                block_ids,
++                num_kv_heads=num_heads,
++                head_dim=latent_kv_dim,
++                nz_width=32,
++            )
++            cache_k_pe_for_load = self._format_compact_a3_kimi_c8_cache_for_gather(
++                cache_k_pe,
++                block_ids,
++                num_kv_heads=num_heads,
++                head_dim=rope_dim,
++                nz_width=16,
++            )
++        else:
++            num_heads = cache_k_pe.size(2)
++            latent_kv_dim = cache_kv_c.size(-1)
++            gather_block_table = prefill_metadata.block_table
+ 
+         actual_seq_lengths_q = prefill_metadata.actual_seq_lengths_q
+ 
+@@ -1387,18 +1499,72 @@ class AscendMLAImpl(MLAAttentionImpl):
+         for i in range(iters):
+             toks = prefill_metadata.chunked_context.seq_tot[i]
+             context_seq_len_npu = self.get_context_seq_len_npu(i, attn_metadata)
+-            kv_c_normed = torch.empty(toks, num_heads, latent_kv_dim, dtype=cache_kv_c.dtype, device=cache_kv_c.device)
+-            k_pe = torch.empty(toks, num_heads, rope_dim, dtype=q_pe.dtype, device=q_pe.device)
+-
+-            DeviceOperator.kv_cache_load(
+-                cache_kv_c,
+-                cache_k_pe,
+-                prefill_metadata.block_table,
+-                context_seq_len_npu,
+-                prefill_metadata.chunked_context.starts[i],
+-                key=kv_c_normed,
+-                value=k_pe,
+-            )
++            if is_a3_c8_cache:
++                # The compact caches were converted back to Normal layout, so
++                # Gather uses the standard 3-D [tokens, heads, dim] outputs.
++                # Load the two caches separately because their dtypes differ.
++                kv_c_normed = torch.empty(
++                    toks,
++                    num_heads,
++                    latent_kv_dim,
++                    dtype=cache_kv_c.dtype,
++                    device=cache_kv_c.device,
++                )
++                k_pe = torch.empty(
++                    toks,
++                    num_heads,
++                    rope_dim,
++                    dtype=q_pe.dtype,
++                    device=q_pe.device,
++                )
++            else:
++                cache_kv_c_for_load = cache_kv_c
++                cache_k_pe_for_load = cache_k_pe
++                kv_c_normed = torch.empty(
++                    toks,
++                    num_heads,
++                    latent_kv_dim,
++                    dtype=cache_kv_c.dtype,
++                    device=cache_kv_c.device,
++                )
++                k_pe = torch.empty(toks, num_heads, rope_dim, dtype=q_pe.dtype, device=q_pe.device)
++
++            if is_a3_c8_cache:
++                # npu_gather_pa_kv_cache requires matching dtypes for the
++                # key/value cache pair. A3 C8 stores latent cache in INT8 and
++                # RoPE cache in BF16, so gather the two Normal compact caches
++                # separately. Normal Gather consumes the token offset directly.
++                chunk_token_offset = prefill_metadata.chunked_context.starts[i]
++                kv_c_unused = torch.empty_like(kv_c_normed)
++                k_pe_unused = torch.empty_like(k_pe)
++                DeviceOperator.kv_cache_load(
++                    cache_kv_c_for_load,
++                    cache_kv_c_for_load,
++                    gather_block_table,
++                    context_seq_len_npu,
++                    chunk_token_offset,
++                    key=kv_c_normed,
++                    value=kv_c_unused,
++                )
++                DeviceOperator.kv_cache_load(
++                    cache_k_pe_for_load,
++                    cache_k_pe_for_load,
++                    gather_block_table,
++                    context_seq_len_npu,
++                    chunk_token_offset,
++                    key=k_pe,
++                    value=k_pe_unused,
++                )
++            else:
++                DeviceOperator.kv_cache_load(
++                    cache_kv_c_for_load,
++                    cache_k_pe_for_load,
++                    prefill_metadata.block_table,
++                    context_seq_len_npu,
++                    prefill_metadata.chunked_context.starts[i],
++                    key=kv_c_normed,
++                    value=k_pe,
++                )
+             kv_c_normed, k_pe = self._reorg_kvcache(
+                 kv_c_normed,
+                 k_pe,
+@@ -1407,9 +1573,14 @@ class AscendMLAImpl(MLAAttentionImpl):
+                 toks=toks,
+             )
+             kv_c_normed = kv_c_normed.squeeze()
+-            if self.fa_quant_layer and get_ascend_device_type() == AscendDeviceType.A5:
+-                kv_c_normed = torch.mul(kv_c_normed.to(self.fak_descale_float.dtype), self.fak_descale_float).to(
++            if self.fa_quant_layer:
++                target_dtype = (
+                     torch.bfloat16
++                    if get_ascend_device_type() == AscendDeviceType.A5
++                    else self.vllm_config.model_config.dtype
++                )
++                kv_c_normed = torch.mul(kv_c_normed.to(self.fak_descale_float.dtype), self.fak_descale_float).to(
++                    target_dtype
+                 )
+             kv_nope = self.kv_b_proj(kv_c_normed)[0].view(-1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+             k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+@@ -1534,13 +1705,181 @@ class AscendMLAImpl(MLAAttentionImpl):
+         kv_c_normed = self.kv_a_layernorm(kv_c.contiguous())
+         kv_c_normed = kv_c_normed.view(num_tokens, self.num_kv_heads, self.kv_lora_rank)
+         k_pe = k_pe.view(num_tokens, self.num_kv_heads, self.qk_rope_head_dim)
+-        DeviceOperator.reshape_and_cache(
+-            key=kv_c_normed,
+-            value=k_pe,
+-            key_cache=kv_cache[0],
+-            value_cache=kv_cache[1],
+-            slot_mapping=slots,
+-        )
++        cache_kv_c = kv_c_normed
++        if self.fa_quant_layer:
++            device_type = get_ascend_device_type()
++            assert device_type in {AscendDeviceType.A3, AscendDeviceType.A5}
++            quant_scale = self.fak_descale_reciprocal
++            quant_dtype = torch.qint8
++            if device_type == AscendDeviceType.A5:
++                quant_scale = quant_scale.to(torch.bfloat16)
++                quant_dtype = torch.float8_e4m3fn
++            # Keep the A3 cache format identical to npu_mla_prolog_v2's
++            # symmetric FAK cache mode: FIA receives only descales, so no
++            # per-channel zero point is consumed by the decode kernel.
++            cache_kv_c = torch_npu.npu_quantize(
++                kv_c_normed,
++                quant_scale,
++                None,
++                quant_dtype,
++                -1,
++                False,
++            )
++            if device_type == AscendDeviceType.A3:
++                # Decode FIA's INT8 MLA path requires PA-NZ KV layout.  The
++                # registered vLLM pool remains ND; expose matching 5D views
++                # while Scatter writes PA-NZ bytes into it.
++                block_size = kv_cache[0].shape[1]
++                latent_cache_nz = kv_cache[0].view(
++                    -1,
++                    self.num_kv_heads,
++                    self.kv_lora_rank // 32,
++                    block_size,
++                    32,
++                )
++                rope_cache_nz = kv_cache[1].view(
++                    -1,
++                    self.num_kv_heads,
++                    self.qk_rope_head_dim // 16,
++                    block_size,
++                    16,
++                )
++                debug_enabled = (
++                    os.getenv(
++                        "VLLM_ASCEND_C8_NZ_DEBUG",
++                        os.getenv("VLLM_ASCEND_C8_KV_DEBUG", "0"),
++                    )
++                    == "1"
++                    and os.getenv("VLLM_ASCEND_C8_NZ_HOST_READBACK", "1") == "1"
++                    and os.getenv(
++                        "VLLM_ASCEND_C8_NZ_DEBUG_LAYER",
++                        "model.layers.4.",
++                    )
++                    in str(self.layer_name)
++                    and get_tp_group().rank_in_group == 0
++                )
++                if debug_enabled and not getattr(self, "_c8_nz_debug_config_logged", False):
++                    self._c8_nz_debug_config_logged = True
++                    logger.warning(
++                        "[C8NZCFG] layer=%s block_size=%d kv_heads=%d "
++                        "latent_base(shape=%s stride=%s dtype=%s format=%d) "
++                        "latent_view(shape=%s stride=%s format=%d) "
++                        "pe_base(shape=%s stride=%s dtype=%s format=%d) "
++                        "pe_view(shape=%s stride=%s format=%d)",
++                        self.layer_name,
++                        block_size,
++                        self.num_kv_heads,
++                        tuple(kv_cache[0].shape),
++                        tuple(kv_cache[0].stride()),
++                        kv_cache[0].dtype,
++                        int(torch_npu.get_npu_format(kv_cache[0])),
++                        tuple(latent_cache_nz.shape),
++                        tuple(latent_cache_nz.stride()),
++                        int(torch_npu.get_npu_format(latent_cache_nz)),
++                        tuple(kv_cache[1].shape),
++                        tuple(kv_cache[1].stride()),
++                        kv_cache[1].dtype,
++                        int(torch_npu.get_npu_format(kv_cache[1])),
++                        tuple(rope_cache_nz.shape),
++                        tuple(rope_cache_nz.stride()),
++                        int(torch_npu.get_npu_format(rope_cache_nz)),
++                    )
++                torch_npu.npu_scatter_pa_kv_cache(
++                    key=cache_kv_c.contiguous(),
++                    value=cache_kv_c.contiguous(),
++                    key_cache=latent_cache_nz,
++                    value_cache=latent_cache_nz,
++                    slot_mapping=slots.contiguous(),
++                    cache_mode="PA_NZ",
++                )
++                torch_npu.npu_scatter_pa_kv_cache(
++                    key=k_pe.contiguous(),
++                    value=k_pe.contiguous(),
++                    key_cache=rope_cache_nz,
++                    value_cache=rope_cache_nz,
++                    slot_mapping=slots.contiguous(),
++                    cache_mode="PA_NZ",
++                )
++                if debug_enabled and not torch.npu.is_current_stream_capturing():
++                    step = getattr(self, "_c8_nz_debug_step", 0)
++                    self._c8_nz_debug_step = step + 1
++                    first = int(os.getenv("VLLM_ASCEND_C8_NZ_DEBUG_FIRST_STEPS", "8"))
++                    every = max(1, int(os.getenv("VLLM_ASCEND_C8_NZ_DEBUG_EVERY", "64")))
++                    if step < first or step % every == 0:
++                        try:
++                            scatter_records = getattr(
++                                self,
++                                "_c8_nz_scatter_records",
++                                [],
++                            )
++                            scatter_records.append((step, slots.detach().clone()))
++                            self._c8_nz_scatter_records = scatter_records[-16:]
++                            valid = slots >= 0
++                            valid_slots = slots[valid].to(torch.long)
++                            block_ids = torch.div(valid_slots, block_size, rounding_mode="floor")
++                            offsets = torch.remainder(valid_slots, block_size)
++                            actual_nope = latent_cache_nz[block_ids, :, :, offsets, :]
++                            actual_pe = rope_cache_nz[block_ids, :, :, offsets, :]
++                            expected_nope = cache_kv_c[valid].view_as(actual_nope)
++                            expected_pe = k_pe[valid].view_as(actual_pe)
++                            nope_bad = (
++                                (actual_nope != expected_nope)
++                                .reshape(valid_slots.numel(), -1)
++                                .any(dim=1)
++                            )
++                            pe_bad = (
++                                (actual_pe != expected_pe)
++                                .reshape(valid_slots.numel(), -1)
++                                .any(dim=1)
++                            )
++                            logger.warning(
++                                "[C8NZDBG] layer=%s step=%d tokens=%d slots=%s "
++                                "nope_bad=%d pe_bad=%d nope_sum=%d pe_sum=%.6f",
++                                self.layer_name,
++                                step,
++                                valid_slots.numel(),
++                                (
++                                    valid_slots.cpu().tolist()
++                                    if valid_slots.numel() <= 16
++                                    else valid_slots[:8].cpu().tolist()
++                                    + ["..."]
++                                    + valid_slots[-8:].cpu().tolist()
++                                ),
++                                int(nope_bad.sum().item()),
++                                int(pe_bad.sum().item()),
++                                int(actual_nope.to(torch.int64).sum().item()),
++                                float(actual_pe.to(torch.float32).sum().item()),
++                            )
++                        except Exception:
++                            logger.exception(
++                                "[C8NZDBG] scatter readback failed layer=%s step=%d",
++                                self.layer_name,
++                                step,
++                            )
++            else:
++                # reshape_and_cache requires key and value to have the same dtype.
++                DeviceOperator.reshape_and_cache(
++                    key=cache_kv_c,
++                    value=cache_kv_c,
++                    key_cache=kv_cache[0],
++                    value_cache=kv_cache[0],
++                    slot_mapping=slots,
++                )
++                DeviceOperator.reshape_and_cache(
++                    key=k_pe,
++                    value=k_pe,
++                    key_cache=kv_cache[1],
++                    value_cache=kv_cache[1],
++                    slot_mapping=slots,
++                )
++        else:
++            DeviceOperator.reshape_and_cache(
++                key=cache_kv_c,
++                value=k_pe,
++                key_cache=kv_cache[0],
++                value_cache=kv_cache[1],
++                slot_mapping=slots,
++            )
+         return k_pe, kv_c_normed
+ 
+     def exec_kv_decode(
+@@ -1647,6 +1986,51 @@ class AscendMLAImpl(MLAAttentionImpl):
+     ) -> torch.Tensor:
+         decode_meta = attn_metadata.decode
+         assert decode_meta is not None
++        if (
++            os.getenv(
++                "VLLM_ASCEND_C8_NZ_DEBUG",
++                os.getenv("VLLM_ASCEND_C8_KV_DEBUG", "0"),
++            ) == "1"
++            and os.getenv("VLLM_ASCEND_C8_NZ_HOST_READBACK", "1") == "1"
++            and not torch.npu.is_current_stream_capturing()
++            and bool(getattr(self, "_c8_nz_scatter_records", []))
++            and len(decode_meta.seq_lens_list) == q_nope.size(0)
++        ):
++            try:
++                scatter_records = self._c8_nz_scatter_records
++                record_index = next(
++                    index
++                    for index, (_, record_slots) in enumerate(scatter_records)
++                    if int((record_slots >= 0).sum().item()) == q_nope.size(0)
++                )
++                write_step, record_slots = scatter_records[record_index]
++                del scatter_records[: record_index + 1]
++                write_slots = record_slots[record_slots >= 0].to(torch.long)
++                seq_lens = torch.tensor(
++                    decode_meta.seq_lens_list,
++                    dtype=torch.long,
++                    device=decode_meta.block_table.device,
++                )
++                positions = seq_lens - 1
++                rows = torch.arange(q_nope.size(0), device=decode_meta.block_table.device)
++                block_indices = torch.div(positions, block_size, rounding_mode="floor")
++                fia_blocks = decode_meta.block_table[rows, block_indices].to(torch.long)
++                fia_slots = fia_blocks * block_size + torch.remainder(positions, block_size)
++                logger.warning(
++                    "[C8NZMAP] layer=%s step=%d write_slots=%s fia_slots=%s "
++                    "mismatches=%d seq_lens=%s",
++                    self.layer_name,
++                    write_step,
++                    write_slots.cpu().tolist(),
++                    fia_slots.cpu().tolist(),
++                    int((write_slots != fia_slots).sum().item()),
++                    seq_lens.cpu().tolist(),
++                )
++                self._c8_nz_last_step = write_step
++            except Exception:
++                logger.exception(
++                    "[C8NZMAP] FIA slot validation failed layer=%s", self.layer_name
++                )
+         # TODO: The CANN package is expected to support num_heads that are not
+         # powers of 2 in 2026 Q2. Once supported, all padding operations under
+         # `if self.head_padding > 0` in this function can be removed.
+@@ -1674,6 +2058,106 @@ class AscendMLAImpl(MLAAttentionImpl):
+             k_nope = k_nope.view(-1, self.num_kv_heads, block_size, self.kv_lora_rank)
+             k_pe = k_pe.view(-1, self.num_kv_heads, block_size, self.qk_rope_head_dim)
+ 
++        if (
++            os.getenv(
++                "VLLM_ASCEND_C8_NZ_DEBUG",
++                os.getenv("VLLM_ASCEND_C8_KV_DEBUG", "0"),
++            )
++            == "1"
++            and os.getenv("VLLM_ASCEND_C8_NZ_HOST_READBACK", "1") == "1"
++            and not torch.npu.is_current_stream_capturing()
++            and self.fa_quant_layer
++            and get_ascend_device_type() == AscendDeviceType.A3
++            and os.getenv(
++                "VLLM_ASCEND_C8_NZ_DEBUG_LAYER",
++                "model.layers.4.",
++            )
++            in str(self.layer_name)
++            and get_tp_group().rank_in_group == 0
++            and getattr(self, "_c8_nz_last_step", 0)
++            < int(os.getenv("VLLM_ASCEND_C8_NZ_DEBUG_PAIR_STEPS", "4"))
++        ):
++            try:
++                pair = [
++                    int(value)
++                    for value in os.getenv(
++                        "VLLM_ASCEND_C8_NZ_DEBUG_PAIR",
++                        "0,1",
++                    ).split(",")
++                ]
++                if len(pair) != 2:
++                    raise ValueError("VLLM_ASCEND_C8_NZ_DEBUG_PAIR must contain two row indices")
++                row_a, row_b = pair
++                if max(pair) >= len(decode_meta.seq_lens_list):
++                    raise IndexError(
++                        f"pair rows {pair} exceed decode batch {len(decode_meta.seq_lens_list)}"
++                    )
++
++                def _history(row: int):
++                    seq_len = int(decode_meta.seq_lens_list[row])
++                    positions = torch.arange(
++                        seq_len,
++                        dtype=torch.long,
++                        device=decode_meta.block_table.device,
++                    )
++                    logical_blocks = torch.div(
++                        positions,
++                        block_size,
++                        rounding_mode="floor",
++                    )
++                    physical_blocks = decode_meta.block_table[
++                        row,
++                        logical_blocks,
++                    ].to(torch.long)
++                    offsets = torch.remainder(positions, block_size)
++                    nope = k_nope[
++                        physical_blocks,
++                        :,
++                        :,
++                        offsets,
++                        :,
++                    ].reshape(seq_len, -1)
++                    pe = k_pe[
++                        physical_blocks,
++                        :,
++                        :,
++                        offsets,
++                        :,
++                    ].reshape(seq_len, -1)
++                    return seq_len, nope, pe
++
++                len_a, nope_a, pe_a = _history(row_a)
++                len_b, nope_b, pe_b = _history(row_b)
++                if len_a == len_b:
++                    nope_mismatch = int((nope_a != nope_b).sum().item())
++                    pe_mismatch = int((pe_a != pe_b).sum().item())
++                else:
++                    nope_mismatch = pe_mismatch = -1
++                logger.warning(
++                    "[C8NZPAIR] layer=%s step=%d rows=%s seq_lens=%s "
++                    "nope_mismatch=%d pe_mismatch=%d "
++                    "nope_sum=%s pe_sum=%s",
++                    self.layer_name,
++                    getattr(self, "_c8_nz_last_step", -1),
++                    pair,
++                    [len_a, len_b],
++                    nope_mismatch,
++                    pe_mismatch,
++                    [
++                        int(nope_a.to(torch.int64).sum().item()),
++                        int(nope_b.to(torch.int64).sum().item()),
++                    ],
++                    [
++                        float(pe_a.to(torch.float32).sum().item()),
++                        float(pe_b.to(torch.float32).sum().item()),
++                    ],
++                )
++            except Exception:
++                logger.exception(
++                    "[C8NZPAIR] cache history comparison failed layer=%s",
++                    self.layer_name,
++                )
++
+         attn_output_shape: tuple | None = None
+         if (
+             attn_metadata.attn_state
+@@ -1713,6 +2197,12 @@ class AscendMLAImpl(MLAAttentionImpl):
+             actual_seq_lengths = decode_meta.actual_seq_lengths_q
+             if self.fa_quant_layer:
+                 dequant_scale_q_nope = dequant_scale_q_nope.view(num_tokens, self.num_heads)
++                if self.head_padding > 0:
++                    # query_quant_mode=3 is per-token, per-head. FIA sees the
++                    # padded query heads, so its scale must have the identical
++                    # head axis. A zero scale keeps the synthetic zero query
++                    # heads zero after dequantization.
++                    dequant_scale_q_nope = F.pad(dequant_scale_q_nope, (0, self.head_padding), "constant", 0)
+         elif self.fa_quant_layer:
+             attn_mask = None
+             sparse_mode = 0
+@@ -1725,6 +2215,13 @@ class AscendMLAImpl(MLAAttentionImpl):
+                     q_pe = F.pad(q_pe, (0, 0, 0, 0, 0, self.head_padding), "constant", 0)
+                     q_nope = F.pad(q_nope, (0, 0, 0, 0, 0, self.head_padding), "constant", 0)
+                 dequant_scale_q_nope = dequant_scale_q_nope.view(num_tokens, self.num_heads, 1)
++                if self.head_padding > 0:
++                    dequant_scale_q_nope = F.pad(
++                        dequant_scale_q_nope,
++                        (0, 0, 0, self.head_padding),
++                        "constant",
++                        0,
++                    )
+                 attn_output_shape = (num_tokens, self.num_heads_padded, 1, self.kv_lora_rank)
+             else:
+                 input_layout = "BSND_NBSD"
+@@ -1734,6 +2231,8 @@ class AscendMLAImpl(MLAAttentionImpl):
+                     q_pe = F.pad(q_pe, (0, 0, 0, self.head_padding), "constant", 0)
+                     q_nope = F.pad(q_nope, (0, 0, 0, self.head_padding), "constant", 0)
+                 dequant_scale_q_nope = dequant_scale_q_nope.view(num_tokens, 1, self.num_heads)
++                if self.head_padding > 0:
++                    dequant_scale_q_nope = F.pad(dequant_scale_q_nope, (0, self.head_padding), "constant", 0)
+                 attn_output_shape = (self.num_heads_padded, num_tokens, 1, self.kv_lora_rank)
+         else:
+             # The output layout is set to NBSD to eliminate the need for a
+@@ -1970,9 +2469,10 @@ class AscendMLAImpl(MLAAttentionImpl):
+         )
+         decode_q_pe = self.rope_single(decode_q_pe, cos, sin)
+         dequant_scale_q_nope = None
+-        if self.fa_quant_layer and get_ascend_device_type() == AscendDeviceType.A5:
++        if self.fa_quant_layer and get_ascend_device_type() in {AscendDeviceType.A3, AscendDeviceType.A5}:
+             decode_ql_nope, dequant_scale_q_nope = torch_npu.npu_dynamic_quant(
+-                decode_ql_nope, dst_type=torch.float8_e4m3fn
++                decode_ql_nope,
++                dst_type=self.dtype,
+             )
+             decode_q_pe = (decode_q_pe / dequant_scale_q_nope.unsqueeze(-1) / self.fak_descale_float).to(torch.bfloat16)
+         decode_slots = attn_metadata.slot_mapping[:num_decode_tokens:1]
+@@ -2091,8 +2591,10 @@ class AscendMLAImpl(MLAAttentionImpl):
+             gate = self.g_proj(gate_input)[0]
+ 
+         # MLA Preprocess
+-        if (self.fa_quant_layer or self.enable_mlapo) and (
+-            attn_metadata.num_decode_tokens <= MLAPO_MAX_SUPPORTED_TOKENS and attn_metadata.num_prefills == 0
++        if (
++            self.use_mla_rope
++            and (self.fa_quant_layer or self.enable_mlapo)
++            and (attn_metadata.num_decode_tokens <= MLAPO_MAX_SUPPORTED_TOKENS and attn_metadata.num_prefills == 0)
+         ):
+             hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
+                 hidden_states.contiguous(), need_gather_q_kv
+diff --git a/vllm_ascend/device/device_op.py b/vllm_ascend/device/device_op.py
+index 95e3743..68edadc 100644
+--- a/vllm_ascend/device/device_op.py
++++ b/vllm_ascend/device/device_op.py
+@@ -295,7 +295,15 @@ class BaseDeviceAdaptor:
+         )[0]
+ 
+     @staticmethod
+-    def kv_cache_load(cache_kv_c, cache_k_pe, block_table, context_seq_len_npu, seq_starts, key, value):
++    def kv_cache_load(
++        cache_kv_c,
++        cache_k_pe,
++        block_table,
++        context_seq_len_npu,
++        seq_starts,
++        key,
++        value,
++    ):
+         torch_npu.npu_gather_pa_kv_cache(
+             cache_kv_c,
+             cache_k_pe,
+@@ -1389,7 +1397,15 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
+         )[0]
+ 
+     @staticmethod
+-    def kv_cache_load(cache_kv_c, cache_k_pe, block_table, context_seq_len_npu, seq_offset, key, value):
++    def kv_cache_load(
++        cache_kv_c,
++        cache_k_pe,
++        block_table,
++        context_seq_len_npu,
++        seq_offset,
++        key,
++        value,
++    ):
+         torch_npu.npu_gather_pa_kv_cache(
+             cache_kv_c,
+             cache_k_pe,
+diff --git a/vllm_ascend/envs.py b/vllm_ascend/envs.py
+index f597de5..dbf837f 100644
+--- a/vllm_ascend/envs.py
++++ b/vllm_ascend/envs.py
+@@ -104,6 +104,11 @@ env_variables: dict[str, Callable[[], Any]] = {
+     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
+     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
+     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
++    # Number of Kimi K3 decoder layers to instantiate and load for debugging.
++    # 0 (the default) loads the complete model.
++    "VLLM_ASCEND_KIMI_K3_MAX_LOADED_LAYERS": lambda: os.getenv(
++        "VLLM_ASCEND_KIMI_K3_MAX_LOADED_LAYERS", "0"
++    ),
+ }
+ 
+ # end-env-vars-definition
+diff --git a/vllm_ascend/models/kimi_k3.py b/vllm_ascend/models/kimi_k3.py
+index 957a68f..7589e05 100644
+--- a/vllm_ascend/models/kimi_k3.py
++++ b/vllm_ascend/models/kimi_k3.py
+@@ -103,6 +103,7 @@ from vllm.sequence import IntermediateTensors
+ from vllm.transformers_utils.processor import cached_get_image_processor
+ from vllm.utils.tensor_schema import TensorSchema, TensorShape
+ 
++from vllm_ascend import envs as envs_ascend
+ from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+ from vllm_ascend.ops.activation import AscendSituAndMul, SituActivationConfig
+ from vllm_ascend.ops.kimi_kda import uses_kimi_k3_global_inputs_embeds
+@@ -112,6 +113,52 @@ from vllm_ascend.transformers_utils.processors.kimi_k3 import KimiK3Processor
+ from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type, vllm_version_is
+ 
+ 
++KIMI_K3_MAX_LOADED_LAYERS_ENV = "VLLM_ASCEND_KIMI_K3_MAX_LOADED_LAYERS"
++
++
++def _get_kimi_k3_num_loaded_layers(total_num_layers: int) -> int:
++    """Return the requested K3 decoder-layer count for debug loading.
++
++    A value of ``0`` (the default) preserves the complete model. The setting
++    intentionally lives outside the checkpoint configuration, so it is only a
++    process-local debug aid.
++    """
++    requested_num_layers_raw = getattr(envs_ascend, KIMI_K3_MAX_LOADED_LAYERS_ENV)
++    try:
++        requested_num_layers = int(requested_num_layers_raw)
++    except (TypeError, ValueError) as exc:
++        raise ValueError(
++            f"{KIMI_K3_MAX_LOADED_LAYERS_ENV} must be an integer in "
++            f"[0, {total_num_layers}], got {requested_num_layers_raw!r}"
++        ) from exc
++    if requested_num_layers == 0:
++        return total_num_layers
++    if not 1 <= requested_num_layers <= total_num_layers:
++        raise ValueError(
++            f"{KIMI_K3_MAX_LOADED_LAYERS_ENV} must be in "
++            f"[0, {total_num_layers}], got {requested_num_layers}"
++        )
++    return requested_num_layers
++
++
++def _get_decoder_layer_idx_from_weight_name(weight_name: str) -> int | None:
++    """Extract a K3 decoder-layer index from an inner or VL checkpoint key."""
++    # AutoWeightsLoader removes the child-module prefix before delegating to
++    # KimiK3TextModel.load_weights, so the same tensor can arrive as either
++    # ``model.layers.<idx>`` or ``layers.<idx>``.
++    layer_prefix = "layers."
++    prefix_idx = weight_name.find(layer_prefix)
++    if prefix_idx < 0:
++        return None
++
++    layer_idx_start = prefix_idx + len(layer_prefix)
++    layer_idx_end = weight_name.find(".", layer_idx_start)
++    if layer_idx_end < 0:
++        return None
++    layer_idx_text = weight_name[layer_idx_start:layer_idx_end]
++    return int(layer_idx_text) if layer_idx_text.isdecimal() else None
++
++
+ def _routed_latent_quant_config(
+     quant_config: QuantizationConfig | None,
+ ) -> QuantizationConfig | None:
+@@ -1047,6 +1094,15 @@ class KimiK3TextModel(nn.Module, EagleModelMixin):
+         config: KimiK3TextConfig = vllm_config.model_config.hf_text_config
+         self.config = config
+         self.vocab_size = config.vocab_size
++        self.num_loaded_layers = _get_kimi_k3_num_loaded_layers(config.num_hidden_layers)
++        if self.num_loaded_layers != config.num_hidden_layers:
++            logger.warning_once(
++                "Kimi K3 layer-reduced debug mode is enabled: loading and "
++                "executing decoder layers [0, %d) out of %d. Generated "
++                "results are not model-quality valid.",
++                self.num_loaded_layers,
++                config.num_hidden_layers,
++            )
+ 
+         if get_pp_group().is_first_rank:
+             self.embed_tokens = VocabParallelEmbedding(
+@@ -1061,7 +1117,7 @@ class KimiK3TextModel(nn.Module, EagleModelMixin):
+             return KimiK3DecoderLayer(config, vllm_config, prefix)
+ 
+         self.start_layer, self.end_layer, self.layers = make_layers(
+-            config.num_hidden_layers,
++            self.num_loaded_layers,
+             get_layer,
+             prefix=f"{prefix}.layers",
+         )
+@@ -1174,6 +1230,9 @@ class KimiK3TextModel(nn.Module, EagleModelMixin):
+             loader_kwargs: dict[str, Any] = args[2] if len(args) == 3 else {}
+             if "rotary_emb" in name:
+                 continue
++            layer_idx = _get_decoder_layer_idx_from_weight_name(name)
++            if layer_idx is not None and layer_idx >= self.num_loaded_layers:
++                continue
+             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
+             if spec_layer is not None:
+                 continue
+diff --git a/vllm_ascend/ops/fused_moe/fused_moe.py b/vllm_ascend/ops/fused_moe/fused_moe.py
+index 1c619d3..f923c25 100644
+--- a/vllm_ascend/ops/fused_moe/fused_moe.py
++++ b/vllm_ascend/ops/fused_moe/fused_moe.py
+@@ -781,7 +781,7 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
+                 self._shared_experts.down_proj, "weight_scale"
+             )
+             shared_uses_situ = isinstance(self._shared_experts.act_fn, AscendSituAndMul)
+-            if has_quantized_shared and self.quant_type in (QuantType.W8A8, QuantType.W4A8):
++            if has_quantized_shared and self.quant_type == QuantType.W8A8:
+                 original_dtype = hidden_states.dtype
+                 # Execute dynamic quant concurrently with MoE gate.
+                 quantized_x, pertoken_scale = torch_npu.npu_dynamic_quant(hidden_states)
+@@ -878,6 +878,9 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
+                 maybe_wait_event(fused_moe_evts.before_combine)
+                 shared_out = self._shared_experts.down_proj((quantized_x, swiglu_out_scale))[0]
+             else:
++                # Kimi K3 per-channel W4A8 shared experts also use this path.
++                # Their Linear scheme dynamically quantizes each projection's
++                # activation and evaluates its INT4 NZ weight as one GMM group.
+                 # Execute the gate projection and activation concurrently with the
+                 # dispatch communication.
+                 maybe_wait_event(fused_moe_evts.before_dispatch)
+diff --git a/vllm_ascend/ops/fused_moe/moe_mlp.py b/vllm_ascend/ops/fused_moe/moe_mlp.py
+index 887f60d..4a97e4d 100644
+--- a/vllm_ascend/ops/fused_moe/moe_mlp.py
++++ b/vllm_ascend/ops/fused_moe/moe_mlp.py
+@@ -14,6 +14,7 @@
+ # limitations under the License.
+ # This file is a part of the vllm-ascend project.
+ 
++import os
+ 
+ import torch
+ import torch_npu
+@@ -31,6 +32,7 @@ from vllm_ascend.ops.activation import (
+     AscendSwigluOAIAndMul,
+     AscendSwigluStepAndMul,
+     SituActivationConfig,
++    situ_and_mul,
+ )
+ from vllm_ascend.ops.fused_moe.moe_runtime_args import MoEMlpComputeInput
+ from vllm_ascend.quantization.quant_type import QuantType
+@@ -205,6 +207,21 @@ def _w4a8_situ_apply_mlp(
+             activate_left=True,
+             dst_type=SITU_MX_DST_TYPE_E4M3FN,
+         )
++    elif os.getenv("VLLM_ASCEND_C8_NZ_DEBUG_FALLBACK_SITU", "0") == "1":
++        # Compatibility path for runtime images without dequant_situ_quant.
++        # It preserves the W4A8 contract by applying SiTU in BF16 and then
++        # dynamically quantizing its output before the W4 grouped matmul.
++        situ_output = situ_and_mul(
++            gate_up_out,
++            beta=activation.beta,
++            linear_beta=activation.linear_beta,
++        )
++        hidden_states, situ_out_scale = DeviceOperator.npu_dynamic_quant(
++            hidden_states=situ_output,
++            dynamic_scale=None,
++            act_quant_type=act_quant_type,
++            use_mxfp_quant=False,
++        )
+     else:
+         hidden_states, situ_out_scale = torch.ops._C_ascend.dequant_situ_quant(
+             x=gate_up_out,
+diff --git a/vllm_ascend/ops/gdn_attn_builder.py b/vllm_ascend/ops/gdn_attn_builder.py
+index acb017b..9c3a21f 100644
+--- a/vllm_ascend/ops/gdn_attn_builder.py
++++ b/vllm_ascend/ops/gdn_attn_builder.py
+@@ -374,7 +374,6 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
+         self.spec_query_start_loc[: graph_batch_size + 1].zero_()
+         self.num_accepted_tokens[:graph_batch_size].zero_()
+         self.spec_actual_seq_lengths[: graph_batch_size + 1].zero_()
+-
+     def _attach_non_spec_prefill_metadata(
+         self,
+         attn_metadata: GDNAttentionMetadata,
+diff --git a/vllm_ascend/ops/kimi_kda.py b/vllm_ascend/ops/kimi_kda.py
+index 265a5e5..95d2e0a 100644
+--- a/vllm_ascend/ops/kimi_kda.py
++++ b/vllm_ascend/ops/kimi_kda.py
+@@ -648,6 +648,14 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
+                     attn_metadata.non_spec_query_start_loc[: attn_metadata.num_decodes + 1],
+                     attn_metadata.non_spec_state_indices_tensor,
+                 )
++                # recurrent_kda leaves graph-padding token outputs
++                # uninitialized. Clear the uncovered non-spec decode tail
++                # before it reaches the residual and MoE layers, matching
++                # the existing spec-decode handling above.
++                core_non_spec = _zero_padded_spec_output(
++                    core_non_spec,
++                    attn_metadata.non_spec_query_start_loc[: attn_metadata.num_decodes + 1],
++                )
+ 
+         if core_spec is not None and core_non_spec is not None:
+             merged = torch.empty(
+diff --git a/vllm_ascend/quantization/methods/kv_c8.py b/vllm_ascend/quantization/methods/kv_c8.py
+index 6ec5e81..8752f44 100644
+--- a/vllm_ascend/quantization/methods/kv_c8.py
++++ b/vllm_ascend/quantization/methods/kv_c8.py
+@@ -31,7 +31,7 @@ def _fa_quant_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor):
+ class AscendFAQuantAttentionMethod:
+     def __init__(self):
+         vllm_config = get_current_vllm_config()
+-        config = vllm_config.model_config.hf_config
++        config = vllm_config.model_config.hf_text_config
+         self.kv_lora_rank = getattr(config, "kv_lora_rank", 0)
+         self.qk_rope_head_dim = getattr(config, "qk_rope_head_dim", 0)
+ 
+diff --git a/vllm_ascend/quantization/methods/w4a8.py b/vllm_ascend/quantization/methods/w4a8.py
+index 643245f..e8a976f 100644
+--- a/vllm_ascend/quantization/methods/w4a8.py
++++ b/vllm_ascend/quantization/methods/w4a8.py
+@@ -35,6 +35,28 @@ from .base import AscendLinearScheme, AscendMoEScheme, QuantType, get_moe_num_lo
+ from .registry import register_scheme
+ 
+ 
++def _is_kimi_k3_model(vllm_config: Any) -> bool:
++    """Identify K3 from either its outer multimodal or inner text config.
++
++    The full K3 checkpoint has ``hf_config.model_type == "kimi_k3"``. Some
++    text-only loading paths expose the nested K3 text config instead, whose
++    inherited model type is ``"kimi_linear"``. The latter is distinguished
++    from a regular Kimi Linear model by the K3 MLA/output-gate and routed-MoE
++    fields.
++    """
++    model_config = getattr(vllm_config, "model_config", None)
++    hf_config = getattr(model_config, "hf_config", None)
++    if getattr(hf_config, "model_type", None) == "kimi_k3":
++        return True
++
++    hf_text_config = getattr(model_config, "hf_text_config", None)
++    return (
++        getattr(hf_text_config, "model_type", None) == "kimi_linear"
++        and bool(getattr(hf_text_config, "mla_use_output_gate", False))
++        and getattr(hf_text_config, "routed_expert_hidden_size", None) is not None
++    )
++
++
+ @register_scheme("W4A8_DYNAMIC", "linear")
+ class AscendW4A8DynamicLinearMethod(AscendLinearScheme):
+     """Linear method for Ascend W4A8_DYNAMIC.
+@@ -48,7 +70,8 @@ class AscendW4A8DynamicLinearMethod(AscendLinearScheme):
+     The names below use ``linear`` as the checkpoint prefix of a linear layer,
+     ``input_size`` as the logical input dimension, ``output_size`` as the
+     logical output dimension, and ``group_size`` as the number of input
+-    channels per weight quantization group.
++    channels per weight quantization group. A ``group_size`` of ``0`` selects
++    per-channel weight quantization.
+ 
+     For ``quant_version != "1.0.0"``, the original linear weights are:
+ 
+@@ -56,10 +79,11 @@ class AscendW4A8DynamicLinearMethod(AscendLinearScheme):
+       Each int8 element stores one 4-bit weight value.
+     - ``linear.weight_scale``: ``params_dtype``, ``[output_size, 1]``.
+     - ``linear.weight_offset``: ``params_dtype``, ``[output_size, 1]``.
+-    - ``linear.weight_scale_second``: ``params_dtype``,
+-      ``[output_size, input_size // group_size]``.
+-    - ``linear.weight_offset_second``: ``torch.int64``,
++    - For per-group quantization, ``linear.weight_scale_second`` and
++      ``linear.weight_offset_second`` have shape
+       ``[output_size, input_size // group_size]``.
++    - For per-channel quantization, ``weight_scale`` and ``weight_offset``
++      are the only scale tensors; no second-level tensors are present.
+ 
+     For ``quant_version == "1.0.0"``, the original linear weights are:
+ 
+@@ -68,10 +92,10 @@ class AscendW4A8DynamicLinearMethod(AscendLinearScheme):
+       dimension.
+     - ``linear.weight_scale``: ``params_dtype``, ``[output_size, 1]``.
+     - ``linear.weight_offset``: ``params_dtype``, ``[output_size, 1]``.
+-    - ``linear.weight_scale_second``: ``params_dtype``,
+-      ``[output_size, input_size // group_size]``.
+-    - ``linear.weight_offset_second``: ``torch.int64``,
+-      ``[output_size, input_size // group_size]``.
++    - For per-group quantization, ``linear.weight_scale_second`` and
++      ``linear.weight_offset_second`` have shape
++      ``[output_size, input_size // group_size]``. Per-channel quantization
++      does not store second-level scale or offset tensors.
+     - ``linear.scale_bias``: ``torch.float32``, ``[output_size, 1]`` for
+       column-parallel linear layers and ``[output_size, 16]`` for
+       row-parallel linear layers.
+@@ -83,21 +107,47 @@ class AscendW4A8DynamicLinearMethod(AscendLinearScheme):
+     already packed as int4 pairs in int8 storage and are reinterpreted as int32
+     by grouping four int8 values.
+ 
+-    After processing, ``torch_npu.npu_weight_quant_batchmatmul`` is called with
+-    ``weight`` as ``torch.int32`` in the operator-required packed layout
+-    with shape ``[input_size, output_size // 8]`` and
+-    ``antiquant_scale`` as ``weight_scale * weight_scale_second`` converted to
+-    ``x.dtype`` with shape ``[input_size // group_size, output_size]``.
++    Per-group linear weights use ``torch_npu.npu_weight_quant_batchmatmul``.
++    Generic per-channel linear weights use ``torch_npu.npu_quant_matmul``.
++    K3 shared experts use the per-channel W4A8 grouped-matmul path: activations
++    are dynamically quantized to int8, packed int4 weights are converted to NZ,
++    and the projection is evaluated as a single expert by
++    ``torch_npu.npu_grouped_matmul``. This avoids silently degrading K3 shared
++    experts to W4A16.
++
++    The generic linear operators consume ``weight`` as ``torch.int32`` with
++    shape ``[input_size, output_size // 8]``. The K3 shared-expert grouped
++    operator consumes a leading singleton expert dimension, with shape
++    ``[1, input_size, output_size // 8]``.
+     """
+ 
+     def __init__(self):
+         vllm_config = get_current_vllm_config()
+         self.group_size = vllm_config.quant_config.quant_description.get("group_size", 256)
++        self.is_per_channel_weight = self.group_size == 0
+         quant_version = vllm_config.quant_config.quant_description.get("version", "0")
+         self.new_quant_version = quant_version == "1.0.0"
++        self._uses_kimi_k3_shared_expert_per_channel = _is_kimi_k3_model(vllm_config)
++        self._force_kimi_shared_expert_per_channel = False
+ 
+         self.tp_size = get_tensor_model_parallel_world_size()
+ 
++    def _uses_per_channel_shared_expert(self, layer: torch.nn.Module) -> bool:
++        # This is deliberately not a model-wide K3 flag: only K3 shared
++        # experts have per-channel W4A8 scales. Routed experts stay per-group.
++        return self._force_kimi_shared_expert_per_channel or (
++            self._uses_kimi_k3_shared_expert_per_channel and ".shared_experts." in getattr(layer, "prefix", "")
++        )
++
++    def enable_per_channel_for_kimi_shared_expert(self) -> None:
++        """Select the per-channel W4A8 path for a Kimi shared expert."""
++        self.group_size = 0
++        self.is_per_channel_weight = True
++        # This scheme instance is attached to one shared-expert projection.
++        # Retain that selection through weight loading, where layer.prefix is
++        # not a reliable discriminator for every vLLM Linear wrapper.
++        self._force_kimi_shared_expert_per_channel = True
++
+     def get_weight(self, input_size: int, output_size: int, params_dtype: torch.dtype) -> dict[str, Any]:
+         """Create weight parameters.
+ 
+@@ -127,10 +177,13 @@ class AscendW4A8DynamicLinearMethod(AscendLinearScheme):
+         params_dict = {}
+         params_dict["weight_scale"] = torch.empty(output_size, 1, dtype=params_dtype)
+         params_dict["weight_offset"] = torch.empty(output_size, 1, dtype=params_dtype)
+-        params_dict["weight_scale_second"] = torch.empty(output_size, input_size // self.group_size, dtype=params_dtype)
+-        params_dict["weight_offset_second"] = torch.empty(
+-            output_size, input_size // self.group_size, dtype=params_dtype
+-        )
++        if not self.is_per_channel_weight:
++            params_dict["weight_scale_second"] = torch.empty(
++                output_size, input_size // self.group_size, dtype=params_dtype
++            )
++            params_dict["weight_offset_second"] = torch.empty(
++                output_size, input_size // self.group_size, dtype=params_dtype
++            )
+ 
+         # NOTE: In w4a8 quantization implementation,
+         #       for down_proj and o_proj(layer_type == "row") scale_bias shape is [output_size, 16],
+@@ -182,7 +235,64 @@ class AscendW4A8DynamicLinearMethod(AscendLinearScheme):
+         bias: torch.Tensor | None = None,
+         tp_rank: int | None = None,
+     ) -> torch.Tensor:
+-        # NOTE: activation `x` is not quantized
++        if self.is_per_channel_weight:
++            if self._uses_per_channel_shared_expert(layer):
++                # QuantMatmul cannot consume the A3 per-channel INT4 WeightNZ
++                # representation. Model this projection as one grouped expert
++                # instead, which keeps both the int8 activation and int4 weight.
++                input_shape = x.shape
++                x_2d = x.reshape(-1, input_shape[-1])
++                quantized_x, pertoken_scale = torch_npu.npu_dynamic_quant(x_2d)
++                # Construct the single-group token count directly on the
++                # device. ``torch.tensor([count], device=x.device)`` performs
++                # a synchronous host-to-device copy, which is forbidden while
++                # ACL Graph is capturing in GLOBAL mode.
++                group_list = torch.full(
++                    (1,),
++                    quantized_x.shape[0],
++                    dtype=torch.int64,
++                    device=x.device,
++                )
++
++                scale_bias = layer.scale_bias
++                if scale_bias.dim() == 2:
++                    rank = tp_rank or 0
++                    if rank >= scale_bias.shape[1]:
++                        raise ValueError(f"tp_rank {rank} exceeds scale_bias width {scale_bias.shape[1]}")
++                    scale_bias = scale_bias[:, rank]
++
++                output = torch_npu.npu_grouped_matmul(
++                    x=[quantized_x],
++                    weight=[layer.weight],
++                    scale=[layer.weight_scale.reshape(1, 1, -1)],
++                    bias=[scale_bias.reshape(1, -1)],
++                    per_token_scale=[pertoken_scale],
++                    split_item=2,
++                    group_list=group_list,
++                    group_type=0,
++                    group_list_type=1,
++                    output_dtype=x.dtype,
++                )[0]
++                if bias is not None:
++                    output = output + bias
++                return output.reshape(*input_shape[:-1], output.shape[-1])
++            quantized_x, pertoken_scale = torch_npu.npu_dynamic_quant(x)
++            need_unsqueeze = pertoken_scale.dim() == 2
++            if need_unsqueeze:
++                quantized_x = quantized_x.squeeze(dim=1)
++                pertoken_scale = pertoken_scale.squeeze(dim=1)
++
++            output = torch_npu.npu_quant_matmul(
++                quantized_x,
++                layer.weight,
++                layer.weight_scale,
++                pertoken_scale=pertoken_scale,
++                bias=bias,
++                output_dtype=x.dtype,
++            )
++            return output.unsqueeze(dim=1) if need_unsqueeze else output
++
++        # Per-group INT4 weights use the weight-only quantized operator.
+         return torch_npu.npu_weight_quant_batchmatmul(
+             x,
+             layer.weight,
+@@ -191,16 +301,53 @@ class AscendW4A8DynamicLinearMethod(AscendLinearScheme):
+         )
+ 
+     def process_weights_after_loading(self, layer: torch.nn.Module):
++        uses_per_channel_shared_expert = self._uses_per_channel_shared_expert(layer)
+         layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
+-        layer.weight.data = maybe_trans_nz(layer.weight.data)
+-        layer.weight_scale.data = layer.weight_scale.data.flatten().to(torch.float32)
++        layer.weight_scale.data = layer.weight_scale.data.flatten()
+         layer.weight_offset.data = layer.weight_offset.data.flatten()
+-        layer.weight_scale_second.data, scale_bias = self.process_scale_second(
+-            layer.weight.data,
+-            layer.weight_scale.data,
+-            layer.weight_scale_second.data.transpose(0, 1).contiguous(),
+-            is_new_quant=self.new_quant_version,
+-        )
++
++        if uses_per_channel_shared_expert:
++            if not self.new_quant_version:
++                raise ValueError("K3 shared-expert W4A8 requires quantization version 1.0.0")
++
++            # Preserve the floating-point scale for the fused SiTU path, then
++            # bit-cast it to the int64 representation required by grouped
++            # matmul. Each int64 element stores one FP32 scale bit pattern.
++            layer.weight_scale_fp32 = layer.weight_scale.data.to(torch.float32)
++            scale_np = layer.weight_scale_fp32.contiguous().cpu().numpy()
++            scale_np.dtype = np.uint32
++            layer.weight_scale.data = torch.from_numpy(scale_np.astype(np.int64)).to(layer.weight_scale.device)
++
++            if not hasattr(layer, "scale_bias"):
++                raise ValueError("K3 shared-expert W4A8 requires scale_bias")
++            if layer.scale_bias.data.shape[1] == 1:
++                layer.scale_bias.data = layer.scale_bias.data.flatten()
++            else:
++                layer.scale_bias.data = layer.scale_bias.data.contiguous()
++
++            # Treat the shared projection as one grouped expert. Keep packed
++            # int4 bytes while converting to NZ, then expose groups of four
++            # bytes as the int32 storage expected by the GMM interface.
++            assert layer.weight.data.shape[-1] % 4 == 0, (
++                f"the last dim of weight needs to be divided by 4 but got shape {layer.weight.data.shape}"
++            )
++            layer.weight.data = maybe_trans_nz(layer.weight.data.unsqueeze(0)).view(torch.int32).contiguous()
++            return
++
++        layer.weight.data = maybe_trans_nz(layer.weight.data)
++        if self.is_per_channel_weight:
++            # QuantMatmul consumes the checkpoint dtype, while the fused SiTU
++            # dequantization step requires an FP32 copy of the same scale.
++            layer.weight_scale_fp32 = layer.weight_scale.data.to(torch.float32)
++        scale_bias = None
++        if not self.is_per_channel_weight:
++            layer.weight_scale.data = layer.weight_scale.data.to(torch.float32)
++            layer.weight_scale_second.data, scale_bias = self.process_scale_second(
++                layer.weight.data,
++                layer.weight_scale.data,
++                layer.weight_scale_second.data.transpose(0, 1).contiguous(),
++                is_new_quant=self.new_quant_version,
++            )
+ 
+         if self.new_quant_version:
+             # Process the loaded data based on layer type
+@@ -209,22 +356,19 @@ class AscendW4A8DynamicLinearMethod(AscendLinearScheme):
+                     layer.scale_bias.data = layer.scale_bias.data.flatten()
+                 else:
+                     layer.scale_bias.data = layer.scale_bias.data.contiguous()
+-        else:
+-            if scale_bias is not None:
+-                param = torch.nn.Parameter(scale_bias, requires_grad=False)
+-                layer.register_parameter("weight_scale_bias", param)
++        elif scale_bias is not None:
++            param = torch.nn.Parameter(scale_bias, requires_grad=False)
++            layer.register_parameter("weight_scale_bias", param)
+ 
+-        # Convert to NPU-specific int4pack format
++        # Convert to NPU-specific int4pack format.
+         if self.new_quant_version:
+-            # weights on disk are already in packed int4 format
+-            # pack 4 int8(int4*2) to int32
++            # Weights on disk are already in packed int4 format; group four
++            # int8 bytes into one int32 storage element.
+             assert layer.weight.data.shape[-1] % 4 == 0, (
+                 f"the last dim of weight needs to be divided by 4 but got shape {layer.weight.data.shape}"
+             )
+             layer.weight.data = layer.weight.data.view(torch.int32).contiguous()
+         else:
+-            # weights are not compressed
+-            # need to be packed via npu_convert_weight_to_int4pack
+             layer.weight.data = torch_npu.npu_convert_weight_to_int4pack(layer.weight.data.to(torch.int32))
+ 
+ 
+diff --git a/vllm_ascend/quantization/modelslim_config.py b/vllm_ascend/quantization/modelslim_config.py
+index b9cb740..7911e4b 100644
+--- a/vllm_ascend/quantization/modelslim_config.py
++++ b/vllm_ascend/quantization/modelslim_config.py
+@@ -49,6 +49,7 @@ from vllm_ascend.utils import (
+ )
+ 
+ from .methods import get_scheme_class
++from .methods.w4a8 import _is_kimi_k3_model
+ 
+ 
+ def _is_fused_moe_layer(layer: torch.nn.Module) -> bool:
+@@ -586,6 +587,7 @@ class AscendModelSlimConfig(QuantizationConfig):
+     def get_cache_scale_mapper(self) -> "WeightsMapper":
+         """Upstream use staticmethod, but we need to use instance attribute"""
+         suffix_map = {}
++        regex_map = {}
+         if self.enable_c8_quant:
+             suffix_map.update(
+                 {
+@@ -596,26 +598,33 @@ class AscendModelSlimConfig(QuantizationConfig):
+                 }
+             )
+         if self.enable_fa_quant:
+-            suffix_map.update(
++            # Kimi K3's multimodal wrapper and language model both use an
++            # AutoWeightsLoader. The mapper is therefore applied twice while
++            # loading FAQuant weights. Match only the source form so a name
++            # already mapped under ``mla_attn.mla_attn`` remains unchanged.
++            regex_map.update(
+                 {
+-                    ".fa_q.scale": ".mla_attn.mla_attn.fa_q.scale",
+-                    ".fa_k.scale": ".mla_attn.mla_attn.fa_k.scale",
+-                    ".fa_v.scale": ".mla_attn.mla_attn.fa_v.scale",
+-                    ".fa_q.offset": ".mla_attn.mla_attn.fa_q.offset",
+-                    ".fa_k.offset": ".mla_attn.mla_attn.fa_k.offset",
+-                    ".fa_v.offset": ".mla_attn.mla_attn.fa_v.offset",
++                    re.compile(
++                        r"(?<!\.mla_attn\.mla_attn)\.fa_([qkv])\.(scale|offset)$"
++                    ): r".mla_attn.mla_attn.fa_\1.\2",
+                 }
+             )
+         if self.enable_indexer_quant:
+-            suffix_map.update(
++            # Keep the same idempotency guarantee for indexer scales, which
++            # are loaded through the same nested model-loader path.
++            regex_map.update(
+                 {
+-                    ".indexer.q_rot": ".mla_attn.mla_attn.indexer.q_rot",
+-                    ".indexer.k_rot": ".mla_attn.mla_attn.indexer.k_rot",
++                    re.compile(
++                        r"(?<!\.mla_attn\.mla_attn)\.indexer\.([qk]_rot)$"
++                    ): r".mla_attn.mla_attn.indexer.\1",
+                 }
+             )
+-        if not suffix_map:
++        if not suffix_map and not regex_map:
+             return QuantizationConfig.get_cache_scale_mapper()
+-        cache_scale_mapper = WeightsMapper(orig_to_new_suffix=suffix_map)
++        cache_scale_mapper = WeightsMapper(
++            orig_to_new_regex=regex_map,
++            orig_to_new_suffix=suffix_map,
++        )
+         return cache_scale_mapper | QuantizationConfig.get_cache_scale_mapper()
+ 
+     def _has_quant_weight(self, prefix: str, packed_modules_mapping: Mapping[str, list[str]]) -> bool:
+@@ -713,6 +722,13 @@ class AscendModelSlimConfig(QuantizationConfig):
+                 logger.debug("Select AscendUnquantizedLinearMethod for %s (layer=%s)", prefix, "LinearBase")
+                 return AscendUnquantizedLinearMethod()
+             scheme = create_scheme_for_layer(self.quant_description, prefix, "linear", self.packed_modules_mapping)
++            if _is_kimi_k3_model(vllm_config) and ".shared_experts." in prefix:
++                # Kimi K3 stores W4A8 shared-expert linears with per-channel
++                # scales, while its routed experts remain per-group.
++                from .methods.w4a8 import AscendW4A8DynamicLinearMethod
++
++                if isinstance(scheme, AscendW4A8DynamicLinearMethod):
++                    scheme.enable_per_channel_for_kimi_shared_expert()
+             logger.debug("Select AscendLinearMethod for %s (layer=%s)", prefix, "LinearBase")
+             return AscendLinearMethod(scheme)
+         elif isinstance(layer, AttentionLayerBase) and (
+diff --git a/vllm_ascend/worker/model_runner_v1.py b/vllm_ascend/worker/model_runner_v1.py
+index 5d98fc1..c1fc674 100644
+--- a/vllm_ascend/worker/model_runner_v1.py
++++ b/vllm_ascend/worker/model_runner_v1.py
+@@ -19,6 +19,7 @@
+ 
+ import logging
+ import math
++import os
+ import sys
+ import time
+ from collections import defaultdict
+@@ -1840,6 +1841,44 @@ class NPUModelRunner(GPUModelRunner):
+                     if not has_kv_transfer_group():
+                         return EMPTY_MODEL_RUNNER_OUTPUT
+                     return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
++                if (
++                    os.getenv("VLLM_ASCEND_C8_NZ_DEBUG", "0") == "1"
++                    and get_tp_group().rank_in_group == 0
++                ):
++                    debug_step = getattr(self, "_c8_nz_request_debug_step", 0)
++                    self._c8_nz_request_debug_step = debug_step + 1
++                    debug_first = int(
++                        os.getenv("VLLM_ASCEND_C8_NZ_DEBUG_FIRST_STEPS", "8")
++                    )
++                    debug_every = max(
++                        1,
++                        int(os.getenv("VLLM_ASCEND_C8_NZ_DEBUG_EVERY", "64")),
++                    )
++                    if debug_step < debug_first or debug_step % debug_every == 0:
++                        computed = self.input_batch.num_computed_tokens_cpu[:num_reqs]
++                        prompts = self.input_batch.num_prompt_tokens[:num_reqs]
++                        logger.warning(
++                            "[C8REQ] dp=%d step=%d reqs=%d ids=%s "
++                            "scheduled=%s computed=%s prompts=%s "
++                            "common_prefix_blocks=%s prefix_cache=%s",
++                            get_dp_group().rank_in_group,
++                            debug_step,
++                            num_reqs,
++                            list(req_ids),
++                            list(tokens),
++                            computed.tolist(),
++                            prompts.tolist(),
++                            getattr(
++                                scheduler_output,
++                                "num_common_prefix_blocks",
++                                None,
++                            ),
++                            getattr(
++                                self.cache_config,
++                                "enable_prefix_caching",
++                                None,
++                            ),
++                        )
+                 self._start_dump_data()
+                 num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
+                 max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
+@@ -3725,6 +3764,23 @@ class NPUModelRunner(GPUModelRunner):
+         head_size_v = kv_cache_spec.head_size_v if hasattr(kv_cache_spec, "head_size_v") else kv_cache_spec.head_size
+         return kv_cache_spec.head_size, head_size_v
+ 
++    def _get_mla_fa_quant_cache_dtypes(
++        self,
++        layer_name: str,
++        kv_cache_spec: AttentionSpec,
++    ) -> tuple[torch.dtype, torch.dtype] | None:
++        if not isinstance(kv_cache_spec, AscendMLAAttentionSpec):
++            return None
++        attn_layers = get_layers_from_vllm_config(
++            self.vllm_config,
++            AttentionLayerBase,
++            [layer_name],
++        )
++        attn_layer = attn_layers[layer_name]
++        if isinstance(attn_layer, MLAAttention) and getattr(attn_layer.impl, "fa_quant_layer", False):
++            return attn_layer.impl.dtype, self.model_config.dtype
++        return None
++
+     @staticmethod
+     def _align_up(value: int, alignment: int) -> int:
+         return (value + alignment - 1) // alignment * alignment
+@@ -3930,21 +3986,30 @@ class NPUModelRunner(GPUModelRunner):
+                     else:
+                         k_dim, v_dim = self._get_attention_kv_cache_dims(layer_name, current_kv_cache_spec)
+                         assert k_dim > 0 and v_dim > 0
+-                        kv_head_dim_list = [
+-                            k_dim,
+-                            v_dim,
+-                        ]
+-                        if not self.use_sparse and enable_fa_quant(self.vllm_config):
++                        mla_fa_quant_dtypes = self._get_mla_fa_quant_cache_dtypes(
++                            layer_name,
++                            current_kv_cache_spec,
++                        )
++                        if mla_fa_quant_dtypes is not None:
++                            k_cache_dtype, v_cache_dtype = mla_fa_quant_dtypes
++                            kv_head_dim_list = [
++                                k_dim * get_dtype_size(k_cache_dtype),
++                                v_dim * get_dtype_size(v_cache_dtype),
++                            ]
++                            k_tensor_split_factor, v_tensor_split_factor = calc_split_factor(kv_head_dim_list)
++                        elif not self.use_sparse and enable_fa_quant(self.vllm_config):
++                            kv_head_dim_list = [k_dim, v_dim]
+                             k_tensor_split_factor, v_tensor_split_factor = (
+                                 self.vllm_config.quant_config.get_kv_quant_split_factor(layer_name, kv_head_dim_list)
+                             )
+                         else:
++                            kv_head_dim_list = [k_dim, v_dim]
+                             k_tensor_split_factor, v_tensor_split_factor = calc_split_factor(kv_head_dim_list)
+                         k_tensor_size = int(kv_cache_tensor.size // k_tensor_split_factor)
+                         v_tensor_size = int(kv_cache_tensor.size // v_tensor_split_factor)
+-                    # Allocate raw int8 tensors. Even bf16/fp16 KV cache entries
+-                    # are allocated as int8 raw bytes first and then viewed as
+-                    # the target dtype in _reshape_kv_cache_tensors.
++                    # Allocate raw int8 tensors. Even bf16/fp16 KV cache
++                    # entries are allocated as int8 raw bytes first and then
++                    # viewed as their target dtype in _reshape_kv_cache_tensors.
+                     v_tensor = None
+                     k_tensor = self._allocate_int8_cache_tensor(
+                         k_tensor_size,
+@@ -4233,11 +4298,19 @@ class NPUModelRunner(GPUModelRunner):
+                                 raw_v_tensor = raw_kv_tensor[attn_tensor_page_size:]
+                             else:
+                                 k_dim, v_dim = self._get_attention_kv_cache_dims(layer_name, current_kv_cache_spec)
+-                                nope_page_size = int(np.prod(kv_cache_shape[:-1])) * k_dim * get_dtype_size(
+-                                    current_kv_cache_spec.dtype
++                                mla_fa_quant_dtypes = self._get_mla_fa_quant_cache_dtypes(
++                                    layer_name,
++                                    current_kv_cache_spec,
+                                 )
+-                                rope_page_size = int(np.prod(kv_cache_shape[:-1])) * v_dim * get_dtype_size(
+-                                    current_kv_cache_spec.dtype
++                                if mla_fa_quant_dtypes is None:
++                                    k_cache_dtype = v_cache_dtype = current_kv_cache_spec.dtype
++                                else:
++                                    k_cache_dtype, v_cache_dtype = mla_fa_quant_dtypes
++                                nope_page_size = (
++                                    int(np.prod(kv_cache_shape[:-1])) * k_dim * get_dtype_size(k_cache_dtype)
++                                )
++                                rope_page_size = (
++                                    int(np.prod(kv_cache_shape[:-1])) * v_dim * get_dtype_size(v_cache_dtype)
+                                 )
+                                 conv_block_padding_size = raw_k_tensor.numel() - nope_page_size - rope_page_size
+                                 raw_kv_tensor = raw_k_tensor[conv_block_padding_size:]
+@@ -4281,7 +4354,13 @@ class NPUModelRunner(GPUModelRunner):
+                             v_dim,
+                         )
+                     k_cache_dtype = v_cache_dtype = current_kv_cache_spec.dtype
+-                    if enable_fa_quant(self.vllm_config):
++                    mla_fa_quant_dtypes = self._get_mla_fa_quant_cache_dtypes(
++                        layer_name,
++                        current_kv_cache_spec,
++                    )
++                    if mla_fa_quant_dtypes is not None:
++                        k_cache_dtype, v_cache_dtype = mla_fa_quant_dtypes
++                    elif enable_fa_quant(self.vllm_config):
+                         k_cache_dtype, v_cache_dtype = self.vllm_config.quant_config.get_kv_quant_dtype(
+                             layer_name, current_kv_cache_spec.dtype, self.model_config
+                         )
+@@ -4605,8 +4684,15 @@ class NPUModelRunner(GPUModelRunner):
+                     )
+                 elif spec := attn_module.get_kv_cache_spec(self.vllm_config):
+                     if getattr(attn_module.impl, "fa_quant_layer", False):
+-                        head_size = attn_module.head_size + attn_module.qk_rope_head_dim
+                         dtype, cache_dtype_str = attn_module.impl.dtype, None
++                        dtype_size = get_dtype_size(dtype)
++                        # Latent KV is C8, while the positional cache remains in model dtype.
++                        head_size_bytes = (
++                            attn_module.kv_lora_rank * dtype_size
++                            + attn_module.qk_rope_head_dim * get_dtype_size(self.model_config.dtype)
++                        )
++                        assert head_size_bytes % dtype_size == 0
++                        head_size = head_size_bytes // dtype_size
+                     else:
+                         head_size, dtype, cache_dtype_str = spec.head_size, spec.dtype, spec.cache_dtype_str
+                     kv_cache_spec[layer_name] = AscendMLAAttentionSpec(

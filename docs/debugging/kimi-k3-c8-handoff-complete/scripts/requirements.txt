@@ -1,0 +1,4 @@
+# The exact historical client environment was not recoverable.
+# This range covers the only non-stdlib dependency used by the client.
+aiohttp>=3.9,<4
+
