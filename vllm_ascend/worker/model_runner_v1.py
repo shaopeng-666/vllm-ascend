@@ -5954,6 +5954,22 @@ class NPUModelRunner(GPUModelRunner):
                 if kv_cache_spec[layer_name].page_size_bytes < mamba_page_size_padded:  # type: ignore[attr-defined]
                     object.__setattr__(kv_cache_spec[layer_name], "page_size_padded", mamba_page_size_padded)
 
+        # KV specs are serialized from workers to the engine core, while the
+        # static forward-context modules are worker-local. Preserve the exact
+        # draft-layer identity discovered by the proposer on the corresponding
+        # spec so engine-core grouping can annotate only the true draft group.
+        for layer_name, spec in kv_cache_spec.items():
+            if getattr(
+                attn_layers.get(layer_name),
+                "_vllm_ascend_is_draft_cache_layer",
+                False,
+            ):
+                object.__setattr__(
+                    spec,
+                    "_vllm_ascend_is_draft_cache_layer",
+                    True,
+                )
+
         if self.sparse_kv_offload_enabled:
             self.kv_cache_spec = kv_cache_spec # reserve for Sparse KV offload usage
         return kv_cache_spec

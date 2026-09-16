@@ -29,6 +29,7 @@ from vllm.config import CUDAGraphMode
 from vllm_ascend.spec_decode.llm_base_proposer import (
     AscendSpecDecodeBaseProposer,
     _draft_embed_accepts_mm,
+    _mark_draft_kv_cache_layers,
 )
 
 # CUDAGraphMode values whose ``has_full_cudagraphs()`` is True: FULL plus the
@@ -44,6 +45,23 @@ NON_FULL_CUDAGRAPH_MODES = [
     CUDAGraphMode.NONE,
     CUDAGraphMode.PIECEWISE,
 ]
+
+
+def test_mark_draft_kv_cache_layers_marks_only_discovered_layers() -> None:
+    target = SimpleNamespace()
+    draft = SimpleNamespace()
+    other_mamba = SimpleNamespace()
+    layers = {
+        "model.layers.0.self_attn.attn": target,
+        "mtp.layers.0.self_attn.attn": draft,
+        "model.layers.1.linear_attn": other_mamba,
+    }
+
+    _mark_draft_kv_cache_layers(layers, {"mtp.layers.0.self_attn.attn"})
+
+    assert draft._vllm_ascend_is_draft_cache_layer is True
+    assert not hasattr(target, "_vllm_ascend_is_draft_cache_layer")
+    assert not hasattr(other_mamba, "_vllm_ascend_is_draft_cache_layer")
 
 
 class TestMultimodalImageTokenIndex:

@@ -68,6 +68,23 @@ from vllm_ascend.worker.device_metadata import DeviceMetadataTask, DeviceMetadat
 
 # Currently we will fix block size to a small one since `num_reqs` can't be too large
 _PREPARE_INPUTS_BLOCK_SIZE = 4
+_ASCEND_DRAFT_CACHE_LAYER_ATTR = "_vllm_ascend_is_draft_cache_layer"
+
+
+def _mark_draft_kv_cache_layers(
+    all_attn_layers: dict[str, AttentionLayerBase],
+    draft_layer_names: set[str],
+) -> None:
+    """Preserve proposer-owned draft cache identity through KV grouping.
+
+    Full-attention MTP layers (for example Qwen3.5 MTP) have the same cache
+    spec as target full-attention layers. Once specs are merged into groups,
+    their draft identity cannot be recovered from the merged spec alone.
+    Mark the actual layers discovered by the proposer so the platform KV
+    grouping patch can annotate only the group that contains those layers.
+    """
+    for layer_name in draft_layer_names:
+        setattr(all_attn_layers[layer_name], _ASCEND_DRAFT_CACHE_LAYER_ATTR, True)
 
 _HIDDEN_STATE_DRAFTER_TYPES = (
     Eagle3LlamaForCausalLM,
@@ -374,6 +391,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             for name in (set(all_attn_layers.keys()) - target_attn_layer_names)
             if all_attn_layers[name].get_kv_cache_spec(self.vllm_config) is not None
         } - all_indexer_layer_names
+        _mark_draft_kv_cache_layers(
+            all_attn_layers,
+            self._draft_attn_layer_names,
+        )
 
         self.attn_layer_names = list(sorted(self._draft_attn_layer_names))
         draft_attn_layers_dict = get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase)

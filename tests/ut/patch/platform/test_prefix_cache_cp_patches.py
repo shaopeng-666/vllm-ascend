@@ -40,6 +40,7 @@ from vllm_ascend.patch.platform.patch_kv_cache_coordinator import (
     get_kv_cache_coordinator,
 )
 from vllm_ascend.patch.platform.patch_kv_cache_utils import (
+    _ascend_annotate_eagle_groups,
     _ascend_resolve_kv_cache_block_sizes,
     _get_kimi_k3_dspark_mixed_kv_cache_groups,
     _get_kv_cache_config_deepseek_v4,
@@ -89,6 +90,61 @@ def _make_hybrid_kv_cache_config(
             KVCacheGroupSpec(layer_names=["mamba"], kv_cache_spec=mamba_spec),
         ],
     )
+
+
+def test_qwen35_mtp_marks_only_full_attention_draft_group() -> None:
+    target_full_spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=8,
+        head_size=64,
+        dtype=torch.bfloat16,
+    )
+    draft_full_spec = replace(target_full_spec)
+    object.__setattr__(
+        draft_full_spec,
+        "_vllm_ascend_is_draft_cache_layer",
+        True,
+    )
+    mamba_specs = [
+        MambaSpec(
+            block_size=16,
+            shapes=((1,),),
+            dtypes=(torch.float32,),
+            mamba_cache_mode="align",
+        )
+        for _ in range(3)
+    ]
+    groups = [
+        KVCacheGroupSpec(
+            layer_names=["model.layers.0.self_attn.attn", "mtp.layers.0.self_attn.attn"],
+            kv_cache_spec=target_full_spec,
+        ),
+        *[
+            KVCacheGroupSpec(
+                layer_names=[f"model.layers.{idx}.linear_attn"],
+                kv_cache_spec=spec,
+            )
+            for idx, spec in enumerate(mamba_specs, start=1)
+        ],
+    ]
+    vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(use_eagle=lambda: True),
+        # EngineCore does not own the workers' static forward-context modules.
+        compilation_config=SimpleNamespace(static_forward_context={}),
+    )
+    specs = {
+        "model.layers.0.self_attn.attn": target_full_spec,
+        "mtp.layers.0.self_attn.attn": draft_full_spec,
+        **{
+            group.layer_names[0]: group.kv_cache_spec
+            for group in groups[1:]
+        },
+    }
+
+    _ascend_annotate_eagle_groups(vllm_config, specs, groups)
+
+    assert groups[0].is_eagle_group
+    assert all(not group.is_eagle_group for group in groups[1:])
 
 
 def _make_kimi_k3_dspark_kv_cache_specs(
@@ -287,6 +343,53 @@ def test_resolve_kv_cache_block_sizes_with_cp_hybrid_groups(
     expected_scheduler_block_size = math.lcm(16, 32) * 2
     assert scheduler_block_size == expected_scheduler_block_size
     assert hash_block_size == expected_hash_block_size
+
+
+def test_cp_hybrid_groups_honor_prefix_match_unit() -> None:
+    """The Ascend CP override must not discard vLLM's public CLI setting."""
+    kv_cache_config = _make_hybrid_kv_cache_config(
+        full_block_size=16,
+        mamba_block_size=32,
+    )
+    vllm_config = _make_vllm_config(
+        enable_prefix_caching=True,
+        dcp=2,
+        prefix_match_unit=8,
+    )
+
+    scheduler_block_size, hash_block_size = (
+        _ascend_resolve_kv_cache_block_sizes(
+            kv_cache_config,
+            vllm_config,
+        )
+    )
+
+    assert scheduler_block_size == 64
+    assert hash_block_size == 8
+
+
+def test_cp_hybrid_groups_reject_incompatible_prefix_match_unit() -> None:
+    kv_cache_config = _make_hybrid_kv_cache_config(
+        full_block_size=16,
+        mamba_block_size=32,
+    )
+    vllm_config = _make_vllm_config(
+        enable_prefix_caching=True,
+        dcp=2,
+        prefix_match_unit=24,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"Invalid prefix_match_unit=24; all KV cache group block sizes "
+            r"must be divisible by prefix_match_unit"
+        ),
+    ):
+        _ascend_resolve_kv_cache_block_sizes(
+            kv_cache_config,
+            vllm_config,
+        )
 
 
 @pytest.mark.parametrize(
