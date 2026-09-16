@@ -41,7 +41,60 @@ from vllm_ascend.patch.platform.patch_kv_cache_utils import (
     _get_kv_cache_config_deepseek_v4_main,
 )
 from vllm_ascend.utils import AscendDeviceType, vllm_version_is
-from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+from vllm_ascend.worker.model_runner_v1 import (
+    NPUModelRunner,
+    _is_exact_single_gdn_prefill_graph,
+)
+
+
+class TestGDNPrefillGraphRuntimeContract(unittest.TestCase):
+    def test_exact_single_prefill_is_graph_safe(self):
+        self.assertTrue(
+            _is_exact_single_gdn_prefill_graph(
+                uniform_decode=False,
+                num_reqs=1,
+                num_tokens=1024,
+                graph_num_tokens=1024,
+                max_num_scheduled_tokens=1024,
+                decode_threshold=4,
+            )
+        )
+
+    def test_padded_prefill_is_not_graph_safe(self):
+        self.assertFalse(
+            _is_exact_single_gdn_prefill_graph(
+                uniform_decode=False,
+                num_reqs=1,
+                num_tokens=513,
+                graph_num_tokens=1024,
+                max_num_scheduled_tokens=513,
+                decode_threshold=4,
+            )
+        )
+
+    def test_multi_request_prefill_is_not_graph_safe(self):
+        self.assertFalse(
+            _is_exact_single_gdn_prefill_graph(
+                uniform_decode=False,
+                num_reqs=2,
+                num_tokens=1024,
+                graph_num_tokens=1024,
+                max_num_scheduled_tokens=512,
+                decode_threshold=4,
+            )
+        )
+
+    def test_spec_decode_is_not_graph_safe(self):
+        self.assertFalse(
+            _is_exact_single_gdn_prefill_graph(
+                uniform_decode=False,
+                num_reqs=1,
+                num_tokens=4,
+                graph_num_tokens=4,
+                max_num_scheduled_tokens=4,
+                decode_threshold=4,
+            )
+        )
 
 
 class TestDummyRunSlotInvalidation(unittest.TestCase):

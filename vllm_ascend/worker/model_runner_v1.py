@@ -335,6 +335,24 @@ def supports_shared_kv_backing_with_transfer(vllm_config: VllmConfig) -> bool:
     )
 
 
+def _is_exact_single_gdn_prefill_graph(
+    *,
+    uniform_decode: bool,
+    num_reqs: int,
+    num_tokens: int,
+    graph_num_tokens: int,
+    max_num_scheduled_tokens: int,
+    decode_threshold: int,
+) -> bool:
+    """Whether a runtime batch matches the graph-safe GDN prefill contract."""
+    return (
+        not uniform_decode
+        and num_reqs == 1
+        and graph_num_tokens == num_tokens
+        and max_num_scheduled_tokens > decode_threshold
+    )
+
+
 class ExecuteModelState(NamedTuple):
     """Ephemeral cached state transferred between execute_model() and
     sample_tokens(), after execute_model() returns None."""
@@ -3236,6 +3254,32 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         cudagraph_mode, batch_descriptor = dispatch_cudagraph(num_tokens_padded, use_cascade_attn or has_encoder_output)
+        # GDN FULL graphs deliberately support only exact-size singleton
+        # prefills: its Triton/FLA prefill kernels embed host cu-seqlens/chunk
+        # tuples, while state/cache indices are refreshed through stable
+        # tensors. Decode/spec-decode uses different mutable recurrent-state
+        # metadata and stays eager. A padded token bucket or multiple request
+        # boundaries would likewise invalidate the captured host arguments.
+        # Capture itself passes force_uniform_decode=False and is exempt from
+        # this runtime-only guard.
+        is_exact_single_gdn_prefill = _is_exact_single_gdn_prefill_graph(
+            uniform_decode=uniform_decode,
+            num_reqs=num_reqs,
+            num_tokens=num_tokens_padded,
+            graph_num_tokens=batch_descriptor.num_tokens,
+            max_num_scheduled_tokens=max_num_scheduled_tokens,
+            decode_threshold=self.decode_threshold,
+        )
+        if (
+            self._has_gdn
+            and force_uniform_decode is None
+            and cudagraph_mode == CUDAGraphMode.FULL
+            and not is_exact_single_gdn_prefill
+        ):
+            cudagraph_mode, batch_descriptor = dispatch_cudagraph(
+                num_tokens_padded,
+                disable_full=True,
+            )
         num_tokens_padded = batch_descriptor.num_tokens
         if enable_sp(self.vllm_config):
             assert batch_descriptor.num_tokens % self.vllm_config.parallel_config.tensor_parallel_size == 0, (

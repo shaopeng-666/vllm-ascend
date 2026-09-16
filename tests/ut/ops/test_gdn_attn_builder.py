@@ -8,7 +8,7 @@ import pytest
 import torch
 from vllm.config.compilation import CUDAGraphMode
 from vllm.third_party.flash_linear_attention.ops import index as _fla_index
-from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.attention.backend import AttentionCGSupport, CommonAttentionMetadata
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import MambaSpec
 
@@ -1013,3 +1013,59 @@ def test_full_graph_non_spec_metadata_nulls_padded_state_indices(
         decode_metadata.actual_seq_lengths,
         torch.tensor([0, 1, 1, 0, 0], dtype=torch.int32),
     )
+
+
+@pytest.mark.parametrize(
+    ("is_moe", "enable_fused_mc2", "expected"),
+    [
+        pytest.param(False, 0, AttentionCGSupport.ALWAYS, id="dense-unfused"),
+        pytest.param(True, 1, AttentionCGSupport.ALWAYS, id="moe-fused-mc2"),
+        pytest.param(True, 0, AttentionCGSupport.UNIFORM_BATCH, id="moe-unfused"),
+    ],
+)
+def test_gdn_prefill_graph_support_requires_fused_mc2_for_moe(
+    is_moe: bool,
+    enable_fused_mc2: int,
+    expected: AttentionCGSupport,
+):
+    with (
+        patch.object(ascend_gdn_attn_builder, "is_moe_model", return_value=is_moe),
+        patch.object(
+            ascend_gdn_attn_builder,
+            "get_ascend_config",
+            return_value=SimpleNamespace(enable_fused_mc2=enable_fused_mc2),
+        ),
+    ):
+        support = AscendGDNAttentionMetadataBuilder.get_cudagraph_support(
+            SimpleNamespace(),
+            SimpleNamespace(),
+        )
+
+    assert support == expected
+
+
+@pytest.mark.parametrize("capture_size", [256, 512, 1024, 2048])
+def test_full_graph_capture_uses_exact_single_prefill_metadata(capture_size: int):
+    common = create_common_attn_metadata(
+        BatchSpec(
+            seq_lens=[capture_size // 4] * 4,
+            query_lens=[capture_size // 4] * 4,
+        ),
+        block_size=16,
+        device=torch.device("cpu"),
+    )
+    builder = _make_builder(
+        device=torch.device("cpu"),
+        num_heads=32,
+        num_speculative_tokens=3,
+        cudagraph_mode=CUDAGraphMode.FULL,
+    )
+
+    captured = builder.build_for_cudagraph_capture(common)
+
+    assert captured.num_prefills == 1
+    assert captured.num_decodes == 0
+    assert captured.num_spec_decodes == 0
+    assert captured.num_actual_tokens == capture_size
+    assert captured.non_spec_query_start_loc.tolist() == [0, capture_size]
+    assert builder._captured_single_prefill_metadata[capture_size] is captured

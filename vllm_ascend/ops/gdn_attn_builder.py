@@ -33,12 +33,14 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ops.triton.fla.utils import (
     prepare_chunk_indices,
     prepare_chunk_offsets,
     prepare_final_chunk_indices,
     prepare_update_chunk_offsets,
 )
+from vllm_ascend.utils import is_moe_model
 
 _GDN_CHUNK_SIZE = 64
 # Keep this aligned with solve_tril.LARGE_BLOCK_T in ops/triton/fla/solve_tril.py.
@@ -221,7 +223,28 @@ def _build_non_spec_chunked_prefill_metadata(
 
 
 class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
-    _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
+    # Prefill FULL graphs are supported for exact-size, single-request batches.
+    # The model runner keeps other mixed shapes eager because the Triton/FLA
+    # kernels capture host-side sequence/chunk tuples. Exact singleton buckets
+    # have invariant tuples, while state/cache indices are refreshed through
+    # graph-stable tensors before every replay.
+    _cudagraph_support = AttentionCGSupport.ALWAYS
+
+    @classmethod
+    def get_cudagraph_support(
+        cls,
+        vllm_config: VllmConfig,
+        kv_cache_spec: AttentionSpec,
+    ) -> AttentionCGSupport:
+        del kv_cache_spec
+        # On MoE hardware profiles the unfused capacity fallback may select an
+        # ALLTOALL implementation which materializes host split sizes via a
+        # device-to-host scalar sync. That operation cannot be captured in an
+        # ACL graph. Keep those models on their existing decode-only graph mode
+        # unless fused MC2 is explicitly enabled; non-MoE models are unaffected.
+        if is_moe_model(vllm_config) and get_ascend_config().enable_fused_mc2 != 1:
+            return AttentionCGSupport.UNIFORM_BATCH
+        return cls._cudagraph_support
 
     def __init__(
         self,
@@ -279,6 +302,126 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             dtype=torch.int32,
             device=device,
         )
+        self._captured_single_prefill_metadata: dict[int, GDNAttentionMetadata] = {}
+
+    @staticmethod
+    def _is_exact_single_prefill(
+        attn_metadata: GDNAttentionMetadata,
+        capture_size: int,
+    ) -> bool:
+        query_start_loc = attn_metadata.non_spec_query_start_loc
+        return (
+            attn_metadata.num_prefills == 1
+            and attn_metadata.num_decodes == 0
+            and attn_metadata.num_spec_decodes == 0
+            and attn_metadata.num_actual_tokens == capture_size
+            and query_start_loc is not None
+            and query_start_loc.numel() == 2
+        )
+
+    @staticmethod
+    def _refresh_captured_single_prefill_metadata(
+        captured: GDNAttentionMetadata,
+        runtime: GDNAttentionMetadata,
+    ) -> GDNAttentionMetadata:
+        """Refresh replay-varying inputs without changing captured addresses."""
+        assert captured.prefill_state_indices is not None
+        assert runtime.prefill_state_indices is not None
+        captured.prefill_state_indices.copy_(
+            runtime.prefill_state_indices,
+            non_blocking=True,
+        )
+
+        assert captured.prefill_has_initial_state is not None
+        assert runtime.prefill_has_initial_state is not None
+        captured.prefill_has_initial_state.copy_(
+            runtime.prefill_has_initial_state,
+            non_blocking=True,
+        )
+        assert captured.has_initial_state is not None
+        assert runtime.has_initial_state is not None
+        captured.has_initial_state.copy_(
+            runtime.has_initial_state,
+            non_blocking=True,
+        )
+
+        assert captured.non_spec_state_indices_tensor is not None
+        assert runtime.non_spec_state_indices_tensor is not None
+        captured.non_spec_state_indices_tensor.copy_(
+            runtime.non_spec_state_indices_tensor,
+            non_blocking=True,
+        )
+
+        captured_prefill = captured.non_spec_prefill_metadata
+        runtime_prefill = runtime.non_spec_prefill_metadata
+        assert captured_prefill is not None
+        assert runtime_prefill is not None
+        captured_prefill.causal_conv1d.cache_indices.copy_(
+            runtime_prefill.causal_conv1d.cache_indices,
+            non_blocking=True,
+        )
+        captured_prefill.causal_conv1d.initial_state_mode.copy_(
+            runtime_prefill.causal_conv1d.initial_state_mode,
+            non_blocking=True,
+        )
+        return captured
+
+    def build_for_cudagraph_capture(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+    ) -> GDNAttentionMetadata:
+        """Build decode graphs normally and singleton prefill graphs safely.
+
+        The generic capture driver spreads a mixed capture bucket over
+        ``max_num_seqs`` dummy requests. GDN's Triton/FLA path embeds CPU
+        cu-seqlens and chunk indices in operator arguments, so such a graph
+        cannot be replayed for arbitrary request boundaries. We instead
+        capture every mixed bucket as one exact sequence. The model runner
+        dispatch guard only selects these graphs for an exact-size singleton;
+        all other mixed batches stay eager.
+        """
+        m = common_attn_metadata
+        query_lens_cpu = torch.diff(m.query_start_loc_cpu)
+        if query_lens_cpu.numel() > 0 and bool(torch.all(query_lens_cpu <= self.num_spec + 1).item()):
+            return super().build_for_cudagraph_capture(m)
+
+        capture_size = m.num_actual_tokens
+        query_start_loc_cpu = torch.tensor(
+            [0, capture_size],
+            dtype=m.query_start_loc_cpu.dtype,
+            device="cpu",
+        )
+        query_start_loc = query_start_loc_cpu.to(m.query_start_loc.device)
+        seq_lens = torch.full(
+            (1,),
+            capture_size,
+            dtype=m.seq_lens.dtype,
+            device=m.seq_lens.device,
+        )
+        seq_lens_cpu = torch.full(
+            (1,),
+            capture_size,
+            dtype=m.query_start_loc_cpu.dtype,
+            device="cpu",
+        )
+        single = m.replace(
+            query_start_loc=query_start_loc,
+            query_start_loc_cpu=query_start_loc_cpu,
+            seq_lens=seq_lens,
+            _seq_lens_cpu=seq_lens_cpu,
+            seq_lens_cpu_upper_bound=seq_lens_cpu,
+            _num_computed_tokens_cpu=torch.zeros_like(seq_lens_cpu),
+            _num_computed_tokens_cache=None,
+            num_reqs=1,
+            num_actual_tokens=capture_size,
+            max_query_len=capture_size,
+            block_table_tensor=m.block_table_tensor[:1],
+            is_prefilling=torch.ones(1, dtype=torch.bool),
+        )
+        captured = self.build(0, single)
+        assert self._is_exact_single_prefill(captured, capture_size)
+        self._captured_single_prefill_metadata[capture_size] = captured
+        return captured
 
     def _init_reorder_batch_threshold(
         self,
@@ -874,10 +1017,20 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         attn_metadata = self._attach_spec_decode_metadata(
             attn_metadata,
         )
-        return self._attach_non_spec_decode_metadata(
+        attn_metadata = self._attach_non_spec_decode_metadata(
             attn_metadata,
             non_spec_conv1d_cache_indices,
         )
+        captured = self._captured_single_prefill_metadata.get(attn_metadata.num_actual_tokens)
+        if captured is not None and self._is_exact_single_prefill(
+            attn_metadata,
+            attn_metadata.num_actual_tokens,
+        ):
+            return self._refresh_captured_single_prefill_metadata(
+                captured,
+                attn_metadata,
+            )
+        return attn_metadata
 
     def _build_prefill_has_initial_state_and_causal_conv1d_meta(
         self,
