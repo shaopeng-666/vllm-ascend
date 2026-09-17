@@ -5,20 +5,22 @@ from unittest.mock import Mock, patch
 
 import torch
 from torch import nn
+from vllm.config import CUDAGraphMode
 from vllm.forward_context import ForwardContext, override_forward_context
-from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
 from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
 from vllm_ascend.ops.gdn_attn_builder import (
+    AscendGDNAttentionMetadata,
     GDNCausalConv1dMetadata,
     GDNDecodeMetadata,
     GDNPrefillMetadata,
 )
+from vllm_ascend.ops.gdn_graph_capability import gdn_prefill_graph_capture_scope
 
 
-def _make_mixed_metadata() -> GDNAttentionMetadata:
+def _make_mixed_metadata() -> AscendGDNAttentionMetadata:
     """One decode token followed by a two-token prefill."""
-    metadata = GDNAttentionMetadata(
+    metadata = AscendGDNAttentionMetadata(
         num_prefills=1,
         num_prefill_tokens=2,
         num_decodes=1,
@@ -106,6 +108,10 @@ def _make_layer() -> SimpleNamespace:
 def test_mixed_non_spec_reuses_rearranged_qkv() -> None:
     layer = _make_layer()
     metadata = _make_mixed_metadata()
+    # This is the typed marker produced by FULL graph warmup metadata.  The
+    # requested eager backend remains FLA, so consuming the marker is what
+    # keeps this graph path on the A3-safe native implementation.
+    metadata.gdn_prefill_graph_backend = "native"
 
     # Token rows contain visibly different Q/K/V values so the assertions
     # can detect an incorrect decode/prefill boundary.
@@ -125,6 +131,9 @@ def test_mixed_non_spec_reuses_rearranged_qkv() -> None:
         attn_metadata={layer.prefix: metadata},
         slot_mapping={},
     )
+    # ACL graph FX warmup currently exposes NONE here even though the global
+    # capture monitor is active.  This reproduces the service path.
+    forward_context.cudagraph_runtime_mode = CUDAGraphMode.NONE
 
     recurrent_calls: list[dict[str, torch.Tensor]] = []
 
@@ -154,19 +163,35 @@ def test_mixed_non_spec_reuses_rearranged_qkv() -> None:
     with (
         override_forward_context(forward_context),
         patch(
+            "vllm_ascend.ops.gdn.get_ascend_config",
+            return_value=SimpleNamespace(gdn_prefill_backend="fla_npu"),
+        ),
+        patch(
             "vllm_ascend.ops.gdn.get_pcp_group",
             return_value=SimpleNamespace(world_size=1),
         ),
+        patch.object(
+            AscendGatedDeltaNetAttention,
+            "_fused_chunk_available",
+            False,
+        ),
+        gdn_prefill_graph_capture_scope(),
+        patch("vllm_ascend.ops.gdn.is_950", return_value=False),
         patch(
             "vllm_ascend.ops.gdn.DeviceOperator.fused_gdn_gating",
             return_value=gating,
         ),
         patch("vllm_ascend.ops.gdn.l2norm_fwd", side_effect=lambda x: x),
         patch("vllm_ascend.ops.gdn.clear_ssm_states"),
-        patch(
-            "vllm_ascend.ops.gdn.chunk_gated_delta_rule",
+        patch.object(
+            AscendGatedDeltaNetAttention,
+            "_chunk_gated_delta_rule_fused",
             side_effect=chunk_gated_delta_rule,
         ) as chunk_mock,
+        patch(
+            "vllm_ascend.ops.gdn._chunk_gated_delta_rule_fla_npu",
+            side_effect=AssertionError("typed graph backend marker was ignored"),
+        ),
         patch("vllm_ascend.ops.gdn.maybe_save_kv_layer_to_connector"),
         patch.object(
             torch.ops._C_ascend,

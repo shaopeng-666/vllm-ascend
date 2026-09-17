@@ -40,6 +40,7 @@ from vllm.compilation import breakable_cudagraph
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
 from vllm.distributed import (
+    get_pcp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
@@ -154,6 +155,7 @@ from vllm_ascend.compilation.acl_graph import (
     update_full_graph_params,
 )
 from vllm_ascend.compilation.breakable_aclgraph import BreakableACLGraphWrapper
+from vllm_ascend.device.device_config import is_950
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.device.mxfp_kv_cache import (
     MXFP8_GROUP_SIZE,
@@ -178,6 +180,13 @@ from vllm_ascend.eplb.core.eplb_worker import EplbProcess
 from vllm_ascend.eplb.eplb_updator import EplbUpdator
 from vllm_ascend.model_executor.offloader import create_offloader
 from vllm_ascend.ops.fused_moe.force_eplb import build_force_eplb_topk
+from vllm_ascend.ops.gdn_graph_capability import (
+    GDNPrefillGraphCapability,
+    gdn_prefill_graph_capture_scope,
+    get_gdn_prefill_graph_capability,
+    is_exact_gdn_prefill_graph_contract,
+    select_gdn_prefill_graph_backend,
+)
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.ops.triton.spec_decode.ngram import triton_ngram_spec_decode
 from vllm_ascend.quantization.utils import enable_fa_quant
@@ -344,14 +353,13 @@ def _is_gdn_prefill_graph_compatible(
     min_num_scheduled_tokens: int,
     max_num_scheduled_tokens: int,
     decode_threshold: int,
-    fused_chunk_available: bool,
+    graph_capability: GDNPrefillGraphCapability,
 ) -> bool:
     """Whether a runtime batch matches a graph-safe GDN prefill contract.
 
-    The Triton fallback embeds host-side sequence/chunk metadata, so it keeps
-    the original exact singleton contract.  The fused CANN operator consumes
-    device ``actual_seq_lengths`` and supports a fixed physical token bucket
-    with dynamic request boundaries, including zero-length tail rows.
+    Host-metadata implementations keep the exact-singleton contract. A backend
+    advertising device-side dynamic lengths can replay a padded token bucket;
+    multi-request replay additionally requires the explicit multi-request bit.
     """
     is_prefill_only = (
         not uniform_decode
@@ -359,9 +367,22 @@ def _is_gdn_prefill_graph_compatible(
         and min_num_scheduled_tokens > decode_threshold
         and max_num_scheduled_tokens > decode_threshold
     )
-    exact_single = num_reqs == 1 and graph_num_tokens == num_tokens
-    padded_fused = fused_chunk_available and graph_num_tokens >= num_tokens
-    return is_prefill_only and (exact_single or padded_fused)
+    exact_single = (
+        num_reqs == 1
+        and graph_num_tokens == num_tokens
+        and bool(graph_capability & GDNPrefillGraphCapability.EXACT_SINGLE_REQUEST)
+    )
+    padded_dynamic = (
+        graph_num_tokens >= num_tokens
+        and bool(
+            graph_capability & GDNPrefillGraphCapability.PADDED_DYNAMIC_LENGTHS
+        )
+        and (
+            num_reqs == 1
+            or bool(graph_capability & GDNPrefillGraphCapability.MULTI_REQUEST)
+        )
+    )
+    return is_prefill_only and (exact_single or padded_dynamic)
 
 
 def _gdn_real_request_view(
@@ -3301,22 +3322,34 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         cudagraph_mode, batch_descriptor = dispatch_cudagraph(num_tokens_padded, use_cascade_attn or has_encoder_output)
-        # The fused CANN GDN prefill op consumes device-side dynamic sequence
-        # lengths, so it can replay a fixed token bucket for multiple prefill
-        # requests.  Keep the exact-singleton fallback for builds where the
-        # fused op probe failed; their Triton path captures host-side tuples.
-        fused_chunk_available = False
-        if self._has_gdn and force_uniform_decode is None:
-            from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
-
-            fused_chunk_available = (
-                AscendGatedDeltaNetAttention._fused_chunk_available is True
-            )
         min_num_scheduled_tokens = (
             int(num_scheduled_tokens_np[:num_reqs].min())
             if num_reqs > 0
             else 0
         )
+        # Probe once outside graph capture, then describe the replay contract
+        # explicitly. This keeps graph dispatch stable: a bucket cannot first be
+        # captured with host-metadata FLA and later be replayed as native.
+        graph_capability = GDNPrefillGraphCapability.EXACT_SINGLE_REQUEST
+        if self._has_gdn and force_uniform_decode is None and not uniform_decode:
+            from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
+
+            native_dynamic_lengths_available = (
+                AscendGatedDeltaNetAttention._probe_fused_chunk()
+                and get_pcp_group().world_size == 1
+            )
+            graph_capability = get_gdn_prefill_graph_capability(
+                self.ascend_config.gdn_prefill_backend,
+                native_dynamic_lengths_available=native_dynamic_lengths_available,
+                capture_metadata_is_exact=is_exact_gdn_prefill_graph_contract(
+                    num_reqs=num_reqs,
+                    num_actual_tokens=num_tokens,
+                    graph_num_tokens=batch_descriptor.num_tokens,
+                    min_num_scheduled_tokens=min_num_scheduled_tokens,
+                    max_num_scheduled_tokens=max_num_scheduled_tokens,
+                ),
+                fla_graph_capture_supported=is_950(),
+            )
         is_gdn_prefill_graph_compatible = _is_gdn_prefill_graph_compatible(
             uniform_decode=uniform_decode,
             num_reqs=num_reqs,
@@ -3325,7 +3358,7 @@ class NPUModelRunner(GPUModelRunner):
             min_num_scheduled_tokens=min_num_scheduled_tokens,
             max_num_scheduled_tokens=max_num_scheduled_tokens,
             decode_threshold=self.decode_threshold,
-            fused_chunk_available=fused_chunk_available,
+            graph_capability=graph_capability,
         )
         if (
             self._has_gdn
@@ -3542,6 +3575,41 @@ class NPUModelRunner(GPUModelRunner):
                 req_idx = self.input_batch.req_id_to_index[req_id]
                 req_doc_ranges[req_idx] = image_doc_ranges
 
+        gdn_prefill_graph_backend = None
+        if self._has_gdn and cudagraph_runtime_mode == CUDAGraphMode.FULL:
+            from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
+
+            scheduled = (
+                num_scheduled_tokens_np[:num_reqs]
+                if num_scheduled_tokens_np is not None
+                else np.asarray([num_tokens], dtype=np.int32)
+            )
+            min_scheduled = int(scheduled.min()) if scheduled.size else 0
+            max_scheduled = int(scheduled.max()) if scheduled.size else 0
+            graph_num_tokens = (
+                batch_descriptor.num_tokens
+                if batch_descriptor is not None
+                else num_tokens_padded
+            )
+            graph_metadata_is_exact = is_exact_gdn_prefill_graph_contract(
+                num_reqs=num_reqs,
+                num_actual_tokens=num_tokens,
+                graph_num_tokens=graph_num_tokens,
+                min_num_scheduled_tokens=min_scheduled,
+                max_num_scheduled_tokens=max_scheduled,
+            )
+            native_dynamic_lengths_available = (
+                AscendGatedDeltaNetAttention._probe_fused_chunk()
+                and get_pcp_group().world_size == 1
+            )
+            gdn_prefill_graph_backend = select_gdn_prefill_graph_backend(
+                self.ascend_config.gdn_prefill_backend,
+                runtime_mode=cudagraph_runtime_mode,
+                is_ascend_950=is_950(),
+                metadata_immutable=graph_metadata_is_exact,
+                native_dynamic_lengths_available=native_dynamic_lengths_available,
+            )
+
         cm_base = AscendCommonAttentionMetadata(
             query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
             query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],
@@ -3566,6 +3634,7 @@ class NPUModelRunner(GPUModelRunner):
             causal=True,
             is_prefilling=is_prefilling,
             num_input_tokens=num_tokens_padded,
+            gdn_prefill_graph_backend=gdn_prefill_graph_backend,
             actual_seq_lengths_q=self.actual_seq_lengths_q,
             positions=self.positions,
             positions_cpu=self._dsa_positions_cpu_buf if self.use_compress else None,
@@ -6165,7 +6234,11 @@ class NPUModelRunner(GPUModelRunner):
     def capture_model(self) -> int:
         """Capture NPU graphs and return actual graph pool memory bytes consumed."""
         parent_module_name = _get_gpu_model_runner_module_name(self)
-        with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(parent_module_name):
+        with (
+            _torch_cuda_wrapper(),
+            _replace_gpu_model_runner_function_wrapper(parent_module_name),
+            gdn_prefill_graph_capture_scope(),
+        ):
             cuda_graph_size = GPUModelRunner.capture_model(self)
 
         mgr = self.encoder_cudagraph_manager

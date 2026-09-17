@@ -34,6 +34,7 @@ from vllm.v1.attention.backends.utils import (
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.device.device_config import is_950
 from vllm_ascend.ops.triton.fla.utils import (
     prepare_chunk_indices,
     prepare_chunk_offsets,
@@ -125,6 +126,13 @@ class GDNDecodeMetadata:
 class GDNSpecDecodeMetadata:
     spec_causal_conv1d: GDNSpecCausalConv1dMetadata
     actual_seq_lengths: torch.Tensor
+
+
+@dataclass
+class AscendGDNAttentionMetadata(GDNAttentionMetadata):
+    """GDN metadata carrying the graph-prefill implementation contract."""
+
+    gdn_prefill_graph_backend: str | None = None
 
 
 def _build_actual_seq_lengths(
@@ -237,6 +245,15 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         kv_cache_spec: AttentionSpec,
     ) -> AttentionCGSupport:
         del kv_cache_spec
+        # A3 can capture uniform decode/spec-decode batches, but a FULL graph
+        # with MTP also asks the builder to capture padded prefill-shaped dummy
+        # batches. Those batches do not satisfy the recurrent-state pure-prefill
+        # contract. Advertise the narrower support so vLLM resolves an explicit
+        # FULL request to FULL_DECODE_ONLY instead of failing during startup.
+        # A5 keeps FULL support, and A3 without speculative decoding retains the
+        # existing prefill-graph path.
+        if not is_950() and getattr(vllm_config, "speculative_config", None) is not None:
+            return AttentionCGSupport.UNIFORM_BATCH
         # On MoE hardware profiles the unfused capacity fallback may select an
         # ALLTOALL implementation which materializes host split sizes via a
         # device-to-host scalar sync. That operation cannot be captured in an
@@ -434,8 +451,9 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         Capture keeps the generic driver's request-row capacity.  At replay,
         device query boundaries and state/cache indices are refreshed while
         unused tail rows become zero-length.  The runtime dispatcher selects
-        padded/multi-request graphs only when fused CANN GDN is available;
-        the host-metadata Triton fallback remains exact-singleton only.
+        padded/multi-request graphs only when fused CANN GDN is available.
+        FLA can be retained only for a capture whose host sequence metadata is
+        already the exact immutable singleton used by every replay.
         """
         m = common_attn_metadata
         query_lens_cpu = torch.diff(m.query_start_loc_cpu)
@@ -446,6 +464,12 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         captured = self.build(0, m)
         assert self._is_pure_prefill(captured, capture_size)
         assert captured.non_spec_prefill_metadata is not None
+        cu_seqlens_host = captured.non_spec_prefill_metadata.chunk.cu_seqlens_host
+        graph_metadata_is_exact = (
+            captured.num_prefills == 1 and len(cu_seqlens_host) == 2 and cu_seqlens_host == (0, capture_size)
+        )
+        if captured.gdn_prefill_graph_backend == "fla_npu" and not graph_metadata_is_exact:
+            raise RuntimeError("FLA GDN graph metadata must be an exact singleton prefill")
         # Recurrent state indices use the scheduler-reserved null block (0),
         # while causal-conv uses PAD_SLOT_ID (-1) as an explicit skip sentinel.
         # The eager metadata can expose both as views of the same block table;
@@ -719,7 +743,20 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             spec_sequence_masks = None
             num_spec_decodes = 0
         else:
-            num_reqs = num_decode_draft_tokens_cpu.numel()
+            # FULL graph scheduling can retain padded speculative-decode
+            # buffers after the GDN common metadata has been narrowed to the
+            # real request rows (for example, two live requests and one FIA
+            # padding row).  Sequence masks index query_start_loc rows, so do
+            # not let trailing draft-buffer capacity become a third request.
+            num_reqs = query_start_loc_cpu.numel() - 1
+            if num_decode_draft_tokens_cpu.numel() < num_reqs:
+                raise ValueError(
+                    "Speculative decode metadata has fewer rows than GDN "
+                    f"requests: {num_decode_draft_tokens_cpu.numel()} < {num_reqs}"
+                )
+            num_decode_draft_tokens_cpu = num_decode_draft_tokens_cpu[:num_reqs]
+            if num_accepted_tokens is not None:
+                num_accepted_tokens = num_accepted_tokens[:num_reqs]
             spec_sequence_masks_cpu = self.spec_sequence_masks_cpu[:num_reqs]
             runtime_draft_tokens = num_decode_draft_tokens_cpu[num_decode_draft_tokens_cpu >= 0]
             if runtime_draft_tokens.sum().item() > 0:
@@ -1020,7 +1057,7 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             )
             non_spec_conv1d_cache_indices = non_spec_state_indices_tensor
 
-        attn_metadata = GDNAttentionMetadata(
+        attn_metadata = AscendGDNAttentionMetadata(
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
             num_decodes=num_decodes,
@@ -1045,6 +1082,11 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             nums_dict=nums_dict,
             batch_ptr=batch_ptr,
             token_chunk_offset_ptr=token_chunk_offset_ptr,
+            gdn_prefill_graph_backend=getattr(
+                m,
+                "gdn_prefill_graph_backend",
+                None,
+            ),
         )
         attn_metadata = self._attach_non_spec_prefill_metadata(
             attn_metadata,

@@ -890,6 +890,37 @@ def test_spec_sized_prefill_fold_ignores_graph_padding_rows():
     assert num_accepted_tokens.tolist() == [1, 1, 1, 1]
 
 
+def test_spec_decode_ignores_trailing_fia_draft_buffer_row():
+    common_attn_metadata = create_common_attn_metadata(
+        BatchSpec(
+            seq_lens=[8, 8],
+            query_lens=[4, 1],
+            name="two_runtime_requests_three_draft_rows",
+        ),
+        block_size=16,
+        device=torch.device("cpu"),
+    )
+    builder = _make_builder(
+        device=torch.device("cpu"),
+        num_heads=32,
+        num_speculative_tokens=3,
+        cudagraph_mode=CUDAGraphMode.FULL,
+    )
+
+    attn_metadata = builder.build(
+        0,
+        common_attn_metadata,
+        num_accepted_tokens=torch.ones(3, dtype=torch.int32),
+        num_decode_draft_tokens_cpu=torch.tensor([0, -1, -1], dtype=torch.int32),
+    )
+
+    assert attn_metadata.spec_sequence_masks is not None
+    assert attn_metadata.spec_sequence_masks.tolist() == [True, False]
+    assert attn_metadata.num_spec_decodes == 1
+    assert attn_metadata.num_accepted_tokens is not None
+    assert attn_metadata.num_accepted_tokens.numel() == 1
+
+
 def test_full_graph_without_runtime_spec_resets_captured_spec_inputs():
     capture_common_metadata = create_common_attn_metadata(
         batch_spec=BatchSpec(
@@ -1051,20 +1082,32 @@ def test_full_graph_non_spec_metadata_nulls_padded_state_indices(
 
 
 @pytest.mark.parametrize(
-    ("is_moe", "enable_fused_mc2", "expected"),
+    ("is_moe", "enable_fused_mc2", "ascend_950", "speculative", "expected"),
     [
-        pytest.param(False, 0, AttentionCGSupport.ALWAYS, id="dense-unfused"),
-        pytest.param(True, 1, AttentionCGSupport.ALWAYS, id="moe-fused-mc2"),
-        pytest.param(True, 0, AttentionCGSupport.UNIFORM_BATCH, id="moe-unfused"),
+        pytest.param(False, 0, False, False, AttentionCGSupport.ALWAYS, id="a3-dense-unfused"),
+        pytest.param(True, 1, False, False, AttentionCGSupport.ALWAYS, id="a3-moe-fused-no-mtp"),
+        pytest.param(
+            True,
+            1,
+            False,
+            True,
+            AttentionCGSupport.UNIFORM_BATCH,
+            id="a3-moe-fused-mtp-decode-only",
+        ),
+        pytest.param(True, 1, True, True, AttentionCGSupport.ALWAYS, id="a5-moe-fused-mtp"),
+        pytest.param(True, 0, True, False, AttentionCGSupport.UNIFORM_BATCH, id="a5-moe-unfused"),
     ],
 )
 def test_gdn_prefill_graph_support_requires_fused_mc2_for_moe(
     is_moe: bool,
     enable_fused_mc2: int,
+    ascend_950: bool,
+    speculative: bool,
     expected: AttentionCGSupport,
 ):
     with (
         patch.object(ascend_gdn_attn_builder, "is_moe_model", return_value=is_moe),
+        patch.object(ascend_gdn_attn_builder, "is_950", return_value=ascend_950),
         patch.object(
             ascend_gdn_attn_builder,
             "get_ascend_config",
@@ -1072,7 +1115,7 @@ def test_gdn_prefill_graph_support_requires_fused_mc2_for_moe(
         ),
     ):
         support = AscendGDNAttentionMetadataBuilder.get_cudagraph_support(
-            SimpleNamespace(),
+            SimpleNamespace(speculative_config=object() if speculative else None),
             SimpleNamespace(),
         )
 
@@ -1089,6 +1132,7 @@ def test_full_graph_capture_keeps_fixed_request_capacity(capture_size: int):
         block_size=16,
         device=torch.device("cpu"),
     )
+    common.gdn_prefill_graph_backend = "native"
     builder = _make_builder(
         device=torch.device("cpu"),
         num_heads=32,
@@ -1110,6 +1154,27 @@ def test_full_graph_capture_keeps_fixed_request_capacity(capture_size: int):
         capture_size,
     ]
     assert builder._captured_prefill_metadata[capture_size] is captured
+    assert captured.gdn_prefill_graph_backend == "native"
+
+
+def test_exact_single_prefill_capture_registers_immutable_fla_metadata():
+    capture_size = 320
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[capture_size], query_lens=[capture_size]),
+        block_size=16,
+        device=torch.device("cpu"),
+    )
+    common.gdn_prefill_graph_backend = "fla_npu"
+    builder = _make_builder(
+        device=torch.device("cpu"),
+        num_heads=32,
+        num_speculative_tokens=3,
+        cudagraph_mode=CUDAGraphMode.FULL,
+    )
+
+    captured = builder.build_for_cudagraph_capture(common)
+
+    assert captured.gdn_prefill_graph_backend == "fla_npu"
 
 
 def test_full_graph_prefill_replay_refreshes_boundaries_and_zero_tail_rows():
