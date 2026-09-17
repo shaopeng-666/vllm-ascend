@@ -3330,6 +3330,7 @@ class NPUModelRunner(GPUModelRunner):
         if (
             self._has_gdn
             and force_uniform_decode is None
+            and not uniform_decode
             and cudagraph_mode == CUDAGraphMode.FULL
             and not is_gdn_prefill_graph_compatible
         ):

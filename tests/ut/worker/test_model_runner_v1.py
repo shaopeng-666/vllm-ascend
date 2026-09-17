@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, call, patch
 import numpy as np
 import torch
 from vllm.config import CUDAGraphMode
+from vllm.forward_context import BatchDescriptor
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.sampling_params import SamplingParams
@@ -102,6 +103,69 @@ class TestGDNPrefillGraphRuntimeContract(unittest.TestCase):
                 fused_chunk_available=True,
             )
         )
+
+    @staticmethod
+    def _runtime_runner(computed_tokens: list[int]):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner._pad_for_sequence_parallelism = lambda value: value
+        runner.input_batch = SimpleNamespace(
+            num_computed_tokens_cpu=np.asarray(computed_tokens, dtype=np.int32),
+            lora_id_to_lora_request={},
+        )
+        runner.uniform_decode_query_len = 4
+        runner.decode_threshold = 4
+        runner.model_config = SimpleNamespace(is_encoder_decoder=False)
+        runner._has_gdn = True
+        runner.parallel_config = SimpleNamespace(data_parallel_size=1)
+        runner.vllm_config = SimpleNamespace(
+            parallel_config=runner.parallel_config,
+            observability_config=SimpleNamespace(cudagraph_metrics=False),
+        )
+
+        def dispatch(*, num_tokens, uniform_decode, invalid_modes=None, **_kwargs):
+            if invalid_modes and CUDAGraphMode.FULL in invalid_modes:
+                return CUDAGraphMode.NONE, BatchDescriptor(num_tokens)
+            return CUDAGraphMode.FULL, BatchDescriptor(
+                num_tokens=num_tokens,
+                num_reqs=1 if uniform_decode else None,
+                uniform=uniform_decode,
+            )
+
+        runner.cudagraph_dispatcher = SimpleNamespace(dispatch=MagicMock(side_effect=dispatch))
+        return runner
+
+    @patch("vllm_ascend.worker.model_runner_v1.enable_sp", return_value=False)
+    def test_uniform_gdn_decode_keeps_full_graph(self, _mock_enable_sp):
+        runner = self._runtime_runner([64])
+        mode, descriptor, *_ = runner._determine_batch_execution_and_padding(
+            num_tokens=4,
+            num_reqs=1,
+            num_scheduled_tokens_np=np.asarray([4], dtype=np.int32),
+            max_num_scheduled_tokens=4,
+            use_cascade_attn=False,
+        )
+
+        self.assertEqual(mode, CUDAGraphMode.FULL)
+        self.assertTrue(descriptor.uniform)
+        self.assertEqual(runner.cudagraph_dispatcher.dispatch.call_count, 1)
+
+    @patch("vllm_ascend.worker.model_runner_v1.enable_sp", return_value=False)
+    def test_incompatible_gdn_prefill_still_disables_full_graph(self, _mock_enable_sp):
+        runner = self._runtime_runner([0, 0])
+        with patch(
+            "vllm_ascend.ops.gdn.AscendGatedDeltaNetAttention._fused_chunk_available",
+            False,
+        ):
+            mode, _, *_ = runner._determine_batch_execution_and_padding(
+                num_tokens=512,
+                num_reqs=2,
+                num_scheduled_tokens_np=np.asarray([256, 256], dtype=np.int32),
+                max_num_scheduled_tokens=256,
+                use_cascade_attn=False,
+            )
+
+        self.assertEqual(mode, CUDAGraphMode.NONE)
+        self.assertEqual(runner.cudagraph_dispatcher.dispatch.call_count, 2)
 
     def test_gdn_view_excludes_fia_virtual_padding_request(self):
         @dataclass
