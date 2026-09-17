@@ -1,6 +1,7 @@
 import unittest
 from collections import deque
 from contextlib import nullcontext
+from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
@@ -43,58 +44,111 @@ from vllm_ascend.patch.platform.patch_kv_cache_utils import (
 from vllm_ascend.utils import AscendDeviceType, vllm_version_is
 from vllm_ascend.worker.model_runner_v1 import (
     NPUModelRunner,
-    _is_exact_single_gdn_prefill_graph,
+    _gdn_real_request_view,
+    _is_gdn_prefill_graph_compatible,
 )
 
 
 class TestGDNPrefillGraphRuntimeContract(unittest.TestCase):
+    @staticmethod
+    def _compatible(**overrides):
+        args = dict(
+            uniform_decode=False,
+            num_reqs=1,
+            num_tokens=1024,
+            graph_num_tokens=1024,
+            min_num_scheduled_tokens=1024,
+            max_num_scheduled_tokens=1024,
+            decode_threshold=4,
+            fused_chunk_available=False,
+        )
+        args.update(overrides)
+        return _is_gdn_prefill_graph_compatible(**args)
+
     def test_exact_single_prefill_is_graph_safe(self):
+        self.assertTrue(self._compatible())
+
+    def test_padded_prefill_requires_fused_chunk(self):
+        self.assertFalse(self._compatible(num_tokens=513))
+        self.assertTrue(self._compatible(num_tokens=513, fused_chunk_available=True))
+
+    def test_multi_request_prefill_requires_fused_chunk(self):
+        self.assertFalse(self._compatible(num_reqs=2))
         self.assertTrue(
-            _is_exact_single_gdn_prefill_graph(
-                uniform_decode=False,
-                num_reqs=1,
-                num_tokens=1024,
-                graph_num_tokens=1024,
-                max_num_scheduled_tokens=1024,
-                decode_threshold=4,
-            )
-        )
-
-    def test_padded_prefill_is_not_graph_safe(self):
-        self.assertFalse(
-            _is_exact_single_gdn_prefill_graph(
-                uniform_decode=False,
-                num_reqs=1,
-                num_tokens=513,
-                graph_num_tokens=1024,
-                max_num_scheduled_tokens=513,
-                decode_threshold=4,
-            )
-        )
-
-    def test_multi_request_prefill_is_not_graph_safe(self):
-        self.assertFalse(
-            _is_exact_single_gdn_prefill_graph(
-                uniform_decode=False,
+            self._compatible(
                 num_reqs=2,
-                num_tokens=1024,
-                graph_num_tokens=1024,
-                max_num_scheduled_tokens=512,
-                decode_threshold=4,
+                min_num_scheduled_tokens=256,
+                max_num_scheduled_tokens=768,
+                fused_chunk_available=True,
+            )
+        )
+
+    def test_mixed_decode_prefill_is_not_graph_safe(self):
+        self.assertFalse(
+            self._compatible(
+                num_reqs=2,
+                min_num_scheduled_tokens=1,
+                fused_chunk_available=True,
             )
         )
 
     def test_spec_decode_is_not_graph_safe(self):
         self.assertFalse(
-            _is_exact_single_gdn_prefill_graph(
-                uniform_decode=False,
-                num_reqs=1,
+            self._compatible(
                 num_tokens=4,
                 graph_num_tokens=4,
+                min_num_scheduled_tokens=4,
                 max_num_scheduled_tokens=4,
-                decode_threshold=4,
+                fused_chunk_available=True,
             )
         )
+
+    def test_gdn_view_excludes_fia_virtual_padding_request(self):
+        @dataclass
+        class FakeCommonMetadata:
+            query_start_loc: torch.Tensor
+            query_start_loc_cpu: torch.Tensor
+            seq_lens: torch.Tensor
+            _seq_lens_cpu: torch.Tensor
+            seq_lens_cpu_upper_bound: torch.Tensor
+            seq_lens_cpu: torch.Tensor | None
+            num_computed_tokens_cpu: torch.Tensor | None
+            num_reqs: int
+            block_table_tensor: torch.Tensor
+            is_prefilling: torch.Tensor
+
+        for total, bucket in ((193, 256), (300, 512)):
+            with self.subTest(total=total, bucket=bucket):
+                per_req = [total // 4] * 4
+                per_req[-1] += total - sum(per_req)
+                real_qstart = torch.tensor([0, *np.cumsum(per_req)], dtype=torch.int32)
+                fia_qstart = torch.cat([real_qstart, torch.tensor([bucket], dtype=torch.int32)])
+                common = FakeCommonMetadata(
+                    query_start_loc=fia_qstart,
+                    query_start_loc_cpu=fia_qstart.cpu(),
+                    seq_lens=torch.arange(5, dtype=torch.int32),
+                    _seq_lens_cpu=torch.arange(5, dtype=torch.int32),
+                    seq_lens_cpu_upper_bound=torch.arange(5, dtype=torch.int32),
+                    seq_lens_cpu=torch.arange(5, dtype=torch.int32),
+                    num_computed_tokens_cpu=torch.arange(5, dtype=torch.int32),
+                    num_reqs=5,
+                    block_table_tensor=torch.arange(10, dtype=torch.int32).reshape(5, 2),
+                    is_prefilling=torch.ones(5, dtype=torch.bool),
+                )
+
+                gdn = _gdn_real_request_view(
+                    common,
+                    real_qstart,
+                    real_qstart.cpu(),
+                    num_reqs=4,
+                )
+
+                self.assertEqual(gdn.num_reqs, 4)
+                self.assertEqual(gdn.query_start_loc.tolist(), real_qstart.tolist())
+                self.assertEqual(gdn.query_start_loc[-1].item(), total)
+                self.assertEqual(gdn.block_table_tensor.shape[0], 4)
+                self.assertEqual(gdn.seq_lens.shape[0], 4)
+                self.assertEqual(gdn.is_prefilling.shape[0], 4)
 
 
 class TestDummyRunSlotInvalidation(unittest.TestCase):

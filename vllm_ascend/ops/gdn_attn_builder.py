@@ -302,83 +302,140 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             dtype=torch.int32,
             device=device,
         )
-        self._captured_single_prefill_metadata: dict[int, GDNAttentionMetadata] = {}
+        self._captured_prefill_metadata: dict[int, GDNAttentionMetadata] = {}
 
     @staticmethod
-    def _is_exact_single_prefill(
+    def _is_pure_prefill(
         attn_metadata: GDNAttentionMetadata,
         capture_size: int,
     ) -> bool:
         query_start_loc = attn_metadata.non_spec_query_start_loc
         return (
-            attn_metadata.num_prefills == 1
+            attn_metadata.num_prefills > 0
             and attn_metadata.num_decodes == 0
             and attn_metadata.num_spec_decodes == 0
-            and attn_metadata.num_actual_tokens == capture_size
+            and attn_metadata.num_actual_tokens <= capture_size
             and query_start_loc is not None
-            and query_start_loc.numel() == 2
+            and query_start_loc.numel() >= 2
         )
 
     @staticmethod
-    def _refresh_captured_single_prefill_metadata(
+    def _copy_and_pad_rows(
+        captured: torch.Tensor,
+        runtime: torch.Tensor,
+        fill_value: int | bool,
+    ) -> None:
+        if runtime.shape[0] > captured.shape[0]:
+            raise RuntimeError(
+                "Runtime GDN prefill metadata exceeds the captured row capacity: "
+                f"runtime={runtime.shape[0]}, captured={captured.shape[0]}"
+            )
+        # ``runtime`` can be a prefix view of ``captured`` (both may originate
+        # from the model runner's shared query-start buffer).  Filling the
+        # whole destination first would therefore overwrite the source before
+        # it is copied.  Preserve the live prefix first, then initialize only
+        # the unused tail rows.
+        runtime_rows = runtime.shape[0]
+        captured[:runtime_rows].copy_(runtime, non_blocking=True)
+        captured[runtime_rows:].fill_(fill_value)
+
+    @classmethod
+    def _refresh_captured_prefill_metadata(
+        cls,
         captured: GDNAttentionMetadata,
         runtime: GDNAttentionMetadata,
     ) -> GDNAttentionMetadata:
-        """Refresh replay-varying inputs without changing captured addresses."""
+        """Refresh dynamic prefill boundaries without changing graph addresses.
+
+        Tail rows use zero sequence length.  Their state index is the padding
+        slot and ``has_initial_state=True`` prevents the pre-op clear from
+        mutating that slot; both fused GDN and causal-conv then leave it intact.
+        """
+        assert captured.non_spec_query_start_loc is not None
+        assert runtime.non_spec_query_start_loc is not None
+        runtime_query_start_loc = runtime.non_spec_query_start_loc
+        final_offset = int(runtime_query_start_loc[-1].item())
+        cls._copy_and_pad_rows(
+            captured.non_spec_query_start_loc,
+            runtime_query_start_loc,
+            final_offset,
+        )
+
+        if (
+            captured.prefill_query_start_loc is not None
+            and runtime.prefill_query_start_loc is not None
+            and captured.prefill_query_start_loc.data_ptr() != captured.non_spec_query_start_loc.data_ptr()
+        ):
+            cls._copy_and_pad_rows(
+                captured.prefill_query_start_loc,
+                runtime.prefill_query_start_loc,
+                final_offset,
+            )
+
         assert captured.prefill_state_indices is not None
         assert runtime.prefill_state_indices is not None
-        captured.prefill_state_indices.copy_(
+        cls._copy_and_pad_rows(
+            captured.prefill_state_indices,
             runtime.prefill_state_indices,
-            non_blocking=True,
+            NULL_BLOCK_ID,
         )
 
         assert captured.prefill_has_initial_state is not None
         assert runtime.prefill_has_initial_state is not None
-        captured.prefill_has_initial_state.copy_(
+        cls._copy_and_pad_rows(
+            captured.prefill_has_initial_state,
             runtime.prefill_has_initial_state,
-            non_blocking=True,
+            True,
         )
         assert captured.has_initial_state is not None
         assert runtime.has_initial_state is not None
-        captured.has_initial_state.copy_(
+        cls._copy_and_pad_rows(
+            captured.has_initial_state,
             runtime.has_initial_state,
-            non_blocking=True,
+            True,
         )
 
         assert captured.non_spec_state_indices_tensor is not None
         assert runtime.non_spec_state_indices_tensor is not None
-        captured.non_spec_state_indices_tensor.copy_(
-            runtime.non_spec_state_indices_tensor,
-            non_blocking=True,
-        )
+        if captured.non_spec_state_indices_tensor.data_ptr() != captured.prefill_state_indices.data_ptr():
+            cls._copy_and_pad_rows(
+                captured.non_spec_state_indices_tensor,
+                runtime.non_spec_state_indices_tensor,
+                NULL_BLOCK_ID,
+            )
 
         captured_prefill = captured.non_spec_prefill_metadata
         runtime_prefill = runtime.non_spec_prefill_metadata
         assert captured_prefill is not None
         assert runtime_prefill is not None
-        captured_prefill.causal_conv1d.cache_indices.copy_(
+        cache_indices = captured_prefill.causal_conv1d.cache_indices
+        cls._copy_and_pad_rows(
+            cache_indices,
             runtime_prefill.causal_conv1d.cache_indices,
-            non_blocking=True,
+            PAD_SLOT_ID,
         )
-        captured_prefill.causal_conv1d.initial_state_mode.copy_(
-            runtime_prefill.causal_conv1d.initial_state_mode,
-            non_blocking=True,
-        )
+        if captured_prefill.causal_conv1d.initial_state_mode.data_ptr() not in {
+            captured.prefill_has_initial_state.data_ptr(),
+            captured.has_initial_state.data_ptr(),
+        }:
+            cls._copy_and_pad_rows(
+                captured_prefill.causal_conv1d.initial_state_mode,
+                runtime_prefill.causal_conv1d.initial_state_mode,
+                True,
+            )
         return captured
 
     def build_for_cudagraph_capture(
         self,
         common_attn_metadata: CommonAttentionMetadata,
     ) -> GDNAttentionMetadata:
-        """Build decode graphs normally and singleton prefill graphs safely.
+        """Build decode graphs normally and fixed-capacity prefill graphs.
 
-        The generic capture driver spreads a mixed capture bucket over
-        ``max_num_seqs`` dummy requests. GDN's Triton/FLA path embeds CPU
-        cu-seqlens and chunk indices in operator arguments, so such a graph
-        cannot be replayed for arbitrary request boundaries. We instead
-        capture every mixed bucket as one exact sequence. The model runner
-        dispatch guard only selects these graphs for an exact-size singleton;
-        all other mixed batches stay eager.
+        Capture keeps the generic driver's request-row capacity.  At replay,
+        device query boundaries and state/cache indices are refreshed while
+        unused tail rows become zero-length.  The runtime dispatcher selects
+        padded/multi-request graphs only when fused CANN GDN is available;
+        the host-metadata Triton fallback remains exact-singleton only.
         """
         m = common_attn_metadata
         query_lens_cpu = torch.diff(m.query_start_loc_cpu)
@@ -386,41 +443,17 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             return super().build_for_cudagraph_capture(m)
 
         capture_size = m.num_actual_tokens
-        query_start_loc_cpu = torch.tensor(
-            [0, capture_size],
-            dtype=m.query_start_loc_cpu.dtype,
-            device="cpu",
-        )
-        query_start_loc = query_start_loc_cpu.to(m.query_start_loc.device)
-        seq_lens = torch.full(
-            (1,),
-            capture_size,
-            dtype=m.seq_lens.dtype,
-            device=m.seq_lens.device,
-        )
-        seq_lens_cpu = torch.full(
-            (1,),
-            capture_size,
-            dtype=m.query_start_loc_cpu.dtype,
-            device="cpu",
-        )
-        single = m.replace(
-            query_start_loc=query_start_loc,
-            query_start_loc_cpu=query_start_loc_cpu,
-            seq_lens=seq_lens,
-            _seq_lens_cpu=seq_lens_cpu,
-            seq_lens_cpu_upper_bound=seq_lens_cpu,
-            _num_computed_tokens_cpu=torch.zeros_like(seq_lens_cpu),
-            _num_computed_tokens_cache=None,
-            num_reqs=1,
-            num_actual_tokens=capture_size,
-            max_query_len=capture_size,
-            block_table_tensor=m.block_table_tensor[:1],
-            is_prefilling=torch.ones(1, dtype=torch.bool),
-        )
-        captured = self.build(0, single)
-        assert self._is_exact_single_prefill(captured, capture_size)
-        self._captured_single_prefill_metadata[capture_size] = captured
+        captured = self.build(0, m)
+        assert self._is_pure_prefill(captured, capture_size)
+        assert captured.non_spec_prefill_metadata is not None
+        # Recurrent state indices use the scheduler-reserved null block (0),
+        # while causal-conv uses PAD_SLOT_ID (-1) as an explicit skip sentinel.
+        # The eager metadata can expose both as views of the same block table;
+        # graph capture needs distinct storage so their padded tails cannot
+        # overwrite one another.
+        conv = captured.non_spec_prefill_metadata.causal_conv1d
+        conv.cache_indices = conv.cache_indices.clone()
+        self._captured_prefill_metadata[capture_size] = captured
         return captured
 
     def _init_reorder_batch_threshold(
@@ -1021,12 +1054,16 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             attn_metadata,
             non_spec_conv1d_cache_indices,
         )
-        captured = self._captured_single_prefill_metadata.get(attn_metadata.num_actual_tokens)
-        if captured is not None and self._is_exact_single_prefill(
-            attn_metadata,
+        capture_size = max(
             attn_metadata.num_actual_tokens,
+            getattr(m, "num_input_tokens", 0),
+        )
+        captured = self._captured_prefill_metadata.get(capture_size)
+        if captured is not None and self._is_pure_prefill(
+            attn_metadata,
+            capture_size,
         ):
-            return self._refresh_captured_single_prefill_metadata(
+            return self._refresh_captured_prefill_metadata(
                 captured,
                 attn_metadata,
             )

@@ -1045,7 +1045,7 @@ def test_gdn_prefill_graph_support_requires_fused_mc2_for_moe(
 
 
 @pytest.mark.parametrize("capture_size", [256, 512, 1024, 2048])
-def test_full_graph_capture_uses_exact_single_prefill_metadata(capture_size: int):
+def test_full_graph_capture_keeps_fixed_request_capacity(capture_size: int):
     common = create_common_attn_metadata(
         BatchSpec(
             seq_lens=[capture_size // 4] * 4,
@@ -1063,9 +1063,69 @@ def test_full_graph_capture_uses_exact_single_prefill_metadata(capture_size: int
 
     captured = builder.build_for_cudagraph_capture(common)
 
-    assert captured.num_prefills == 1
+    assert captured.num_prefills == 4
     assert captured.num_decodes == 0
     assert captured.num_spec_decodes == 0
     assert captured.num_actual_tokens == capture_size
-    assert captured.non_spec_query_start_loc.tolist() == [0, capture_size]
-    assert builder._captured_single_prefill_metadata[capture_size] is captured
+    assert captured.non_spec_query_start_loc.tolist() == [
+        0,
+        capture_size // 4,
+        capture_size // 2,
+        3 * capture_size // 4,
+        capture_size,
+    ]
+    assert builder._captured_prefill_metadata[capture_size] is captured
+
+
+def test_full_graph_prefill_replay_refreshes_boundaries_and_zero_tail_rows():
+    capture_size = 256
+    capture = create_common_attn_metadata(
+        BatchSpec(seq_lens=[256] * 4, query_lens=[64] * 4),
+        block_size=16,
+        device=torch.device("cpu"),
+    )
+    capture.num_input_tokens = capture_size
+    builder = _make_builder(
+        device=torch.device("cpu"),
+        num_heads=32,
+        num_speculative_tokens=3,
+        cudagraph_mode=CUDAGraphMode.FULL,
+    )
+    captured = builder.build_for_cudagraph_capture(capture)
+
+    runtime = create_common_attn_metadata(
+        BatchSpec(seq_lens=[256, 256], query_lens=[97, 80]),
+        block_size=16,
+        device=torch.device("cpu"),
+    )
+    runtime.num_input_tokens = capture_size
+    replay = builder.build(0, runtime)
+
+    assert replay is captured
+    assert replay.num_actual_tokens == capture_size
+    assert replay.non_spec_query_start_loc.tolist() == [0, 97, 177, 177, 177]
+    assert replay.prefill_state_indices.tolist()[:2] == [0, 16]
+    assert replay.prefill_state_indices.tolist()[2:] == [
+        NULL_BLOCK_ID,
+        NULL_BLOCK_ID,
+    ]
+    assert replay.prefill_has_initial_state.tolist()[2:] == [True, True]
+    conv = replay.non_spec_prefill_metadata.causal_conv1d
+    assert conv.query_start_loc.tolist() == [0, 97, 177, 177, 177]
+    assert torch.all(conv.cache_indices[2:] == PAD_SLOT_ID)
+    assert conv.cache_indices.data_ptr() != replay.prefill_state_indices.data_ptr()
+    assert conv.initial_state_mode.tolist()[2:] == [True, True]
+
+
+def test_copy_and_pad_rows_preserves_overlapping_runtime_prefix():
+    captured = torch.tensor([0, 64, 128, 192, 256], dtype=torch.int32)
+    runtime = captured[:2]
+    runtime[1] = 193
+
+    AscendGDNAttentionMetadataBuilder._copy_and_pad_rows(
+        captured,
+        runtime,
+        193,
+    )
+
+    assert captured.tolist() == [0, 193, 193, 193, 193]

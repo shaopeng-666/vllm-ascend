@@ -335,21 +335,68 @@ def supports_shared_kv_backing_with_transfer(vllm_config: VllmConfig) -> bool:
     )
 
 
-def _is_exact_single_gdn_prefill_graph(
+def _is_gdn_prefill_graph_compatible(
     *,
     uniform_decode: bool,
     num_reqs: int,
     num_tokens: int,
     graph_num_tokens: int,
+    min_num_scheduled_tokens: int,
     max_num_scheduled_tokens: int,
     decode_threshold: int,
+    fused_chunk_available: bool,
 ) -> bool:
-    """Whether a runtime batch matches the graph-safe GDN prefill contract."""
-    return (
+    """Whether a runtime batch matches a graph-safe GDN prefill contract.
+
+    The Triton fallback embeds host-side sequence/chunk metadata, so it keeps
+    the original exact singleton contract.  The fused CANN operator consumes
+    device ``actual_seq_lengths`` and supports a fixed physical token bucket
+    with dynamic request boundaries, including zero-length tail rows.
+    """
+    is_prefill_only = (
         not uniform_decode
-        and num_reqs == 1
-        and graph_num_tokens == num_tokens
+        and num_reqs > 0
+        and min_num_scheduled_tokens > decode_threshold
         and max_num_scheduled_tokens > decode_threshold
+    )
+    exact_single = num_reqs == 1 and graph_num_tokens == num_tokens
+    padded_fused = fused_chunk_available and graph_num_tokens >= num_tokens
+    return is_prefill_only and (exact_single or padded_fused)
+
+
+def _gdn_real_request_view(
+    common_attn_metadata: AscendCommonAttentionMetadata,
+    query_start_loc: torch.Tensor,
+    query_start_loc_cpu: torch.Tensor,
+    num_reqs: int,
+) -> AscendCommonAttentionMetadata:
+    """Remove FIA's virtual padding request from the GDN metadata view.
+
+    FULL-mode FIA may append one request whose only purpose is to cover the
+    physical token bucket. Stateful GDN/causal-conv metadata must keep one row
+    per real request; graph replay pads that real view to the captured row
+    capacity itself.
+    """
+
+    def _rows(value):
+        return None if value is None else value[:num_reqs]
+
+    return replace(
+        common_attn_metadata,
+        query_start_loc=query_start_loc[: num_reqs + 1],
+        query_start_loc_cpu=query_start_loc_cpu[: num_reqs + 1],
+        seq_lens=_rows(common_attn_metadata.seq_lens),
+        _seq_lens_cpu=_rows(common_attn_metadata._seq_lens_cpu),
+        seq_lens_cpu_upper_bound=_rows(
+            common_attn_metadata.seq_lens_cpu_upper_bound
+        ),
+        seq_lens_cpu=_rows(common_attn_metadata.seq_lens_cpu),
+        num_computed_tokens_cpu=_rows(
+            common_attn_metadata.num_computed_tokens_cpu
+        ),
+        num_reqs=num_reqs,
+        block_table_tensor=_rows(common_attn_metadata.block_table_tensor),
+        is_prefilling=_rows(common_attn_metadata.is_prefilling),
     )
 
 
@@ -3254,27 +3301,37 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         cudagraph_mode, batch_descriptor = dispatch_cudagraph(num_tokens_padded, use_cascade_attn or has_encoder_output)
-        # GDN FULL graphs deliberately support only exact-size singleton
-        # prefills: its Triton/FLA prefill kernels embed host cu-seqlens/chunk
-        # tuples, while state/cache indices are refreshed through stable
-        # tensors. Decode/spec-decode uses different mutable recurrent-state
-        # metadata and stays eager. A padded token bucket or multiple request
-        # boundaries would likewise invalidate the captured host arguments.
-        # Capture itself passes force_uniform_decode=False and is exempt from
-        # this runtime-only guard.
-        is_exact_single_gdn_prefill = _is_exact_single_gdn_prefill_graph(
+        # The fused CANN GDN prefill op consumes device-side dynamic sequence
+        # lengths, so it can replay a fixed token bucket for multiple prefill
+        # requests.  Keep the exact-singleton fallback for builds where the
+        # fused op probe failed; their Triton path captures host-side tuples.
+        fused_chunk_available = False
+        if self._has_gdn and force_uniform_decode is None:
+            from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
+
+            fused_chunk_available = (
+                AscendGatedDeltaNetAttention._fused_chunk_available is True
+            )
+        min_num_scheduled_tokens = (
+            int(num_scheduled_tokens_np[:num_reqs].min())
+            if num_reqs > 0
+            else 0
+        )
+        is_gdn_prefill_graph_compatible = _is_gdn_prefill_graph_compatible(
             uniform_decode=uniform_decode,
             num_reqs=num_reqs,
             num_tokens=num_tokens_padded,
             graph_num_tokens=batch_descriptor.num_tokens,
+            min_num_scheduled_tokens=min_num_scheduled_tokens,
             max_num_scheduled_tokens=max_num_scheduled_tokens,
             decode_threshold=self.decode_threshold,
+            fused_chunk_available=fused_chunk_available,
         )
         if (
             self._has_gdn
             and force_uniform_decode is None
             and cudagraph_mode == CUDAGraphMode.FULL
-            and not is_exact_single_gdn_prefill
+            and not is_gdn_prefill_graph_compatible
         ):
             cudagraph_mode, batch_descriptor = dispatch_cudagraph(
                 num_tokens_padded,
@@ -3651,21 +3708,23 @@ class NPUModelRunner(GPUModelRunner):
                 num_reqs_padded,
             )
 
-            # Now, query_start_loc is padded.
-            # But gdn needs an unpadded one.
-            # gdn_query_start_loc is an unpadded version of query_start_loc.
-            # TODO delete it if fia's check is removed.
-            if self._has_gdn:
-                attn_group = self.attn_groups[kv_cache_gid][0]
-                builder = attn_group.get_metadata_builder(0)
-                if isinstance(builder, GDNAttentionMetadataBuilder):
-                    cm.query_start_loc_cpu = self.gdn_query_start_loc.cpu[: num_reqs_padded + 1]
-                    cm.query_start_loc = self.gdn_query_start_loc.gpu[: num_reqs_padded + 1]
-
             if kv_cache_gid > 0:
                 cm.block_table_tensor, cm.slot_mapping = _get_block_table_and_slot_mapping(
                     kv_cache_gid
                 )
+            # FIA can append one virtual request to cover a physical token
+            # bucket. GDN owns state only for the real requests and pads its
+            # captured rows independently with zero-length sequences.
+            if self._has_gdn:
+                attn_group = self.attn_groups[kv_cache_gid][0]
+                builder = attn_group.get_metadata_builder(0)
+                if isinstance(builder, GDNAttentionMetadataBuilder):
+                    cm = _gdn_real_request_view(
+                        cm,
+                        self.gdn_query_start_loc.gpu,
+                        self.gdn_query_start_loc.cpu,
+                        num_reqs,
+                    )
             if self.speculative_config and isinstance(self.drafter, (AscendStep3p5MTPProposer, AscendDSparkProposer)):
                 # step3p5 MTP draft layers span multiple KV cache groups; capture
                 # each group's block table / slot mapping so the proposer can
