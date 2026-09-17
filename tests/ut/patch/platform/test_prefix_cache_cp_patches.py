@@ -393,6 +393,62 @@ def test_cp_hybrid_groups_reject_incompatible_prefix_match_unit() -> None:
 
 
 @pytest.mark.parametrize(
+    ("use_scheduler_alignment", "expected_partial_hits", "expected_alignment"),
+    [
+        pytest.param(False, True, 512, id="fine-grained-prefix-hits"),
+        pytest.param(True, False, 2048, id="scheduler-aligned-prefix-hits"),
+    ],
+)
+def test_hybrid_prefix_cache_can_use_scheduler_block_alignment(
+    use_scheduler_alignment: bool,
+    expected_partial_hits: bool,
+    expected_alignment: int,
+) -> None:
+    full_block_size = 512
+    scheduler_block_size = 2048
+    full_spec = FullAttentionSpec(
+        block_size=full_block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+    )
+    mamba_spec = MambaSpec(
+        block_size=scheduler_block_size,
+        shapes=((1,),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+    )
+    coordinator = AscendHybridKVCacheCoordinator(
+        kv_cache_config=KVCacheConfig(
+            num_blocks=16,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(["full"], full_spec),
+                KVCacheGroupSpec(["mamba"], mamba_spec),
+            ],
+        ),
+        max_model_len=8192,
+        use_eagle=False,
+        enable_caching=True,
+        enable_kv_cache_events=False,
+        dcp_world_size=1,
+        pcp_world_size=1,
+        hash_block_size=full_block_size,
+        scheduler_block_size=scheduler_block_size,
+        max_num_batched_tokens=8192,
+        prefix_cache_use_scheduler_block_size=use_scheduler_alignment,
+    )
+
+    assert coordinator.hash_block_size == full_block_size
+    assert coordinator.scheduler_block_size == scheduler_block_size
+    assert coordinator.enable_partial_hash_hits is expected_partial_hits
+    assert coordinator._cache_hit_alignment_tokens == expected_alignment
+    assert coordinator._align_cacheable(2560) == (
+        scheduler_block_size if use_scheduler_alignment else 2560
+    )
+
+
+@pytest.mark.parametrize(
     ("full_block_size", "prefix_match_unit", "expected_hash_block_size"),
     [
         pytest.param(128, None, 16, id="default-prefix-match-unit"),
@@ -967,11 +1023,13 @@ def test_get_kv_cache_coordinator_delegates_hybrid_without_caching(monkeypatch) 
 def test_get_kv_cache_coordinator_uses_ascend_for_deepseek_v4(monkeypatch) -> None:
     sentinel = object()
     kv_cache_config = _make_deepseek_v4_kv_cache_config()
+    coordinator_kwargs = {}
 
     def _fake_orig(*args, **kwargs):
         raise AssertionError("DeepSeek V4 should use AscendHybridKVCacheCoordinator")
 
     def _fake_ascend_coordinator(*args, **kwargs):
+        coordinator_kwargs.update(kwargs)
         return sentinel
 
     monkeypatch.setattr(
@@ -981,6 +1039,10 @@ def test_get_kv_cache_coordinator_uses_ascend_for_deepseek_v4(monkeypatch) -> No
     monkeypatch.setattr(
         "vllm_ascend.patch.platform.patch_kv_cache_coordinator.AscendHybridKVCacheCoordinator",
         _fake_ascend_coordinator,
+    )
+    monkeypatch.setattr(
+        "vllm_ascend.patch.platform.patch_kv_cache_coordinator.get_ascend_config",
+        lambda: SimpleNamespace(prefix_cache_use_scheduler_block_size=True),
     )
 
     coordinator = get_kv_cache_coordinator(
@@ -996,6 +1058,7 @@ def test_get_kv_cache_coordinator_uses_ascend_for_deepseek_v4(monkeypatch) -> No
     )
 
     assert coordinator is sentinel
+    assert coordinator_kwargs["prefix_cache_use_scheduler_block_size"] is True
 
 
 class _FakeEagleManager:

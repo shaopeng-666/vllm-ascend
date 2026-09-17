@@ -212,6 +212,7 @@ Single-node deployment runs both Prefill and Decode on the same node. `Qwen3.6-3
     - `--gpu-memory-utilization` controls how much HBM vLLM can use to calculate KV cache capacity. A higher value increases KV cache size but can trigger OOM if runtime memory is higher than the profile run.
     - `--enable-prefix-caching` enables prefix caching. For long-context serving, monitor memory usage because prefix caching can increase KV cache pressure.
     - `--prefix-match-unit` optionally sets the token granularity used to hash and match cached prefixes. When omitted, hybrid KV-cache groups use their greatest common divisor. Set it to a common divisor of every participating cache group's block size when coarser matching is preferred; incompatible values are rejected at startup.
+    - Add `"prefix_cache_use_scheduler_block_size": true` to `--additional-config` to restrict hybrid-model prefix-cache reuse to scheduler-block boundaries. For example, with 512-token full-attention blocks and a 2048-token scheduler block, cache hashes remain 512-token granular while reusable prefix lengths are limited to multiples of 2048. The default is `false`.
     - `--quantization ascend` enables Ascend quantization for the W8A8 model. Remove this option when deploying the BF16 model.
     - `--compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}'` enables full decode ACLGraph replay to reduce dispatch overhead.
 

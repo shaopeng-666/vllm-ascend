@@ -186,6 +186,15 @@ class TestAscendConfig(TestBase):
         self.assertEqual(config.finegrained_tp_config.oproj_tensor_parallel_size, 0)
         self.assertFalse(config.scheduler_config.short_request_first_config.enabled)
         self.assertFalse(config.rl_config.enabled)
+        self.assertFalse(config.prefix_cache_use_scheduler_block_size)
+
+    def test_prefix_cache_scheduler_alignment_config(self):
+        config = AscendConfig(
+            sparse_kv_offload_config=SimpleNamespace(enabled=False),
+            prefix_cache_use_scheduler_block_size=True,
+        )
+
+        self.assertTrue(config.prefix_cache_use_scheduler_block_size)
 
     def test_eplb_load_collection_phase_defaults_to_all(self):
         self.assertEqual(EplbConfig().load_collection_phase, "all")
