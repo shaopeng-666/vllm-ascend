@@ -855,6 +855,41 @@ def test_spec_sized_prefill_fold_requires_recurrent_state(
         assert attn_metadata.num_accepted_tokens is None
 
 
+def test_spec_sized_prefill_fold_ignores_graph_padding_rows():
+    common_attn_metadata = create_common_attn_metadata(
+        BatchSpec(
+            seq_lens=[8, 8, 8],
+            query_lens=[4, 4, 4],
+            name="three_runtime_requests_four_graph_rows",
+        ),
+        block_size=16,
+        device=torch.device("cpu"),
+    )
+    builder = _make_builder(
+        device=torch.device("cpu"),
+        num_heads=32,
+        num_speculative_tokens=3,
+        cudagraph_mode=CUDAGraphMode.FULL,
+    )
+    spec_sequence_masks_cpu = torch.tensor(
+        [False, True, False, False],
+        dtype=torch.bool,
+    )
+    num_accepted_tokens = torch.ones(4, dtype=torch.int32)
+
+    folded_masks, folded_accepted_tokens = builder._fold_spec_sized_prefill_chunks_into_spec(
+        common_attn_metadata,
+        spec_sequence_masks_cpu,
+        num_accepted_tokens,
+    )
+
+    assert folded_masks.tolist() == [True, True, True, False]
+    assert folded_accepted_tokens is not None
+    assert folded_accepted_tokens.tolist() == [4, 1, 4, 1]
+    assert spec_sequence_masks_cpu.tolist() == [False, True, False, False]
+    assert num_accepted_tokens.tolist() == [1, 1, 1, 1]
+
+
 def test_full_graph_without_runtime_spec_resets_captured_spec_inputs():
     capture_common_metadata = create_common_attn_metadata(
         batch_spec=BatchSpec(

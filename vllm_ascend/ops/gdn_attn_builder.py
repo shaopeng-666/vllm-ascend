@@ -662,17 +662,21 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         if is_prefilling is None or seq_lens_cpu is None or num_accepted_tokens is None:
             return spec_sequence_masks_cpu, num_accepted_tokens
 
+        query_lens_cpu = torch.diff(common_attn_metadata.query_start_loc_cpu)
         num_reqs = min(
             spec_sequence_masks_cpu.numel(),
             is_prefilling.numel(),
             seq_lens_cpu.numel(),
+            query_lens_cpu.numel(),
+            num_accepted_tokens.numel(),
         )
         is_prefilling = is_prefilling[:num_reqs]
         seq_lens_cpu = seq_lens_cpu[:num_reqs]
-        query_lens_cpu = torch.diff(common_attn_metadata.query_start_loc_cpu)[:num_reqs]
+        query_lens_cpu = query_lens_cpu[:num_reqs]
+        active_spec_sequence_masks_cpu = spec_sequence_masks_cpu[:num_reqs]
         fold = (
             is_prefilling
-            & ~spec_sequence_masks_cpu
+            & ~active_spec_sequence_masks_cpu
             & (query_lens_cpu == self.num_spec + 1)
             & (seq_lens_cpu > query_lens_cpu)
         )
