@@ -260,6 +260,7 @@ class AscendConfig:
             "enable_dsa_cp": false,
             "enable_force_eplb": false,
             "enable_pcp_o_proj_weight_sharding": false,
+            "prefix_cache_use_scheduler_block_size": false,
             "draft_window_size": null,
             "mix_placement": false,
             "pa_shape_list": [],
@@ -394,6 +395,9 @@ class AscendConfig:
     enable_dsa_cp: bool = False
     enable_force_eplb: bool = False
     enable_pcp_o_proj_weight_sharding: bool = False
+    # Keep physical/hash blocks unchanged, but restrict hybrid prefix-cache
+    # reuse to scheduler-block boundaries.
+    prefix_cache_use_scheduler_block_size: bool = False
     draft_window_size: int | None = None
     mix_placement: bool = False
     # When non-zero, force the MC2 combine stage's comm quant_mode to this

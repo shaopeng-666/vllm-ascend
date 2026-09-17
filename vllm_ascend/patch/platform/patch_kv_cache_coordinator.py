@@ -7,6 +7,7 @@ from math import lcm
 import vllm
 import vllm.envs as envs_vllm
 import vllm.v1.core.kv_cache_coordinator as vllm_kv_cache_coordinator
+from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_coordinator import (
@@ -31,7 +32,11 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
 )
 
+from vllm_ascend.ascend_config import get_ascend_config
+
 USE_MULTI_GROUPS_KV_CACHE = True
+
+logger = init_logger(__name__)
 
 _orig_get_kv_cache_coordinator = vllm.v1.core.kv_cache_coordinator.get_kv_cache_coordinator
 
@@ -90,6 +95,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         max_num_batched_tokens: int | None = None,
         scheduler_block_size: int | None = None,
         num_prefill_lookahead: int = 0,
+        prefix_cache_use_scheduler_block_size: bool = False,
     ):
         # Keep pcp_world_size in this patched constructor for compatibility
         # with the upstream coordinator interface. PCP is rejected by the platform.
@@ -166,12 +172,23 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                 for g in kv_cache_config.kv_cache_groups
                 if getattr(g.kv_cache_spec, "participates_in_prefix_caching", True)
             ), "block_size must be divisible by hash_block_size"
-        self.enable_partial_hash_hits = dcp_world_size == 1 and any(
-            isinstance(g.kv_cache_spec, MambaSpec)
-            and g.kv_cache_spec.mamba_cache_mode == "align"
-            and g.kv_cache_spec.block_size > hash_block_size
-            for g in kv_cache_config.kv_cache_groups
+        self.enable_partial_hash_hits = (
+            not prefix_cache_use_scheduler_block_size
+            and dcp_world_size == 1
+            and any(
+                isinstance(g.kv_cache_spec, MambaSpec)
+                and g.kv_cache_spec.mamba_cache_mode == "align"
+                and g.kv_cache_spec.block_size > hash_block_size
+                for g in kv_cache_config.kv_cache_groups
+            )
         )
+        if prefix_cache_use_scheduler_block_size:
+            logger.info(
+                "Prefix-cache hits use scheduler block alignment (%s tokens); "
+                "hash block size remains %s tokens.",
+                scheduler_block_size,
+                hash_block_size,
+            )
         self.verify_and_split_kv_cache_groups()
 
         # Align the WRITE-path mask granularity (reachable_block_mask) with the
@@ -412,6 +429,13 @@ def get_kv_cache_coordinator(  # type: ignore[misc]
     # compatibility; platform validation guarantees that it is one.
     del pcp_world_size
     token_budget = _select_kv_token_budget(max_model_len, max_in_flight_tokens, max_num_batched_tokens)
+    try:
+        prefix_cache_use_scheduler_block_size = get_ascend_config().prefix_cache_use_scheduler_block_size
+    except RuntimeError:
+        # Some standalone/unit-test callers construct the coordinator before
+        # platform configuration is initialized. Production serving initializes
+        # AscendConfig before the scheduler creates the coordinator.
+        prefix_cache_use_scheduler_block_size = False
     if _is_deepseek_v4_kv_cache_config(kv_cache_config):
         return AscendHybridKVCacheCoordinator(  # type: ignore[call-arg]
             kv_cache_config,
@@ -428,6 +452,7 @@ def get_kv_cache_coordinator(  # type: ignore[misc]
             max_num_batched_tokens=token_budget,
             scheduler_block_size=scheduler_block_size,
             num_prefill_lookahead=num_prefill_lookahead,
+            prefix_cache_use_scheduler_block_size=prefix_cache_use_scheduler_block_size,
         )
 
     if len(kv_cache_config.kv_cache_groups) == 1 or not enable_caching:
@@ -462,6 +487,7 @@ def get_kv_cache_coordinator(  # type: ignore[misc]
         max_num_batched_tokens=token_budget,
         scheduler_block_size=scheduler_block_size,
         num_prefill_lookahead=num_prefill_lookahead,
+        prefix_cache_use_scheduler_block_size=prefix_cache_use_scheduler_block_size,
     )
 
 
