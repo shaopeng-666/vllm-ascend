@@ -77,7 +77,7 @@ class AscendKVBlockZeroer(KVBlockZeroer):
     def __init__(self, device: torch.device, pin_memory: bool) -> None:
         self.device = device
         self.pin_memory = pin_memory
-        self._meta: tuple[torch.Tensor, int, int, int] | None = None
+        self._metas: list[tuple[torch.Tensor, int, int, int]] = []
         self._id_cap: int = 0
         self._ids_pinned: torch.Tensor | None = None
         self._ids_gpu: torch.Tensor | None = None
@@ -104,8 +104,7 @@ class AscendKVBlockZeroer(KVBlockZeroer):
         Only AttentionSpec layers are processed; Mamba layers are skipped.
         """
         seen_ptrs: set[int] = set()
-        seg_addrs: list[int] = []
-        page_size_el: int | None = None
+        seg_addrs_by_page_size: dict[int, list[int]] = {}
 
         for group in attn_groups_iter:
             spec = group.kv_cache_spec
@@ -121,8 +120,20 @@ class AscendKVBlockZeroer(KVBlockZeroer):
                 if layer_name in runner_only_attn_layers:
                     continue
                 kv_tuple = static_forward_context[layer_name].kv_cache
-                assert len(kv_tuple) == 2, "K and V are not stored separately"
-                for kv in kv_tuple:
+                if len(kv_tuple) < 2:
+                    raise ValueError(
+                        "Full-attention KV cache must contain at least K and V "
+                        f"tensors, got {len(kv_tuple)} for layer {layer_name}."
+                    )
+                # Auxiliary cache tensors have backend-specific lifetime
+                # semantics. In particular, C8-MXFP stores
+                # (K, V, K-scale, V-scale), and its static V-scale cache is
+                # populated only once per cache instance. Clearing it when a
+                # block is recycled would corrupt later attention reads.
+                # Zero only the K/V data payloads; zero data makes stale
+                # per-token K scales irrelevant while preserving static
+                # auxiliary state.
+                for kv in kv_tuple[:2]:
                     block_dim = 0
                     dp = kv.data_ptr()
                     if dp in seen_ptrs:
@@ -134,10 +145,7 @@ class AscendKVBlockZeroer(KVBlockZeroer):
                     assert cur_bytes % 4 == 0
                     kernel_block_el = cur_bytes // 4
                     cur_page_el = kernel_block_el * ratio
-                    if page_size_el is None:
-                        page_size_el = cur_page_el
-                    else:
-                        assert page_size_el == cur_page_el, f"Non-uniform page sizes: {page_size_el} vs {cur_page_el}"
+                    seg_addrs = seg_addrs_by_page_size.setdefault(cur_page_el, [])
 
                     block_stride_bytes = cur_bytes
                     outer_dims = [d for d in range(block_dim) if kv.stride(d) * el > block_stride_bytes]
@@ -146,12 +154,26 @@ class AscendKVBlockZeroer(KVBlockZeroer):
                         off_bytes = sum(i * s for i, s in zip(outer, outer_strides))
                         seg_addrs.append(dp + off_bytes)
 
-        if not seg_addrs or page_size_el is None:
-            self._meta = None
+        self._metas = []
+        if not seg_addrs_by_page_size:
             return
 
-        # _zero_kv_blocks_kernel will use int64 zeros, to meet the UB size, we use blk_size=64B/8B=8192
-        blk_size = min(largest_power_of_2_divisor(page_size_el), 8192)
+        # Group K/V tensors by logical-page size so every kernel launch retains
+        # a single PAGE_SIZE_EL. This also supports backends whose K and V
+        # payloads have different per-block sizes.
+        for page_size_el, seg_addrs in seg_addrs_by_page_size.items():
+            # _zero_kv_blocks_kernel uses int32 stores. Keep each launch's
+            # chunk size power-of-two aligned and within the vector-core UB.
+            blk_size = min(largest_power_of_2_divisor(page_size_el), 8192)
+            self._metas.append(
+                (
+                    torch.tensor(seg_addrs, dtype=torch.uint64, device=self.device),
+                    page_size_el,
+                    blk_size,
+                    len(seg_addrs),
+                )
+            )
+
         self._id_cap = 8192
         self._ids_pinned = torch.empty(
             self._id_cap,
@@ -159,18 +181,11 @@ class AscendKVBlockZeroer(KVBlockZeroer):
             pin_memory=self.pin_memory,
         )
         self._ids_gpu = torch.empty(self._id_cap, dtype=torch.int64, device=self.device)
-        self._meta = (
-            torch.tensor(seg_addrs, dtype=torch.uint64, device=self.device),
-            page_size_el,
-            blk_size,
-            len(seg_addrs),
-        )
 
     def zero_block_ids(self, block_ids: list[int]) -> None:
         """Zero the KV cache memory for the given block IDs."""
-        if not block_ids or self._meta is None:
+        if not block_ids or not self._metas:
             return
-        seg_addrs, page_size_el, blk_size, n_segs = self._meta
         n_blocks = len(block_ids)
         if n_blocks > self._id_cap:
             self._id_cap = n_blocks * 2
@@ -184,17 +199,18 @@ class AscendKVBlockZeroer(KVBlockZeroer):
         self._ids_pinned[:n_blocks].numpy()[:] = block_ids
         idx = self._ids_gpu[:n_blocks]
         idx.copy_(self._ids_pinned[:n_blocks], non_blocking=True)
-        chunks = page_size_el // blk_size
-        total_work = n_blocks * n_segs * chunks
-        grid = min(total_work, get_vectorcore_num()) if total_work > 0 else 0
-        if grid == 0:
-            return
-        _zero_kv_blocks_kernel[(grid,)](
-            seg_addrs,
-            idx,
-            n_blocks,
-            N_SEGS=n_segs,
-            PAGE_SIZE_EL=page_size_el,
-            BLOCK_SIZE=blk_size,
-            GRID_SIZE=grid,
-        )
+        for seg_addrs, page_size_el, blk_size, n_segs in self._metas:
+            chunks = page_size_el // blk_size
+            total_work = n_blocks * n_segs * chunks
+            grid = min(total_work, get_vectorcore_num()) if total_work > 0 else 0
+            if grid == 0:
+                continue
+            _zero_kv_blocks_kernel[(grid,)](
+                seg_addrs,
+                idx,
+                n_blocks,
+                N_SEGS=n_segs,
+                PAGE_SIZE_EL=page_size_el,
+                BLOCK_SIZE=blk_size,
+                GRID_SIZE=grid,
+            )
