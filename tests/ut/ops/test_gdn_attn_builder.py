@@ -8,7 +8,7 @@ import pytest
 import torch
 from vllm.config.compilation import CUDAGraphMode
 from vllm.third_party.flash_linear_attention.ops import index as _fla_index
-from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.attention.backend import AttentionCGSupport, CommonAttentionMetadata
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import MambaSpec
 
@@ -855,6 +855,72 @@ def test_spec_sized_prefill_fold_requires_recurrent_state(
         assert attn_metadata.num_accepted_tokens is None
 
 
+def test_spec_sized_prefill_fold_ignores_graph_padding_rows():
+    common_attn_metadata = create_common_attn_metadata(
+        BatchSpec(
+            seq_lens=[8, 8, 8],
+            query_lens=[4, 4, 4],
+            name="three_runtime_requests_four_graph_rows",
+        ),
+        block_size=16,
+        device=torch.device("cpu"),
+    )
+    builder = _make_builder(
+        device=torch.device("cpu"),
+        num_heads=32,
+        num_speculative_tokens=3,
+        cudagraph_mode=CUDAGraphMode.FULL,
+    )
+    spec_sequence_masks_cpu = torch.tensor(
+        [False, True, False, False],
+        dtype=torch.bool,
+    )
+    num_accepted_tokens = torch.ones(4, dtype=torch.int32)
+
+    folded_masks, folded_accepted_tokens = builder._fold_spec_sized_prefill_chunks_into_spec(
+        common_attn_metadata,
+        spec_sequence_masks_cpu,
+        num_accepted_tokens,
+    )
+
+    assert folded_masks.tolist() == [True, True, True, False]
+    assert folded_accepted_tokens is not None
+    assert folded_accepted_tokens.tolist() == [4, 1, 4, 1]
+    assert spec_sequence_masks_cpu.tolist() == [False, True, False, False]
+    assert num_accepted_tokens.tolist() == [1, 1, 1, 1]
+
+
+def test_spec_decode_ignores_trailing_fia_draft_buffer_row():
+    common_attn_metadata = create_common_attn_metadata(
+        BatchSpec(
+            seq_lens=[8, 8],
+            query_lens=[4, 1],
+            name="two_runtime_requests_three_draft_rows",
+        ),
+        block_size=16,
+        device=torch.device("cpu"),
+    )
+    builder = _make_builder(
+        device=torch.device("cpu"),
+        num_heads=32,
+        num_speculative_tokens=3,
+        cudagraph_mode=CUDAGraphMode.FULL,
+    )
+
+    attn_metadata = builder.build(
+        0,
+        common_attn_metadata,
+        num_accepted_tokens=torch.ones(3, dtype=torch.int32),
+        num_decode_draft_tokens_cpu=torch.tensor([0, -1, -1], dtype=torch.int32),
+    )
+
+    assert attn_metadata.spec_sequence_masks is not None
+    assert attn_metadata.spec_sequence_masks.tolist() == [True, False]
+    assert attn_metadata.num_spec_decodes == 1
+    assert attn_metadata.num_accepted_tokens is not None
+    assert attn_metadata.num_accepted_tokens.numel() == 1
+
+
 def test_full_graph_without_runtime_spec_resets_captured_spec_inputs():
     capture_common_metadata = create_common_attn_metadata(
         batch_spec=BatchSpec(
@@ -1013,3 +1079,383 @@ def test_full_graph_non_spec_metadata_nulls_padded_state_indices(
         decode_metadata.actual_seq_lengths,
         torch.tensor([0, 1, 1, 0, 0], dtype=torch.int32),
     )
+
+
+@pytest.mark.parametrize(
+    ("is_moe", "enable_fused_mc2", "speculative", "expected"),
+    [
+        pytest.param(False, 0, False, AttentionCGSupport.ALWAYS, id="dense-unfused"),
+        pytest.param(True, 1, False, AttentionCGSupport.ALWAYS, id="moe-fused-no-mtp"),
+        pytest.param(
+            True,
+            1,
+            True,
+            AttentionCGSupport.ALWAYS,
+            id="moe-fused-mtp-full",
+        ),
+        pytest.param(True, 0, False, AttentionCGSupport.UNIFORM_BATCH, id="moe-unfused"),
+    ],
+)
+def test_gdn_prefill_graph_support_requires_fused_mc2_for_moe(
+    is_moe: bool,
+    enable_fused_mc2: int,
+    speculative: bool,
+    expected: AttentionCGSupport,
+):
+    with (
+        patch.object(ascend_gdn_attn_builder, "is_moe_model", return_value=is_moe),
+        patch.object(
+            ascend_gdn_attn_builder,
+            "get_ascend_config",
+            return_value=SimpleNamespace(enable_fused_mc2=enable_fused_mc2),
+        ),
+    ):
+        support = AscendGDNAttentionMetadataBuilder.get_cudagraph_support(
+            SimpleNamespace(speculative_config=object() if speculative else None),
+            SimpleNamespace(),
+        )
+
+    assert support == expected
+
+
+@pytest.mark.parametrize("capture_size", [256, 512, 1024, 2048])
+def test_full_graph_capture_keeps_fixed_request_capacity(capture_size: int):
+    common = create_common_attn_metadata(
+        BatchSpec(
+            seq_lens=[capture_size // 4] * 4,
+            query_lens=[capture_size // 4] * 4,
+        ),
+        block_size=16,
+        device=torch.device("cpu"),
+    )
+    common.gdn_prefill_graph_backend = "native"
+    builder = _make_builder(
+        device=torch.device("cpu"),
+        num_heads=32,
+        num_speculative_tokens=3,
+        cudagraph_mode=CUDAGraphMode.FULL,
+    )
+
+    captured = builder.build_for_cudagraph_capture(common)
+
+    assert captured.num_prefills == 4
+    assert captured.num_decodes == 0
+    assert captured.num_spec_decodes == 0
+    assert captured.num_actual_tokens == capture_size
+    assert captured.non_spec_query_start_loc.tolist()[:5] == [
+        0,
+        capture_size // 4,
+        capture_size // 2,
+        3 * capture_size // 4,
+        capture_size,
+    ]
+    row_capacity = builder._sequence_index_capacity
+    assert captured.non_spec_query_start_loc.shape == (row_capacity + 1,)
+    assert captured.non_spec_query_start_loc.tolist()[5:] == [capture_size] * (row_capacity - 4)
+    assert captured.prefill_state_indices.shape == (row_capacity,)
+    assert captured.prefill_has_initial_state.shape == (row_capacity,)
+    conv = captured.non_spec_prefill_metadata.causal_conv1d
+    assert conv.query_start_loc.data_ptr() == captured.non_spec_query_start_loc.data_ptr()
+    assert conv.cache_indices.shape[0] == row_capacity
+    assert conv.cache_indices.data_ptr() != captured.prefill_state_indices.data_ptr()
+    assert builder._captured_prefill_metadata[capture_size] is captured
+    assert captured.gdn_prefill_graph_backend == "native"
+
+
+def test_full_graph_capture_rejects_mixed_dummy_rows():
+    common = create_common_attn_metadata(
+        BatchSpec(
+            seq_lens=[1] * 7 + [5],
+            query_lens=[1] * 7 + [5],
+        ),
+        block_size=16,
+        device=torch.device("cpu"),
+    )
+    common.gdn_prefill_graph_backend = "native"
+    builder = _make_builder(
+        device=torch.device("cpu"),
+        num_heads=32,
+        num_speculative_tokens=3,
+        cudagraph_mode=CUDAGraphMode.FULL,
+    )
+
+    with pytest.raises(
+        AssertionError,
+        match="mixes decode/spec rows with real prefill rows",
+    ):
+        builder.build_for_cudagraph_capture(common)
+
+
+def test_full_graph_capture_accepts_pure_prefill_rows():
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[6, 6], query_lens=[6, 6]),
+        block_size=16,
+        device=torch.device("cpu"),
+    )
+    common.gdn_prefill_graph_backend = "native"
+    builder = _make_builder(
+        device=torch.device("cpu"),
+        num_heads=32,
+        num_speculative_tokens=3,
+        cudagraph_mode=CUDAGraphMode.FULL,
+    )
+
+    captured = builder.build_for_cudagraph_capture(common)
+
+    assert captured.num_prefills == 2
+    assert captured.num_decodes == 0
+    assert captured.num_spec_decodes == 0
+    assert captured.non_spec_query_start_loc.tolist()[:3] == [0, 6, 12]
+    assert captured.non_spec_query_start_loc.tolist()[3:] == [12] * (builder._sequence_index_capacity - 2)
+
+
+def test_full_graph_prefill_capture_rejects_triton_host_metadata():
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[6, 6], query_lens=[6, 6]),
+        block_size=16,
+        device=torch.device("cpu"),
+    )
+    common.gdn_prefill_graph_backend = "triton"
+    builder = _make_builder(
+        device=torch.device("cpu"),
+        num_heads=32,
+        num_speculative_tokens=3,
+        cudagraph_mode=CUDAGraphMode.FULL,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="requires native device-side dynamic sequence lengths",
+    ):
+        builder.build_for_cudagraph_capture(common)
+
+
+def test_exact_single_prefill_capture_registers_immutable_fla_metadata():
+    capture_size = 320
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[capture_size], query_lens=[capture_size]),
+        block_size=16,
+        device=torch.device("cpu"),
+    )
+    common.gdn_prefill_graph_backend = "fla_npu"
+    builder = _make_builder(
+        device=torch.device("cpu"),
+        num_heads=32,
+        num_speculative_tokens=3,
+        cudagraph_mode=CUDAGraphMode.FULL,
+    )
+
+    captured = builder.build_for_cudagraph_capture(common)
+
+    assert captured.gdn_prefill_graph_backend == "fla_npu"
+
+
+def test_full_graph_prefill_replay_refreshes_boundaries_and_zero_tail_rows():
+    capture_size = 256
+    capture = create_common_attn_metadata(
+        BatchSpec(seq_lens=[256] * 4, query_lens=[64] * 4),
+        block_size=16,
+        device=torch.device("cpu"),
+    )
+    capture.num_input_tokens = capture_size
+    builder = _make_builder(
+        device=torch.device("cpu"),
+        num_heads=32,
+        num_speculative_tokens=3,
+        cudagraph_mode=CUDAGraphMode.FULL,
+    )
+    captured = builder.build_for_cudagraph_capture(capture)
+
+    runtime = create_common_attn_metadata(
+        BatchSpec(seq_lens=[256, 256], query_lens=[97, 80]),
+        block_size=16,
+        device=torch.device("cpu"),
+    )
+    runtime.num_input_tokens = capture_size
+    replay = builder.build(0, runtime)
+
+    assert replay is captured
+    assert replay.num_actual_tokens == capture_size
+    assert replay.non_spec_query_start_loc.tolist() == [0, 97, 177, 177, 177]
+    assert replay.prefill_state_indices.tolist()[:2] == [0, 16]
+    assert replay.prefill_state_indices.tolist()[2:] == [
+        NULL_BLOCK_ID,
+        NULL_BLOCK_ID,
+    ]
+    assert replay.prefill_has_initial_state.tolist()[2:] == [True, True]
+    conv = replay.non_spec_prefill_metadata.causal_conv1d
+    assert conv.query_start_loc.tolist() == [0, 97, 177, 177, 177]
+    assert torch.all(conv.cache_indices[2:] == PAD_SLOT_ID)
+    assert conv.cache_indices.data_ptr() != replay.prefill_state_indices.data_ptr()
+    assert conv.initial_state_mode.tolist()[2:] == [True, True]
+
+
+@pytest.mark.parametrize(
+    ("runtime_query_lens", "expected_prefix"),
+    [
+        pytest.param([800], [0, 800], id="single-800-to-1024"),
+        pytest.param([400, 400], [0, 400, 800], id="multi-400-400-to-1024"),
+    ],
+)
+def test_nearest_1024_prefill_replay_refreshes_native_lengths(
+    runtime_query_lens: list[int],
+    expected_prefix: list[int],
+):
+    capture_size = 1024
+    capture = create_common_attn_metadata(
+        BatchSpec(seq_lens=[capture_size] * 8, query_lens=[128] * 8),
+        block_size=16,
+        device=torch.device("cpu"),
+    )
+    capture.num_input_tokens = capture_size
+    capture.gdn_prefill_graph_backend = "native"
+    builder = _make_builder(
+        device=torch.device("cpu"),
+        num_heads=32,
+        num_speculative_tokens=3,
+        cudagraph_mode=CUDAGraphMode.FULL,
+    )
+    captured = builder.build_for_cudagraph_capture(capture)
+
+    runtime = create_common_attn_metadata(
+        BatchSpec(
+            seq_lens=runtime_query_lens,
+            query_lens=runtime_query_lens,
+        ),
+        block_size=16,
+        device=torch.device("cpu"),
+    )
+    runtime.num_input_tokens = capture_size
+    runtime.gdn_prefill_graph_backend = "native"
+    # The real InputBatch owns one fixed-width block table for capture and
+    # replay.  The test helper sizes it from seq_lens, so pad the runtime view
+    # to the captured width to mirror that production contract.
+    runtime_block_table = torch.zeros(
+        (len(runtime_query_lens), capture.block_table_tensor.shape[1]),
+        dtype=runtime.block_table_tensor.dtype,
+    )
+    runtime_block_table[:, : runtime.block_table_tensor.shape[1]].copy_(runtime.block_table_tensor)
+    runtime.block_table_tensor = runtime_block_table
+    replay = builder.build(0, runtime)
+
+    assert replay is captured
+    assert replay.gdn_prefill_graph_backend == "native"
+    assert replay.non_spec_query_start_loc.tolist()[: len(expected_prefix)] == expected_prefix
+    assert replay.non_spec_query_start_loc.tolist()[len(expected_prefix) :] == [800] * (
+        builder._sequence_index_capacity + 1 - len(expected_prefix)
+    )
+    actual_seq_lengths = torch.diff(replay.non_spec_query_start_loc)
+    assert actual_seq_lengths.tolist()[: len(runtime_query_lens)] == runtime_query_lens
+    assert actual_seq_lengths.tolist()[len(runtime_query_lens) :] == [0] * (
+        builder._sequence_index_capacity - len(runtime_query_lens)
+    )
+
+
+def test_native_prefill_replay_refreshes_metadata_across_buckets_and_shapes():
+    """Alternating buckets must not replay stale boundaries from a prior run."""
+    builder = _make_builder(
+        device=torch.device("cpu"),
+        num_heads=32,
+        num_speculative_tokens=3,
+        cudagraph_mode=CUDAGraphMode.FULL,
+    )
+    captured_by_size = {}
+    capture_block_widths = {}
+    for capture_size in (512, 1024, 2048, 4096):
+        capture = create_common_attn_metadata(
+            BatchSpec(
+                seq_lens=[capture_size] * 8,
+                query_lens=[capture_size // 8] * 8,
+            ),
+            block_size=16,
+            device=torch.device("cpu"),
+        )
+        capture.num_input_tokens = capture_size
+        capture.gdn_prefill_graph_backend = "native"
+        captured_by_size[capture_size] = builder.build_for_cudagraph_capture(capture)
+        capture_block_widths[capture_size] = capture.block_table_tensor.shape[1]
+
+    replay_cases = (
+        (1024, [800]),
+        (512, [300]),
+        (2048, [1500]),
+        (1024, [400, 400]),
+        (4096, [3500]),
+        # Return to the first shape after touching every other capture bucket.
+        (1024, [800]),
+    )
+    for capture_size, query_lens in replay_cases:
+        runtime = create_common_attn_metadata(
+            BatchSpec(seq_lens=query_lens, query_lens=query_lens),
+            block_size=16,
+            device=torch.device("cpu"),
+        )
+        runtime.num_input_tokens = capture_size
+        runtime.gdn_prefill_graph_backend = "native"
+        runtime_block_table = torch.zeros(
+            (len(query_lens), capture_block_widths[capture_size]),
+            dtype=runtime.block_table_tensor.dtype,
+        )
+        runtime_block_table[:, : runtime.block_table_tensor.shape[1]].copy_(runtime.block_table_tensor)
+        runtime.block_table_tensor = runtime_block_table
+
+        replay = builder.build(0, runtime)
+
+        assert replay is captured_by_size[capture_size]
+        expected_boundaries = [0]
+        for query_len in query_lens:
+            expected_boundaries.append(expected_boundaries[-1] + query_len)
+        assert replay.non_spec_query_start_loc.tolist()[: len(expected_boundaries)] == (expected_boundaries)
+        assert replay.non_spec_query_start_loc.tolist()[len(expected_boundaries) :] == [sum(query_lens)] * (
+            builder._sequence_index_capacity + 1 - len(expected_boundaries)
+        )
+        actual_seq_lengths = torch.diff(replay.non_spec_query_start_loc)
+        assert actual_seq_lengths.tolist() == query_lens + [0] * (builder._sequence_index_capacity - len(query_lens))
+        conv = replay.non_spec_prefill_metadata.causal_conv1d
+        assert conv.query_start_loc.data_ptr() == replay.non_spec_query_start_loc.data_ptr()
+        assert torch.all(conv.cache_indices[len(query_lens) :] == PAD_SLOT_ID)
+
+
+def test_a5_exact_fla_capture_is_not_overwritten_by_native_bucket_capture():
+    builder = _make_builder(
+        device=torch.device("cpu"),
+        num_heads=32,
+        num_speculative_tokens=3,
+        cudagraph_mode=CUDAGraphMode.FULL,
+    )
+    fla_capture = create_common_attn_metadata(
+        BatchSpec(seq_lens=[320], query_lens=[320]),
+        block_size=16,
+        device=torch.device("cpu"),
+    )
+    fla_capture.num_input_tokens = 320
+    fla_capture.gdn_prefill_graph_backend = "fla_npu"
+    native_capture = create_common_attn_metadata(
+        BatchSpec(seq_lens=[512] * 8, query_lens=[64] * 8),
+        block_size=16,
+        device=torch.device("cpu"),
+    )
+    native_capture.num_input_tokens = 512
+    native_capture.gdn_prefill_graph_backend = "native"
+
+    fla_metadata = builder.build_for_cudagraph_capture(fla_capture)
+    native_metadata = builder.build_for_cudagraph_capture(native_capture)
+
+    assert builder._captured_prefill_metadata[320] is fla_metadata
+    assert builder._captured_prefill_metadata[512] is native_metadata
+    assert fla_metadata.gdn_prefill_graph_backend == "fla_npu"
+    assert native_metadata.gdn_prefill_graph_backend == "native"
+
+
+def test_copy_and_pad_rows_preserves_overlapping_runtime_prefix():
+    captured = torch.tensor([0, 64, 128, 192, 256], dtype=torch.int32)
+    runtime = captured[:2]
+    runtime[1] = 193
+
+    AscendGDNAttentionMetadataBuilder._copy_and_pad_rows(
+        captured,
+        runtime,
+        193,
+    )
+
+    assert captured.tolist() == [0, 193, 193, 193, 193]

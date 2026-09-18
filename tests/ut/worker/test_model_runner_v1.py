@@ -1,12 +1,14 @@
 import unittest
 from collections import deque
 from contextlib import nullcontext
+from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import numpy as np
 import torch
 from vllm.config import CUDAGraphMode
+from vllm.forward_context import BatchDescriptor
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.sampling_params import SamplingParams
@@ -37,11 +39,635 @@ from vllm_ascend.models.glm5next.kv_cache import (
     Glm5NextIndexerCache,
     Glm5NextStateCache,
 )
+from vllm_ascend.ops.gdn_graph_capability import (
+    GDNPrefillGraphCapability,
+    gdn_prefill_graph_capture_scope,
+    get_gdn_prefill_graph_capability,
+    is_exact_gdn_prefill_graph_contract,
+    is_gdn_prefill_graph_capture_active,
+    select_gdn_prefill_graph_backend,
+    select_gdn_prefill_implementation,
+)
 from vllm_ascend.patch.platform.patch_kv_cache_utils import (
     _get_kv_cache_config_deepseek_v4_main,
 )
 from vllm_ascend.utils import AscendDeviceType, vllm_version_is
-from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+from vllm_ascend.worker.model_runner_v1 import (
+    NPUModelRunner,
+    _gdn_real_request_view,
+    _get_gdn_prefill_capture_num_reqs,
+    _get_gdn_uniform_spec_graph_descriptor,
+    _is_gdn_prefill_graph_compatible,
+    _must_run_fused_mc2_spec_target_eager,
+    _register_gdn_spec_decode_full_graph_keys,
+    _set_dummy_query_start_loc,
+)
+
+
+class TestGDNPrefillGraphRuntimeContract(unittest.TestCase):
+    _dynamic_capability = get_gdn_prefill_graph_capability(
+        "fla_npu",
+        native_dynamic_lengths_available=True,
+    )
+
+    @staticmethod
+    def _compatible(**overrides):
+        args = dict(
+            uniform_decode=False,
+            num_reqs=1,
+            num_tokens=1024,
+            graph_num_reqs=8,
+            graph_num_tokens=1024,
+            min_num_scheduled_tokens=1024,
+            max_num_scheduled_tokens=1024,
+            decode_threshold=4,
+            graph_capability=GDNPrefillGraphCapability.EXACT_SINGLE_REQUEST,
+        )
+        args.update(overrides)
+        return _is_gdn_prefill_graph_compatible(**args)
+
+    def test_exact_single_prefill_is_graph_safe(self):
+        self.assertTrue(self._compatible())
+
+    def test_padded_prefill_requires_dynamic_length_capability(self):
+        self.assertFalse(self._compatible(num_tokens=513))
+        self.assertTrue(self._compatible(num_tokens=513, graph_capability=self._dynamic_capability))
+
+    def test_nearest_1024_bucket_accepts_single_and_multi_prefill(self):
+        self.assertTrue(
+            self._compatible(
+                num_tokens=800,
+                graph_num_tokens=1024,
+                min_num_scheduled_tokens=800,
+                max_num_scheduled_tokens=800,
+                graph_capability=self._dynamic_capability,
+            )
+        )
+        self.assertTrue(
+            self._compatible(
+                num_reqs=2,
+                num_tokens=800,
+                graph_num_tokens=1024,
+                min_num_scheduled_tokens=400,
+                max_num_scheduled_tokens=400,
+                graph_capability=self._dynamic_capability,
+            )
+        )
+
+    def test_padded_prefill_requires_a_reserved_dummy_row(self):
+        self.assertFalse(
+            self._compatible(
+                num_reqs=8,
+                num_tokens=800,
+                graph_num_reqs=8,
+                graph_num_tokens=1024,
+                min_num_scheduled_tokens=100,
+                max_num_scheduled_tokens=100,
+                graph_capability=self._dynamic_capability,
+            )
+        )
+        self.assertTrue(
+            self._compatible(
+                num_reqs=8,
+                num_tokens=1024,
+                graph_num_reqs=8,
+                graph_num_tokens=1024,
+                min_num_scheduled_tokens=128,
+                max_num_scheduled_tokens=128,
+                graph_capability=self._dynamic_capability,
+            )
+        )
+
+    def test_multi_request_prefill_requires_multi_request_capability(self):
+        self.assertFalse(self._compatible(num_reqs=2))
+        self.assertTrue(
+            self._compatible(
+                num_reqs=2,
+                min_num_scheduled_tokens=256,
+                max_num_scheduled_tokens=768,
+                graph_capability=self._dynamic_capability,
+            )
+        )
+
+    def test_capture_row_capacity_avoids_mtp_mixed_dummy(self):
+        self.assertEqual(
+            _get_gdn_prefill_capture_num_reqs(
+                num_tokens=12,
+                max_num_reqs=8,
+                decode_threshold=4,
+            ),
+            2,
+        )
+        self.assertEqual(
+            _get_gdn_prefill_capture_num_reqs(
+                num_tokens=20,
+                max_num_reqs=8,
+                decode_threshold=4,
+            ),
+            4,
+        )
+
+    def test_capture_row_capacity_preserves_large_prefill_capacity(self):
+        for num_tokens in (512, 1024, 2048, 4096):
+            self.assertEqual(
+                _get_gdn_prefill_capture_num_reqs(
+                    num_tokens=num_tokens,
+                    max_num_reqs=8,
+                    decode_threshold=4,
+                ),
+                8,
+            )
+
+    def test_uniform_spec_graph_descriptor_is_distinct_from_mixed_decode(self):
+        mixed = BatchDescriptor(
+            num_tokens=8,
+            num_reqs=8,
+            uniform=False,
+        )
+        spec = _get_gdn_uniform_spec_graph_descriptor(
+            mixed,
+            uniform_decode_query_len=4,
+            max_num_reqs=8,
+        )
+        self.assertEqual(
+            spec,
+            BatchDescriptor(
+                num_tokens=8,
+                num_reqs=2,
+                uniform=True,
+            ),
+        )
+
+    def test_only_fused_mc2_spec_target_full_graph_runs_eager(self):
+        self.assertTrue(
+            _must_run_fused_mc2_spec_target_eager(
+                use_spec_decode=True,
+                cudagraph_mode=CUDAGraphMode.FULL,
+                enable_fused_mc2=1,
+            )
+        )
+        for use_spec_decode, mode, fused in (
+            (False, CUDAGraphMode.FULL, 1),
+            (True, CUDAGraphMode.NONE, 1),
+            (True, CUDAGraphMode.FULL, 0),
+        ):
+            self.assertFalse(
+                _must_run_fused_mc2_spec_target_eager(
+                    use_spec_decode=use_spec_decode,
+                    cudagraph_mode=mode,
+                    enable_fused_mc2=fused,
+                )
+            )
+
+    def test_registers_uniform_spec_keys_for_full_mode(self):
+        mixed_keys = {
+            BatchDescriptor(num_tokens=size, num_reqs=min(size, 8)) for size in (4, 8, 12, 16, 20, 24, 28, 32, 512)
+        }
+        dispatcher = SimpleNamespace(
+            cudagraph_keys={CUDAGraphMode.FULL: mixed_keys},
+        )
+
+        def add_cudagraph_key(mode, descriptor):
+            dispatcher.cudagraph_keys[mode].add(descriptor)
+
+        dispatcher.add_cudagraph_key = add_cudagraph_key
+        _register_gdn_spec_decode_full_graph_keys(
+            dispatcher,
+            cudagraph_mode=CUDAGraphMode.FULL,
+            uniform_decode_query_len=4,
+            max_num_reqs=8,
+        )
+
+        uniform_keys = {desc for desc in dispatcher.cudagraph_keys[CUDAGraphMode.FULL] if desc.uniform}
+        self.assertEqual(
+            uniform_keys,
+            {
+                BatchDescriptor(
+                    num_tokens=size,
+                    num_reqs=size // 4,
+                    uniform=True,
+                )
+                for size in (4, 8, 12, 16, 20, 24, 28, 32)
+            },
+        )
+
+    def test_dummy_query_boundaries_repeat_terminal_for_padded_rows(self):
+        for num_tokens, num_reqs, cumulative in (
+            (12, 2, [6, 12]),
+            (20, 4, [5, 10, 15, 20]),
+            (32, 6, [5, 10, 15, 20, 25, 32]),
+        ):
+            with self.subTest(num_tokens=num_tokens):
+                query_start_loc = np.full(9, -1, dtype=np.int32)
+                _set_dummy_query_start_loc(
+                    query_start_loc,
+                    np.asarray(cumulative, dtype=np.int32),
+                    num_reqs=num_reqs,
+                    num_reqs_padded=8,
+                )
+
+                self.assertEqual(query_start_loc[0], -1)
+                self.assertEqual(query_start_loc[1 : num_reqs + 1].tolist(), cumulative)
+                self.assertEqual(
+                    query_start_loc[num_reqs + 1 : 9].tolist(),
+                    [num_tokens] * (8 - num_reqs),
+                )
+
+    def test_padded_capability_without_multi_request_rejects_multi_request(self):
+        self.assertFalse(
+            self._compatible(
+                num_reqs=2,
+                min_num_scheduled_tokens=256,
+                max_num_scheduled_tokens=768,
+                graph_capability=(
+                    GDNPrefillGraphCapability.EXACT_SINGLE_REQUEST | GDNPrefillGraphCapability.PADDED_DYNAMIC_LENGTHS
+                ),
+            )
+        )
+
+    def test_mixed_decode_prefill_is_not_graph_safe(self):
+        self.assertFalse(
+            self._compatible(
+                num_reqs=2,
+                min_num_scheduled_tokens=1,
+                graph_capability=self._dynamic_capability,
+            )
+        )
+
+    def test_spec_decode_is_not_graph_safe(self):
+        self.assertFalse(
+            self._compatible(
+                num_tokens=4,
+                graph_num_tokens=4,
+                min_num_scheduled_tokens=4,
+                max_num_scheduled_tokens=4,
+                graph_capability=self._dynamic_capability,
+            )
+        )
+
+    @staticmethod
+    def _runtime_runner(computed_tokens: list[int]):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner._pad_for_sequence_parallelism = lambda value: value
+        runner.input_batch = SimpleNamespace(
+            num_computed_tokens_cpu=np.asarray(computed_tokens, dtype=np.int32),
+            lora_id_to_lora_request={},
+        )
+        runner.uniform_decode_query_len = 4
+        runner.decode_threshold = 4
+        runner.model_config = SimpleNamespace(is_encoder_decoder=False)
+        runner._has_gdn = True
+        runner.ascend_config = SimpleNamespace(gdn_prefill_backend="fla_npu")
+        runner.parallel_config = SimpleNamespace(data_parallel_size=1)
+        runner.scheduler_config = SimpleNamespace(max_num_seqs=8)
+        runner.vllm_config = SimpleNamespace(
+            parallel_config=runner.parallel_config,
+            observability_config=SimpleNamespace(cudagraph_metrics=False),
+        )
+
+        def dispatch(*, num_tokens, uniform_decode, invalid_modes=None, **_kwargs):
+            if invalid_modes and CUDAGraphMode.FULL in invalid_modes:
+                return CUDAGraphMode.NONE, BatchDescriptor(num_tokens)
+            return CUDAGraphMode.FULL, BatchDescriptor(
+                num_tokens=num_tokens,
+                num_reqs=1 if uniform_decode else None,
+                uniform=uniform_decode,
+            )
+
+        runner.cudagraph_dispatcher = SimpleNamespace(
+            dispatch=MagicMock(side_effect=dispatch),
+            cudagraph_keys={
+                CUDAGraphMode.FULL: {
+                    BatchDescriptor(
+                        num_tokens=4,
+                        num_reqs=1,
+                        uniform=True,
+                    )
+                }
+            },
+        )
+        return runner
+
+    @patch("vllm_ascend.worker.model_runner_v1.enable_sp", return_value=False)
+    def test_uniform_gdn_decode_keeps_full_graph(self, _mock_enable_sp):
+        runner = self._runtime_runner([64])
+        mode, descriptor, *_ = runner._determine_batch_execution_and_padding(
+            num_tokens=4,
+            num_reqs=1,
+            num_scheduled_tokens_np=np.asarray([4], dtype=np.int32),
+            max_num_scheduled_tokens=4,
+            use_cascade_attn=False,
+        )
+
+        self.assertEqual(mode, CUDAGraphMode.FULL)
+        self.assertTrue(descriptor.uniform)
+        self.assertEqual(runner.cudagraph_dispatcher.dispatch.call_count, 1)
+
+    @patch("vllm_ascend.worker.model_runner_v1.enable_sp", return_value=False)
+    def test_gdn_spec_decode_uses_uniform_graph_before_cpu_state_advances(
+        self,
+        _mock_enable_sp,
+    ):
+        runner = self._runtime_runner([0])
+        mode, descriptor, *_ = runner._determine_batch_execution_and_padding(
+            num_tokens=4,
+            num_reqs=1,
+            num_scheduled_tokens_np=np.asarray([4], dtype=np.int32),
+            max_num_scheduled_tokens=4,
+            use_cascade_attn=False,
+            use_spec_decode=True,
+        )
+
+        self.assertEqual(mode, CUDAGraphMode.FULL)
+        self.assertEqual(descriptor.num_reqs, 1)
+        self.assertTrue(descriptor.uniform)
+
+    @patch("vllm_ascend.worker.model_runner_v1.enable_sp", return_value=False)
+    def test_incompatible_gdn_prefill_still_disables_full_graph(self, _mock_enable_sp):
+        runner = self._runtime_runner([0, 0])
+        with patch(
+            "vllm_ascend.ops.gdn.AscendGatedDeltaNetAttention._fused_chunk_available",
+            False,
+        ):
+            mode, _, *_ = runner._determine_batch_execution_and_padding(
+                num_tokens=512,
+                num_reqs=2,
+                num_scheduled_tokens_np=np.asarray([256, 256], dtype=np.int32),
+                max_num_scheduled_tokens=256,
+                use_cascade_attn=False,
+            )
+
+        self.assertEqual(mode, CUDAGraphMode.NONE)
+        self.assertEqual(runner.cudagraph_dispatcher.dispatch.call_count, 2)
+
+    @patch("vllm_ascend.worker.model_runner_v1.enable_sp", return_value=False)
+    @patch(
+        "vllm_ascend.worker.model_runner_v1.get_pcp_group",
+        return_value=SimpleNamespace(world_size=1),
+    )
+    @patch(
+        "vllm_ascend.ops.gdn.AscendGatedDeltaNetAttention._probe_fused_chunk",
+        return_value=True,
+    )
+    def test_dynamic_native_capability_keeps_multi_request_full_graph(self, _mock_probe, _mock_pcp, _mock_enable_sp):
+        runner = self._runtime_runner([0, 0])
+        mode, _, *_ = runner._determine_batch_execution_and_padding(
+            num_tokens=512,
+            num_reqs=2,
+            num_scheduled_tokens_np=np.asarray([256, 256], dtype=np.int32),
+            max_num_scheduled_tokens=256,
+            use_cascade_attn=False,
+        )
+
+        self.assertEqual(mode, CUDAGraphMode.FULL)
+        self.assertEqual(runner.cudagraph_dispatcher.dispatch.call_count, 1)
+
+    def test_gdn_view_excludes_fia_virtual_padding_request(self):
+        @dataclass
+        class FakeCommonMetadata:
+            query_start_loc: torch.Tensor
+            query_start_loc_cpu: torch.Tensor
+            seq_lens: torch.Tensor
+            _seq_lens_cpu: torch.Tensor
+            seq_lens_cpu_upper_bound: torch.Tensor
+            seq_lens_cpu: torch.Tensor | None
+            num_computed_tokens_cpu: torch.Tensor | None
+            num_reqs: int
+            block_table_tensor: torch.Tensor
+            is_prefilling: torch.Tensor
+
+        for total, bucket in ((193, 256), (300, 512)):
+            with self.subTest(total=total, bucket=bucket):
+                per_req = [total // 4] * 4
+                per_req[-1] += total - sum(per_req)
+                real_qstart = torch.tensor([0, *np.cumsum(per_req)], dtype=torch.int32)
+                fia_qstart = torch.cat([real_qstart, torch.tensor([bucket], dtype=torch.int32)])
+                common = FakeCommonMetadata(
+                    query_start_loc=fia_qstart,
+                    query_start_loc_cpu=fia_qstart.cpu(),
+                    seq_lens=torch.arange(5, dtype=torch.int32),
+                    _seq_lens_cpu=torch.arange(5, dtype=torch.int32),
+                    seq_lens_cpu_upper_bound=torch.arange(5, dtype=torch.int32),
+                    seq_lens_cpu=torch.arange(5, dtype=torch.int32),
+                    num_computed_tokens_cpu=torch.arange(5, dtype=torch.int32),
+                    num_reqs=5,
+                    block_table_tensor=torch.arange(10, dtype=torch.int32).reshape(5, 2),
+                    is_prefilling=torch.ones(5, dtype=torch.bool),
+                )
+
+                gdn = _gdn_real_request_view(
+                    common,
+                    real_qstart,
+                    real_qstart.cpu(),
+                    num_reqs=4,
+                )
+
+                self.assertEqual(gdn.num_reqs, 4)
+                self.assertEqual(gdn.query_start_loc.tolist(), real_qstart.tolist())
+                self.assertEqual(gdn.query_start_loc[-1].item(), total)
+                self.assertEqual(gdn.block_table_tensor.shape[0], 4)
+                self.assertEqual(gdn.seq_lens.shape[0], 4)
+                self.assertEqual(gdn.is_prefilling.shape[0], 4)
+
+
+class TestGDNPrefillBackendSelection(unittest.TestCase):
+    def test_graph_capture_scope_is_lexical(self):
+        self.assertFalse(is_gdn_prefill_graph_capture_active())
+        with gdn_prefill_graph_capture_scope():
+            self.assertTrue(is_gdn_prefill_graph_capture_active())
+        self.assertFalse(is_gdn_prefill_graph_capture_active())
+
+    def test_runtime_mode_and_soc_select_typed_graph_backend(self):
+        cases = (
+            (CUDAGraphMode.NONE, False, True, None),
+            (CUDAGraphMode.PIECEWISE, False, True, "native"),
+            (CUDAGraphMode.FULL_DECODE_ONLY, False, True, "native"),
+            (CUDAGraphMode.FULL, False, True, "native"),
+            (CUDAGraphMode.FULL, False, False, "native"),
+            (CUDAGraphMode.NONE, True, True, None),
+            (CUDAGraphMode.FULL_DECODE_ONLY, True, True, "fla_npu"),
+            (CUDAGraphMode.FULL, True, True, "fla_npu"),
+            (CUDAGraphMode.FULL, True, False, "native"),
+        )
+        for runtime_mode, is_ascend_950, metadata_immutable, expected in cases:
+            with self.subTest(
+                runtime_mode=runtime_mode,
+                is_ascend_950=is_ascend_950,
+                metadata_immutable=metadata_immutable,
+            ):
+                self.assertEqual(
+                    select_gdn_prefill_graph_backend(
+                        "fla_npu",
+                        runtime_mode=runtime_mode,
+                        is_ascend_950=is_ascend_950,
+                        metadata_immutable=metadata_immutable,
+                        native_dynamic_lengths_available=True,
+                    ),
+                    expected,
+                )
+
+        self.assertEqual(
+            select_gdn_prefill_graph_backend(
+                "fla_npu",
+                runtime_mode=CUDAGraphMode.NONE,
+                is_ascend_950=False,
+                metadata_immutable=False,
+                native_dynamic_lengths_available=True,
+                capture_enabled=True,
+            ),
+            "native",
+        )
+
+    def test_exact_capture_contract_is_derived_from_batch_shape(self):
+        self.assertTrue(
+            is_exact_gdn_prefill_graph_contract(
+                num_reqs=1,
+                num_actual_tokens=1024,
+                graph_num_tokens=1024,
+                min_num_scheduled_tokens=1024,
+                max_num_scheduled_tokens=1024,
+            )
+        )
+        self.assertFalse(
+            is_exact_gdn_prefill_graph_contract(
+                num_reqs=2,
+                num_actual_tokens=1024,
+                graph_num_tokens=1024,
+                min_num_scheduled_tokens=512,
+                max_num_scheduled_tokens=512,
+            )
+        )
+        self.assertFalse(
+            is_exact_gdn_prefill_graph_contract(
+                num_reqs=1,
+                num_actual_tokens=800,
+                graph_num_tokens=1024,
+                min_num_scheduled_tokens=800,
+                max_num_scheduled_tokens=800,
+            )
+        )
+
+    def test_fla_eager_remains_fla_on_a5(self):
+        self.assertEqual(
+            select_gdn_prefill_implementation(
+                "fla_npu",
+                is_graph_capture=False,
+                graph_metadata_is_exact=False,
+                native_dynamic_lengths_available=True,
+                fla_runtime_supported=True,
+            ),
+            "fla_npu",
+        )
+
+    def test_fla_all_modes_use_native_on_a3(self):
+        for is_graph_capture in (False, True):
+            with self.subTest(is_graph_capture=is_graph_capture):
+                self.assertEqual(
+                    select_gdn_prefill_implementation(
+                        "fla_npu",
+                        is_graph_capture=is_graph_capture,
+                        graph_metadata_is_exact=True,
+                        native_dynamic_lengths_available=True,
+                        fla_runtime_supported=False,
+                        fla_graph_capture_supported=False,
+                    ),
+                    "native",
+                )
+
+    def test_fla_all_modes_use_triton_on_a3_without_native(self):
+        for is_graph_capture in (False, True):
+            with self.subTest(is_graph_capture=is_graph_capture):
+                self.assertEqual(
+                    select_gdn_prefill_implementation(
+                        "fla_npu",
+                        is_graph_capture=is_graph_capture,
+                        graph_metadata_is_exact=True,
+                        native_dynamic_lengths_available=False,
+                        fla_runtime_supported=False,
+                        fla_graph_capture_supported=False,
+                    ),
+                    "triton",
+                )
+
+    def test_exact_fla_graph_remains_fla(self):
+        self.assertEqual(
+            select_gdn_prefill_implementation(
+                "fla_npu",
+                is_graph_capture=True,
+                graph_metadata_is_exact=True,
+                native_dynamic_lengths_available=True,
+            ),
+            "fla_npu",
+        )
+
+    def test_exact_fla_graph_on_non_950_uses_native(self):
+        self.assertEqual(
+            select_gdn_prefill_implementation(
+                "fla_npu",
+                is_graph_capture=True,
+                graph_metadata_is_exact=True,
+                native_dynamic_lengths_available=True,
+                fla_graph_capture_supported=False,
+            ),
+            "native",
+        )
+
+    def test_non_950_without_native_has_no_graph_capability(self):
+        capability = get_gdn_prefill_graph_capability(
+            "fla_npu",
+            native_dynamic_lengths_available=False,
+            capture_metadata_is_exact=True,
+            fla_graph_capture_supported=False,
+        )
+        self.assertEqual(capability, GDNPrefillGraphCapability(0))
+        self.assertEqual(
+            select_gdn_prefill_implementation(
+                "fla_npu",
+                is_graph_capture=True,
+                graph_metadata_is_exact=True,
+                native_dynamic_lengths_available=False,
+                fla_graph_capture_supported=False,
+            ),
+            "triton",
+        )
+
+    def test_padded_fla_graph_uses_native_dynamic_lengths(self):
+        self.assertEqual(
+            select_gdn_prefill_implementation(
+                "fla_npu",
+                is_graph_capture=True,
+                graph_metadata_is_exact=False,
+                native_dynamic_lengths_available=True,
+            ),
+            "native",
+        )
+
+    def test_dynamic_fla_graph_without_native_is_not_replay_eligible(self):
+        capability = get_gdn_prefill_graph_capability(
+            "fla_npu",
+            native_dynamic_lengths_available=False,
+        )
+        self.assertEqual(capability, GDNPrefillGraphCapability(0))
+        self.assertEqual(
+            select_gdn_prefill_implementation(
+                "fla_npu",
+                is_graph_capture=True,
+                graph_metadata_is_exact=False,
+                native_dynamic_lengths_available=False,
+            ),
+            "triton",
+        )
+
+    def test_exact_fla_capture_without_native_is_replay_eligible(self):
+        capability = get_gdn_prefill_graph_capability(
+            "fla_npu",
+            native_dynamic_lengths_available=False,
+            capture_metadata_is_exact=True,
+        )
+        self.assertEqual(
+            capability,
+            GDNPrefillGraphCapability.EXACT_SINGLE_REQUEST,
+        )
 
 
 class TestDummyRunSlotInvalidation(unittest.TestCase):

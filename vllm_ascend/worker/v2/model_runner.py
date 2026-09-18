@@ -42,6 +42,7 @@ from vllm.v1.worker.gpu.model_runner import (
     ExecuteModelState,
     GPUModelRunner,
 )
+from vllm.v1.worker.utils import copy_kv_cache_blocks_inplace
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import (
@@ -73,7 +74,6 @@ from vllm_ascend.worker.v2.spec_decode import init_speculator
 from vllm_ascend.worker.v2.spec_decode.eagle.speculator import AscendEagleSpeculator
 from vllm_ascend.worker.v2.states import AscendRequestState
 from vllm_ascend.worker.v2.utils import torch_cuda_wrapper
-
 
 class NPUModelRunner(GPUModelRunner):
     """Model runner for Ascend NPUs."""
@@ -190,6 +190,41 @@ class NPUModelRunner(GPUModelRunner):
     @property
     def pcp_manager_cls(self) -> type[AscendPCPManager]:
         return AscendPCPManager
+
+    def _copy_kv_cache_blocks_by_layer_views(self, block_copies: list) -> None:
+        """Copy promoted blocks after flattening hybrid per-layer views.
+
+        Hybrid Mamba layers expose ``(conv_state, temporal_state)`` tuples in
+        ``self.kv_caches``, while the upstream copier accepts a flat iterable
+        of tensors. Flatten only that container boundary, then retain the
+        upstream copier's scheduler-block interpretation. In particular, one
+        scheduler block can span multiple rows of a backend view; indexing the
+        view directly by scheduler block id would copy only its first row.
+        """
+        cache_views: list[torch.Tensor] = []
+        for layer_cache in self.kv_caches:
+            tensors = (
+                layer_cache
+                if isinstance(layer_cache, (list, tuple))
+                else (layer_cache,)
+            )
+            for cache_tensor in tensors:
+                if isinstance(cache_tensor, torch.Tensor) and cache_tensor.dim() > 0:
+                    cache_views.append(cache_tensor)
+        copy_kv_cache_blocks_inplace(
+            cache_views,
+            self.kv_cache_config.num_blocks,
+            block_copies,
+        )
+
+    def update_requests(self, scheduler_output: SchedulerOutput) -> None:
+        block_copies = scheduler_output.kv_cache_block_copies
+        if block_copies:
+            # Consume the copies here so the upstream Tensor-only copier does
+            # not see tuple-valued Mamba caches.
+            scheduler_output.kv_cache_block_copies = None
+            self._copy_kv_cache_blocks_by_layer_views(block_copies)
+        super().update_requests(scheduler_output)
 
     def _restore_replicated_draft_target_states(self) -> None:
         """Restore target states consumed by a replicated PCP draft."""

@@ -79,6 +79,59 @@ def test_execute_model_disables_profiling_timer_and_clears_stale_time():
     mock_perf_counter.assert_not_called()
 
 
+def test_copy_kv_cache_blocks_supports_tensor_and_mamba_tuple_views():
+    runner = NPUModelRunner.__new__(NPUModelRunner)
+    runner.device = torch.device("cpu")
+    runner.kv_cache_config = SimpleNamespace(num_blocks=2)
+    attention = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+    conv_state = torch.arange(8, dtype=torch.bfloat16).reshape(4, 2)
+    temporal_state = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+    scalar_metadata = torch.tensor(7)
+    runner.kv_caches = [
+        attention,
+        (conv_state, temporal_state),
+        (None, scalar_metadata),
+    ]
+    originals = [tensor.clone() for tensor in (attention, conv_state, temporal_state)]
+
+    runner._copy_kv_cache_blocks_by_layer_views([(0, 1)])
+
+    for tensor, original in zip(
+        (attention, conv_state, temporal_state), originals
+    ):
+        # Each scheduler block owns two rows in these backend views. The copy
+        # must preserve the whole virtual split, not just row 0 -> row 1.
+        torch.testing.assert_close(tensor[2:4], original[0:2])
+    assert scalar_metadata.item() == 7
+
+
+def test_update_requests_consumes_block_copies_before_upstream_tuple_copy():
+    runner = NPUModelRunner.__new__(NPUModelRunner)
+    runner._copy_kv_cache_blocks_by_layer_views = Mock()
+    scheduler_output = SimpleNamespace(kv_cache_block_copies=[(2, 14)])
+
+    with patch.object(GPUModelRunner, "update_requests") as parent_update:
+        runner.update_requests(scheduler_output)
+
+    runner._copy_kv_cache_blocks_by_layer_views.assert_called_once_with(
+        [(2, 14)]
+    )
+    assert scheduler_output.kv_cache_block_copies is None
+    parent_update.assert_called_once_with(scheduler_output)
+
+
+def test_update_requests_delegates_without_block_copies():
+    runner = NPUModelRunner.__new__(NPUModelRunner)
+    runner._copy_kv_cache_blocks_by_layer_views = Mock()
+    scheduler_output = SimpleNamespace(kv_cache_block_copies=None)
+
+    with patch.object(GPUModelRunner, "update_requests") as parent_update:
+        runner.update_requests(scheduler_output)
+
+    runner._copy_kv_cache_blocks_by_layer_views.assert_not_called()
+    parent_update.assert_called_once_with(scheduler_output)
+
+
 def test_full_decode_only_keeps_graph_descriptor_request_count():
     runner = _make_runner()
     runner.compilation_config = SimpleNamespace(cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY)

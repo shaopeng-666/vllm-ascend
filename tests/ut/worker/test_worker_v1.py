@@ -1908,6 +1908,35 @@ class TestNPUWorker(TestBase):
 
             # Verify calls
             worker.model_runner.initialize_kv_cache.assert_called_once_with(mock_kv_cache_config)
+            worker.model_runner._init_kv_zero_meta.assert_not_called()
+
+    def test_mrv1_update_states_consumes_new_block_ids_to_zero(self):
+        """The MRV1 execute path must consume scheduler block-zero requests."""
+        from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.requests = {}
+        runner.num_prompt_logprobs = {}
+        runner.late_interaction_runner = MagicMock()
+        runner.input_batch = MagicMock()
+        runner.use_async_scheduling = False
+        runner._apply_pp_sampled_tokens_from_scheduler_output = MagicMock()
+        runner._track_tmp_encoder_cache_refs = MagicMock()
+        runner._zero_block_ids = MagicMock()
+        stop_after_zeroing = RuntimeError("stop after zeroing")
+        runner._process_encoder_cache_scheduler_output = MagicMock(
+            side_effect=stop_after_zeroing
+        )
+
+        scheduler_output = MagicMock()
+        scheduler_output.finished_req_ids = []
+        scheduler_output.new_block_ids_to_zero = [4]
+        scheduler_output.kv_cache_block_copies = None
+
+        with self.assertRaisesRegex(RuntimeError, "stop after zeroing"):
+            runner._update_states(scheduler_output)
+
+        runner._zero_block_ids.assert_called_once_with([4])
 
     @patch("vllm_ascend.worker.worker.ensure_kv_transfer_initialized")
     def test_initialize_from_config_initializes_kv_block_zeroer_for_mrv2_mamba(self, mock_ensure_kv_transfer):
@@ -1954,8 +1983,32 @@ class TestNPUWorker(TestBase):
             worker.model_runner._init_kv_zero_meta.assert_called_once_with()
 
     @patch("vllm_ascend.worker.worker.ensure_kv_transfer_initialized")
-    def test_initialize_from_config_skips_mrv1_zeroer_for_mixed_precision_only(self, mock_ensure_kv_transfer):
-        """MRV1 mixed-precision attention must not enter the Mamba zeroer."""
+    def test_initialize_from_config_initializes_kv_block_zeroer_for_mrv1_mamba_without_spec_decode(
+        self, mock_ensure_kv_transfer
+    ):
+        """MRV1 consumes scheduler block-zero requests without spec decode."""
+        from vllm_ascend.worker.worker import NPUWorker
+
+        with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
+            worker = NPUWorker()
+            worker.model_runner = MagicMock()
+            worker.vllm_config = MagicMock()
+            worker.vllm_config.speculative_config = None
+            worker.vllm_config.model_config.enable_sleep_mode = False
+            worker.use_v2_model_runner = False
+
+            mock_kv_cache_config = MagicMock()
+            mock_kv_cache_config.needs_kv_cache_zeroing = True
+            mock_kv_cache_config.has_mamba_layers = True
+
+            worker.initialize_from_config(mock_kv_cache_config)
+
+            worker.model_runner.initialize_kv_cache.assert_called_once_with(mock_kv_cache_config)
+            worker.model_runner._init_kv_zero_meta.assert_called_once_with()
+
+    @patch("vllm_ascend.worker.worker.ensure_kv_transfer_initialized")
+    def test_initialize_from_config_initializes_mrv1_zeroer_for_mixed_precision_only(self, mock_ensure_kv_transfer):
+        """MRV1 follows the scheduler zeroing contract for mixed precision."""
         from vllm_ascend.worker.worker import NPUWorker
 
         with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
@@ -1974,7 +2027,7 @@ class TestNPUWorker(TestBase):
             worker.initialize_from_config(mock_kv_cache_config)
 
             worker.model_runner.initialize_kv_cache.assert_called_once_with(mock_kv_cache_config)
-            worker.model_runner._init_kv_zero_meta.assert_not_called()
+            worker.model_runner._init_kv_zero_meta.assert_called_once_with()
 
     @patch("vllm_ascend.worker.worker.get_ascend_config")
     @patch("vllm_ascend.worker.worker.enable_sp", return_value=False)

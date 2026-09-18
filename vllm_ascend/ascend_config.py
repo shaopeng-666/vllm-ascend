@@ -253,6 +253,7 @@ class AscendConfig:
             "enable_cpu_binding": true,
             "multistream_dsv4_dsa_overlap": true,
             "enable_prefill_mc2": false,
+            "gdn_prefill_backend": "auto",
             "multistream_overlap_shared_expert": false,
             "enable_kv_nz": false,
             "enable_mc2_hierarchy_comm": false,
@@ -260,6 +261,7 @@ class AscendConfig:
             "enable_dsa_cp": false,
             "enable_force_eplb": false,
             "enable_pcp_o_proj_weight_sharding": false,
+            "prefix_cache_use_scheduler_block_size": false,
             "draft_window_size": null,
             "mix_placement": false,
             "pa_shape_list": [],
@@ -387,6 +389,7 @@ class AscendConfig:
     enable_cpu_binding: bool = True
     multistream_dsv4_dsa_overlap: bool = True
     enable_prefill_mc2: bool = False
+    gdn_prefill_backend: Literal["auto", "native", "fla_npu"] = "auto"
     multistream_overlap_shared_expert: bool = False
     enable_kv_nz: bool = False
     enable_mc2_hierarchy_comm: bool = False  # deprecated, will be replaced by mc2_comm_alg = "hierarchy"
@@ -394,6 +397,9 @@ class AscendConfig:
     enable_dsa_cp: bool = False
     enable_force_eplb: bool = False
     enable_pcp_o_proj_weight_sharding: bool = False
+    # Keep physical/hash blocks unchanged, but restrict hybrid prefix-cache
+    # reuse to scheduler-block boundaries.
+    prefix_cache_use_scheduler_block_size: bool = False
     draft_window_size: int | None = None
     mix_placement: bool = False
     # When non-zero, force the MC2 combine stage's comm quant_mode to this
@@ -458,9 +464,20 @@ class AscendConfig:
     _sparse_li_c8_layer_names: set[str] = dataclasses.field(default_factory=set, init=False, repr=False)
     _sparse_li_c8_layer_filter_enabled: bool = dataclasses.field(default=False, init=False, repr=False)
     _c8_reshape_optim_enabled: bool = dataclasses.field(default=False, init=False, repr=False)
+    gdn_prefill_op: Any = dataclasses.field(default=None, init=False, repr=False)
 
     @model_validator(mode="after")
     def _validate_user_input_ranges(self):
+        if self.gdn_prefill_backend == "fla_npu":
+            try:
+                from fla_npu.ops.ascendc import chunk_gated_delta_rule_fwd
+            except ImportError as exc:
+                raise RuntimeError(
+                    "gdn_prefill_backend='fla_npu' requires a current "
+                    "flash-linear-attention-npu wheel providing "
+                    "fla_npu.ops.ascendc.chunk_gated_delta_rule_fwd."
+                ) from exc
+            self.gdn_prefill_op = chunk_gated_delta_rule_fwd
         if self.weight_nz_mode not in (0, 1, 2):
             raise ValueError(f"weight_nz_mode must be one of 0, 1, or 2; got {self.weight_nz_mode}")
         # TODO(zzzzwwjj): remove it after deprecating `enable_mc2_hierarchy_comm`.

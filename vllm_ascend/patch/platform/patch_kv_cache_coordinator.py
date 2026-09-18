@@ -7,6 +7,7 @@ from math import lcm
 import vllm
 import vllm.envs as envs_vllm
 import vllm.v1.core.kv_cache_coordinator as vllm_kv_cache_coordinator
+from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_coordinator import (
@@ -31,7 +32,11 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
 )
 
+from vllm_ascend.ascend_config import get_ascend_config
+
 USE_MULTI_GROUPS_KV_CACHE = True
+
+logger = init_logger(__name__)
 
 _orig_get_kv_cache_coordinator = vllm.v1.core.kv_cache_coordinator.get_kv_cache_coordinator
 
@@ -43,6 +48,25 @@ def _select_kv_token_budget(
 ) -> int:
     token_budget = max_in_flight_tokens
     return token_budget if token_budget is not None else max_model_len
+
+
+def _get_eagle_probe_max_length(
+    candidate_length: int,
+    eagle_margin: int,
+    block_hashes: list[BlockHash],
+    hash_block_size: int,
+) -> int:
+    """Allow EAGLE to verify one cached unit beyond the reusable prefix.
+
+    ``candidate_length`` is capped at prompt length minus one because the
+    target must recompute the last token. EAGLE must first verify the following
+    cached unit and then drop it. The block-hash coverage is a safe upper bound:
+    the extra unit is evidence only and is never returned as reusable work.
+    """
+    return min(
+        candidate_length + eagle_margin,
+        len(block_hashes) * hash_block_size,
+    )
 
 
 def _is_deepseek_v4_kv_cache_spec(kv_cache_spec: KVCacheSpec) -> bool:
@@ -90,6 +114,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         max_num_batched_tokens: int | None = None,
         scheduler_block_size: int | None = None,
         num_prefill_lookahead: int = 0,
+        prefix_cache_use_scheduler_block_size: bool = False,
     ):
         # Keep pcp_world_size in this patched constructor for compatibility
         # with the upstream coordinator interface. PCP is rejected by the platform.
@@ -166,12 +191,22 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                 for g in kv_cache_config.kv_cache_groups
                 if getattr(g.kv_cache_spec, "participates_in_prefix_caching", True)
             ), "block_size must be divisible by hash_block_size"
-        self.enable_partial_hash_hits = dcp_world_size == 1 and any(
-            isinstance(g.kv_cache_spec, MambaSpec)
-            and g.kv_cache_spec.mamba_cache_mode == "align"
-            and g.kv_cache_spec.block_size > hash_block_size
-            for g in kv_cache_config.kv_cache_groups
+        self.enable_partial_hash_hits = (
+            not prefix_cache_use_scheduler_block_size
+            and dcp_world_size == 1
+            and any(
+                isinstance(g.kv_cache_spec, MambaSpec)
+                and g.kv_cache_spec.mamba_cache_mode == "align"
+                and g.kv_cache_spec.block_size > hash_block_size
+                for g in kv_cache_config.kv_cache_groups
+            )
         )
+        if prefix_cache_use_scheduler_block_size:
+            logger.info(
+                "Prefix-cache hits use scheduler block alignment (%s tokens); hash block size remains %s tokens.",
+                scheduler_block_size,
+                hash_block_size,
+            )
         self.verify_and_split_kv_cache_groups()
 
         # Align the WRITE-path mask granularity (reachable_block_mask) with the
@@ -341,7 +376,12 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                         and group_block_size > self.hash_block_size
                         else group_block_size
                     )
-                    _max_length = min(curr_hit_length + eagle_margin, max_cache_hit_length)
+                    _max_length = _get_eagle_probe_max_length(
+                        curr_hit_length,
+                        eagle_margin,
+                        block_hashes,
+                        self.hash_block_size,
+                    )
                 hit_result = manager_cls.find_longest_cache_hit(
                     block_hashes=_get_block_hashes(spec),
                     max_length=_max_length,
@@ -413,6 +453,11 @@ def get_kv_cache_coordinator(  # type: ignore[misc]
     del pcp_world_size
     token_budget = _select_kv_token_budget(max_model_len, max_in_flight_tokens, max_num_batched_tokens)
     if _is_deepseek_v4_kv_cache_config(kv_cache_config):
+        prefix_cache_use_scheduler_block_size = get_ascend_config().prefix_cache_use_scheduler_block_size
+        logger.info(
+            "Effective prefix_cache_use_scheduler_block_size=%s in KV coordinator",
+            prefix_cache_use_scheduler_block_size,
+        )
         return AscendHybridKVCacheCoordinator(  # type: ignore[call-arg]
             kv_cache_config,
             max_model_len,
@@ -428,6 +473,7 @@ def get_kv_cache_coordinator(  # type: ignore[misc]
             max_num_batched_tokens=token_budget,
             scheduler_block_size=scheduler_block_size,
             num_prefill_lookahead=num_prefill_lookahead,
+            prefix_cache_use_scheduler_block_size=prefix_cache_use_scheduler_block_size,
         )
 
     if len(kv_cache_config.kv_cache_groups) == 1 or not enable_caching:
@@ -447,6 +493,11 @@ def get_kv_cache_coordinator(  # type: ignore[misc]
         orig_kwargs["num_prefill_lookahead"] = num_prefill_lookahead
         return _orig_get_kv_cache_coordinator(**orig_kwargs)
 
+    prefix_cache_use_scheduler_block_size = get_ascend_config().prefix_cache_use_scheduler_block_size
+    logger.info(
+        "Effective prefix_cache_use_scheduler_block_size=%s in KV coordinator",
+        prefix_cache_use_scheduler_block_size,
+    )
     return AscendHybridKVCacheCoordinator(  # type: ignore[call-arg]
         kv_cache_config,
         max_model_len,
@@ -462,6 +513,7 @@ def get_kv_cache_coordinator(  # type: ignore[misc]
         max_num_batched_tokens=token_budget,
         scheduler_block_size=scheduler_block_size,
         num_prefill_lookahead=num_prefill_lookahead,
+        prefix_cache_use_scheduler_block_size=prefix_cache_use_scheduler_block_size,
     )
 
 

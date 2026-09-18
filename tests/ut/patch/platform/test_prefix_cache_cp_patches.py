@@ -36,10 +36,12 @@ from vllm_ascend.core.kv_cache_interface import (
 )
 from vllm_ascend.patch.platform.patch_kv_cache_coordinator import (
     AscendHybridKVCacheCoordinator,
+    _get_eagle_probe_max_length,
     _is_deepseek_v4_kv_cache_spec,
     get_kv_cache_coordinator,
 )
 from vllm_ascend.patch.platform.patch_kv_cache_utils import (
+    _ascend_annotate_eagle_groups,
     _ascend_resolve_kv_cache_block_sizes,
     _get_kimi_k3_dspark_mixed_kv_cache_groups,
     _get_kv_cache_config_deepseek_v4,
@@ -89,6 +91,58 @@ def _make_hybrid_kv_cache_config(
             KVCacheGroupSpec(layer_names=["mamba"], kv_cache_spec=mamba_spec),
         ],
     )
+
+
+def test_qwen35_mtp_marks_only_full_attention_draft_group() -> None:
+    target_full_spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=8,
+        head_size=64,
+        dtype=torch.bfloat16,
+    )
+    draft_full_spec = replace(target_full_spec)
+    object.__setattr__(
+        draft_full_spec,
+        "_vllm_ascend_is_draft_cache_layer",
+        True,
+    )
+    mamba_specs = [
+        MambaSpec(
+            block_size=16,
+            shapes=((1,),),
+            dtypes=(torch.float32,),
+            mamba_cache_mode="align",
+        )
+        for _ in range(3)
+    ]
+    groups = [
+        KVCacheGroupSpec(
+            layer_names=["model.layers.0.self_attn.attn", "mtp.layers.0.self_attn.attn"],
+            kv_cache_spec=target_full_spec,
+        ),
+        *[
+            KVCacheGroupSpec(
+                layer_names=[f"model.layers.{idx}.linear_attn"],
+                kv_cache_spec=spec,
+            )
+            for idx, spec in enumerate(mamba_specs, start=1)
+        ],
+    ]
+    vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(use_eagle=lambda: True),
+        # EngineCore does not own the workers' static forward-context modules.
+        compilation_config=SimpleNamespace(static_forward_context={}),
+    )
+    specs = {
+        "model.layers.0.self_attn.attn": target_full_spec,
+        "mtp.layers.0.self_attn.attn": draft_full_spec,
+        **{group.layer_names[0]: group.kv_cache_spec for group in groups[1:]},
+    }
+
+    _ascend_annotate_eagle_groups(vllm_config, specs, groups)
+
+    assert groups[0].is_eagle_group
+    assert all(not group.is_eagle_group for group in groups[1:])
 
 
 def _make_kimi_k3_dspark_kv_cache_specs(
@@ -287,6 +341,133 @@ def test_resolve_kv_cache_block_sizes_with_cp_hybrid_groups(
     expected_scheduler_block_size = math.lcm(16, 32) * 2
     assert scheduler_block_size == expected_scheduler_block_size
     assert hash_block_size == expected_hash_block_size
+
+
+def test_cp_hybrid_groups_honor_prefix_match_unit() -> None:
+    """The Ascend CP override must not discard vLLM's public CLI setting."""
+    kv_cache_config = _make_hybrid_kv_cache_config(
+        full_block_size=16,
+        mamba_block_size=32,
+    )
+    vllm_config = _make_vllm_config(
+        enable_prefix_caching=True,
+        dcp=2,
+        prefix_match_unit=8,
+    )
+
+    scheduler_block_size, hash_block_size = _ascend_resolve_kv_cache_block_sizes(
+        kv_cache_config,
+        vllm_config,
+    )
+
+    assert scheduler_block_size == 64
+    assert hash_block_size == 8
+
+
+def test_cp_hybrid_groups_reject_incompatible_prefix_match_unit() -> None:
+    kv_cache_config = _make_hybrid_kv_cache_config(
+        full_block_size=16,
+        mamba_block_size=32,
+    )
+    vllm_config = _make_vllm_config(
+        enable_prefix_caching=True,
+        dcp=2,
+        prefix_match_unit=24,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"Invalid prefix_match_unit=24; all KV cache group block sizes "
+            r"must be divisible by prefix_match_unit"
+        ),
+    ):
+        _ascend_resolve_kv_cache_block_sizes(
+            kv_cache_config,
+            vllm_config,
+        )
+
+
+@pytest.mark.parametrize(
+    ("use_scheduler_alignment", "expected_partial_hits", "expected_alignment"),
+    [
+        pytest.param(False, True, 512, id="fine-grained-prefix-hits"),
+        pytest.param(True, False, 2048, id="scheduler-aligned-prefix-hits"),
+    ],
+)
+def test_hybrid_prefix_cache_can_use_scheduler_block_alignment(
+    use_scheduler_alignment: bool,
+    expected_partial_hits: bool,
+    expected_alignment: int,
+) -> None:
+    full_block_size = 512
+    scheduler_block_size = 2048
+    full_spec = FullAttentionSpec(
+        block_size=full_block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+    )
+    mamba_spec = MambaSpec(
+        block_size=scheduler_block_size,
+        shapes=((1,),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+    )
+    coordinator = AscendHybridKVCacheCoordinator(
+        kv_cache_config=KVCacheConfig(
+            num_blocks=16,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(["full"], full_spec),
+                KVCacheGroupSpec(["mamba"], mamba_spec),
+            ],
+        ),
+        max_model_len=8192,
+        use_eagle=False,
+        enable_caching=True,
+        enable_kv_cache_events=False,
+        dcp_world_size=1,
+        pcp_world_size=1,
+        hash_block_size=full_block_size,
+        scheduler_block_size=scheduler_block_size,
+        max_num_batched_tokens=8192,
+        prefix_cache_use_scheduler_block_size=use_scheduler_alignment,
+    )
+
+    assert coordinator.hash_block_size == full_block_size
+    assert coordinator.scheduler_block_size == scheduler_block_size
+    assert coordinator.enable_partial_hash_hits is expected_partial_hits
+    assert coordinator._cache_hit_alignment_tokens == expected_alignment
+    assert coordinator._align_cacheable(2560) == (scheduler_block_size if use_scheduler_alignment else 2560)
+
+
+def test_eagle_probe_can_verify_exact_prompt_boundary_before_drop() -> None:
+    block_hashes = [MagicMock(), MagicMock()]
+
+    assert (
+        _get_eagle_probe_max_length(
+            candidate_length=4095,
+            eagle_margin=2048,
+            block_hashes=block_hashes,
+            hash_block_size=2048,
+        )
+        == 4096
+    )
+
+
+def test_eagle_probe_never_exceeds_available_hash_coverage() -> None:
+    block_hashes = [MagicMock()]
+
+    assert (
+        _get_eagle_probe_max_length(
+            candidate_length=2048,
+            eagle_margin=2048,
+            block_hashes=block_hashes,
+            hash_block_size=2048,
+        )
+        == 2048
+    )
 
 
 @pytest.mark.parametrize(
@@ -861,14 +1042,17 @@ def test_get_kv_cache_coordinator_delegates_hybrid_without_caching(monkeypatch) 
     assert coordinator is sentinel
 
 
-def test_get_kv_cache_coordinator_uses_ascend_for_deepseek_v4(monkeypatch) -> None:
+@pytest.mark.parametrize("use_scheduler_block_size", [False, True])
+def test_get_kv_cache_coordinator_uses_ascend_for_deepseek_v4(monkeypatch, use_scheduler_block_size: bool) -> None:
     sentinel = object()
     kv_cache_config = _make_deepseek_v4_kv_cache_config()
+    coordinator_kwargs = {}
 
     def _fake_orig(*args, **kwargs):
         raise AssertionError("DeepSeek V4 should use AscendHybridKVCacheCoordinator")
 
     def _fake_ascend_coordinator(*args, **kwargs):
+        coordinator_kwargs.update(kwargs)
         return sentinel
 
     monkeypatch.setattr(
@@ -878,6 +1062,10 @@ def test_get_kv_cache_coordinator_uses_ascend_for_deepseek_v4(monkeypatch) -> No
     monkeypatch.setattr(
         "vllm_ascend.patch.platform.patch_kv_cache_coordinator.AscendHybridKVCacheCoordinator",
         _fake_ascend_coordinator,
+    )
+    monkeypatch.setattr(
+        "vllm_ascend.patch.platform.patch_kv_cache_coordinator.get_ascend_config",
+        lambda: SimpleNamespace(prefix_cache_use_scheduler_block_size=use_scheduler_block_size),
     )
 
     coordinator = get_kv_cache_coordinator(
@@ -893,6 +1081,7 @@ def test_get_kv_cache_coordinator_uses_ascend_for_deepseek_v4(monkeypatch) -> No
     )
 
     assert coordinator is sentinel
+    assert coordinator_kwargs["prefix_cache_use_scheduler_block_size"] is use_scheduler_block_size
 
 
 class _FakeEagleManager:

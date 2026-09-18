@@ -40,6 +40,7 @@ from vllm.compilation import breakable_cudagraph
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
 from vllm.distributed import (
+    get_pcp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
@@ -154,6 +155,7 @@ from vllm_ascend.compilation.acl_graph import (
     update_full_graph_params,
 )
 from vllm_ascend.compilation.breakable_aclgraph import BreakableACLGraphWrapper
+from vllm_ascend.device.device_config import is_950
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.device.mxfp_kv_cache import (
     MXFP8_GROUP_SIZE,
@@ -178,6 +180,13 @@ from vllm_ascend.eplb.core.eplb_worker import EplbProcess
 from vllm_ascend.eplb.eplb_updator import EplbUpdator
 from vllm_ascend.model_executor.offloader import create_offloader
 from vllm_ascend.ops.fused_moe.force_eplb import build_force_eplb_topk
+from vllm_ascend.ops.gdn_graph_capability import (
+    GDNPrefillGraphCapability,
+    gdn_prefill_graph_capture_scope,
+    get_gdn_prefill_graph_capability,
+    is_exact_gdn_prefill_graph_contract,
+    select_gdn_prefill_graph_backend,
+)
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.ops.triton.spec_decode.ngram import triton_ngram_spec_decode
 from vllm_ascend.quantization.utils import enable_fa_quant
@@ -332,6 +341,217 @@ def supports_shared_kv_backing_with_transfer(vllm_config: VllmConfig) -> bool:
     return (
         getattr(kv_transfer_config, "kv_connector", None)
         in _STANDARDIZED_SHARED_KV_BACKING_CONNECTORS
+    )
+
+
+def _is_gdn_prefill_graph_compatible(
+    *,
+    uniform_decode: bool,
+    num_reqs: int,
+    num_tokens: int,
+    graph_num_reqs: int,
+    graph_num_tokens: int,
+    min_num_scheduled_tokens: int,
+    max_num_scheduled_tokens: int,
+    decode_threshold: int,
+    graph_capability: GDNPrefillGraphCapability,
+) -> bool:
+    """Whether a runtime batch matches a graph-safe GDN prefill contract.
+
+    Host-metadata implementations keep the exact-singleton contract. A backend
+    advertising device-side dynamic lengths can replay a padded token bucket;
+    multi-request replay additionally requires the explicit multi-request bit.
+    A padded replay must retain one dummy request row for the native operator's
+    padding segment, while an exact-token replay may occupy every captured row.
+    """
+    is_prefill_only = (
+        not uniform_decode
+        and num_reqs > 0
+        and min_num_scheduled_tokens > decode_threshold
+        and max_num_scheduled_tokens > decode_threshold
+    )
+    exact_single = (
+        num_reqs == 1
+        and graph_num_tokens == num_tokens
+        and bool(graph_capability & GDNPrefillGraphCapability.EXACT_SINGLE_REQUEST)
+    )
+    padded_dynamic = (
+        graph_num_tokens >= num_tokens
+        and (graph_num_tokens == num_tokens or num_reqs < graph_num_reqs)
+        and bool(
+            graph_capability & GDNPrefillGraphCapability.PADDED_DYNAMIC_LENGTHS
+        )
+        and (
+            num_reqs == 1
+            or bool(graph_capability & GDNPrefillGraphCapability.MULTI_REQUEST)
+        )
+    )
+    return is_prefill_only and (exact_single or padded_dynamic)
+
+
+def _get_gdn_prefill_capture_num_reqs(
+    *,
+    num_tokens: int,
+    max_num_reqs: int,
+    decode_threshold: int,
+) -> int:
+    """Return the largest request count that is still a pure prefill.
+
+    FULL graph capture normally spreads a token bucket over ``max_num_reqs``.
+    With speculative decoding that can manufacture a mixed dummy batch, for
+    example 12 tokens become ``[1] * 7 + [5]`` when MTP=3.  Such a dummy does
+    not represent any batch that GDN prefill dispatch is allowed to replay:
+    runtime FULL dispatch requires every real request to exceed the decode/spec
+    threshold.  Capture the maximum replayable pure-prefill row capacity
+    instead.  Small decode/spec-only buckets keep the generic dummy layout.
+    """
+    if num_tokens <= decode_threshold:
+        return min(num_tokens, max_num_reqs)
+    min_prefill_tokens = decode_threshold + 1
+    return min(max_num_reqs, num_tokens // min_prefill_tokens)
+
+
+def _get_gdn_uniform_spec_graph_descriptor(
+    mixed_descriptor: BatchDescriptor,
+    *,
+    uniform_decode_query_len: int,
+    max_num_reqs: int,
+) -> BatchDescriptor | None:
+    """Return a distinct FULL-graph key for uniform speculative decode.
+
+    ``CUDAGraphMode.FULL`` normally normalizes uniform and non-uniform batches
+    onto the same descriptor. That is not valid for GDN: graph capture fixes
+    the Python branch in ``_forward_core``, so a ``4 x 1`` ordinary-decode
+    capture cannot replay a ``1 x 4`` MTP verification batch. Keep the mixed
+    descriptor for ordinary decode/prefill and add a uniform descriptor whose
+    request rows are derived from the speculative width.
+    """
+    num_tokens = mixed_descriptor.num_tokens
+    if (
+        uniform_decode_query_len <= 1
+        or num_tokens % uniform_decode_query_len != 0
+    ):
+        return None
+    num_reqs = min(num_tokens // uniform_decode_query_len, max_num_reqs)
+    if num_reqs <= 0:
+        return None
+    return replace(
+        mixed_descriptor,
+        num_reqs=num_reqs,
+        uniform=True,
+    )
+
+
+def _must_run_fused_mc2_spec_target_eager(
+    *,
+    use_spec_decode: bool,
+    cudagraph_mode: CUDAGraphMode,
+    enable_fused_mc2: int,
+) -> bool:
+    """Keep the fused-MC2 speculative target step out of FULL graph replay.
+
+    On A3 the fused MoE collective can leave asynchronous graph work pending
+    after the target verification graph returns, which then hangs at the
+    rejection sampler's first synchronization.  Communication-method mixing
+    inside the same graph pool is also unsafe, so retain fused MC2 and run only
+    this target step eagerly.  Prefill, ordinary decode, and the eager draft
+    model keep their existing execution paths.
+    """
+    return (
+        use_spec_decode
+        and cudagraph_mode == CUDAGraphMode.FULL
+        and enable_fused_mc2 == 1
+    )
+
+
+def _register_gdn_spec_decode_full_graph_keys(
+    cudagraph_dispatcher,
+    *,
+    cudagraph_mode: CUDAGraphMode,
+    uniform_decode_query_len: int,
+    max_num_reqs: int,
+) -> None:
+    """Add separate GDN speculative FULL graphs without changing vLLM modes."""
+    if (
+        uniform_decode_query_len <= 1
+        or not cudagraph_mode.has_mode(CUDAGraphMode.FULL)
+        or cudagraph_mode.separate_routine()
+    ):
+        return
+
+    mixed_keys = list(cudagraph_dispatcher.cudagraph_keys[CUDAGraphMode.FULL])
+    max_spec_tokens = uniform_decode_query_len * max_num_reqs
+    for mixed_descriptor in mixed_keys:
+        if mixed_descriptor.uniform or mixed_descriptor.num_tokens > max_spec_tokens:
+            continue
+        spec_descriptor = _get_gdn_uniform_spec_graph_descriptor(
+            mixed_descriptor,
+            uniform_decode_query_len=uniform_decode_query_len,
+            max_num_reqs=max_num_reqs,
+        )
+        if spec_descriptor is not None:
+            cudagraph_dispatcher.add_cudagraph_key(
+                CUDAGraphMode.FULL,
+                spec_descriptor,
+            )
+
+
+def _set_dummy_query_start_loc(
+    query_start_loc: np.ndarray,
+    cum_num_tokens: np.ndarray,
+    *,
+    num_reqs: int,
+    num_reqs_padded: int,
+) -> None:
+    """Write real dummy boundaries and repeat the terminal boundary for padding.
+
+    GDN FULL capture may deliberately use fewer real requests than the generic
+    graph descriptor's row capacity so every real row is a pure prefill.  The
+    extra descriptor rows are zero-length padding and therefore must repeat the
+    final cumulative token count rather than consuming entries that do not
+    exist in ``cum_num_tokens``.
+    """
+    assert cum_num_tokens.shape == (num_reqs,)
+    assert num_reqs <= num_reqs_padded
+    query_start_loc[1 : num_reqs + 1] = cum_num_tokens
+    if num_reqs < num_reqs_padded:
+        terminal = int(cum_num_tokens[-1]) if num_reqs else 0
+        query_start_loc[num_reqs + 1 : num_reqs_padded + 1] = terminal
+
+
+def _gdn_real_request_view(
+    common_attn_metadata: AscendCommonAttentionMetadata,
+    query_start_loc: torch.Tensor,
+    query_start_loc_cpu: torch.Tensor,
+    num_reqs: int,
+) -> AscendCommonAttentionMetadata:
+    """Remove FIA's virtual padding request from the GDN metadata view.
+
+    FULL-mode FIA may append one request whose only purpose is to cover the
+    physical token bucket. Stateful GDN/causal-conv metadata must keep one row
+    per real request; graph replay pads that real view to the captured row
+    capacity itself.
+    """
+
+    def _rows(value):
+        return None if value is None else value[:num_reqs]
+
+    return replace(
+        common_attn_metadata,
+        query_start_loc=query_start_loc[: num_reqs + 1],
+        query_start_loc_cpu=query_start_loc_cpu[: num_reqs + 1],
+        seq_lens=_rows(common_attn_metadata.seq_lens),
+        _seq_lens_cpu=_rows(common_attn_metadata._seq_lens_cpu),
+        seq_lens_cpu_upper_bound=_rows(
+            common_attn_metadata.seq_lens_cpu_upper_bound
+        ),
+        seq_lens_cpu=_rows(common_attn_metadata.seq_lens_cpu),
+        num_computed_tokens_cpu=_rows(
+            common_attn_metadata.num_computed_tokens_cpu
+        ),
+        num_reqs=num_reqs,
+        block_table_tensor=_rows(common_attn_metadata.block_table_tensor),
+        is_prefilling=_rows(common_attn_metadata.is_prefilling),
     )
 
 
@@ -2351,6 +2571,7 @@ class NPUModelRunner(GPUModelRunner):
                     use_cascade_attn=cascade_attn_prefix_lens is not None,
                     force_eager=self.model_config.enforce_eager,
                     num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
+                    use_spec_decode=spec_decode_metadata is not None,
                 )
 
                 if logger.isEnabledFor(logging.DEBUG):
@@ -3197,17 +3418,24 @@ class NPUModelRunner(GPUModelRunner):
         force_has_lora: bool | None = None,
         force_num_active_loras: int | None = None,
         num_encoder_reqs: int = 0,
+        use_spec_decode: bool = False,
     ) -> tuple[CUDAGraphMode, BatchDescriptor, bool, torch.Tensor | None, CUDAGraphStat | None]:
         num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
         # A stateful P/D handoff can use a uniform decode graph even at
         # prompt_len - 1 computed tokens. Keep first-token prefills out.
         has_initial_state = np.all(self.input_batch.num_computed_tokens_cpu[:num_reqs] > 0)
-        uniform_decode = (
-            (
-                has_initial_state
-                and (max_num_scheduled_tokens == self.uniform_decode_query_len)
-                and (num_tokens == max_num_scheduled_tokens * num_reqs)
+        uniform_decode_shape = (
+            max_num_scheduled_tokens == self.uniform_decode_query_len
+            and num_tokens == max_num_scheduled_tokens * num_reqs
+            and bool(
+                np.all(
+                    num_scheduled_tokens_np[:num_reqs]
+                    == self.uniform_decode_query_len
+                )
             )
+        )
+        uniform_decode = (
+            ((has_initial_state or use_spec_decode) and uniform_decode_shape)
             if force_uniform_decode is None
             else force_uniform_decode
         )
@@ -3226,7 +3454,7 @@ class NPUModelRunner(GPUModelRunner):
             if force_eager:
                 return (CUDAGraphMode.NONE, BatchDescriptor(num_tokens_padded))
 
-            return self.cudagraph_dispatcher.dispatch(
+            mode, descriptor = self.cudagraph_dispatcher.dispatch(
                 num_tokens=num_tokens,
                 has_lora=has_lora,
                 uniform_decode=uniform_decode,
@@ -3234,8 +3462,93 @@ class NPUModelRunner(GPUModelRunner):
                 invalid_modes={CUDAGraphMode.FULL} if disable_full else None,
                 num_active_loras=num_active_loras,
             )
+            if (
+                self._has_gdn
+                and uniform_decode
+                and not disable_full
+                and (valid_modes is None or CUDAGraphMode.FULL in valid_modes)
+            ):
+                spec_descriptor = _get_gdn_uniform_spec_graph_descriptor(
+                    descriptor,
+                    uniform_decode_query_len=self.uniform_decode_query_len,
+                    max_num_reqs=self.scheduler_config.max_num_seqs,
+                )
+                if (
+                    spec_descriptor is not None
+                    and spec_descriptor
+                    in self.cudagraph_dispatcher.cudagraph_keys[
+                        CUDAGraphMode.FULL
+                    ]
+                ):
+                    return CUDAGraphMode.FULL, spec_descriptor
+            return mode, descriptor
 
         cudagraph_mode, batch_descriptor = dispatch_cudagraph(num_tokens_padded, use_cascade_attn or has_encoder_output)
+        if _must_run_fused_mc2_spec_target_eager(
+            use_spec_decode=use_spec_decode,
+            cudagraph_mode=cudagraph_mode,
+            enable_fused_mc2=getattr(
+                self.ascend_config,
+                "enable_fused_mc2",
+                0,
+            ),
+        ):
+            logger.warning_once(
+                "Running the fused-MC2 speculative target step eagerly because "
+                "A3 FULL graph replay does not safely complete this collective."
+            )
+            cudagraph_mode = CUDAGraphMode.NONE
+            batch_descriptor = BatchDescriptor(num_tokens=num_tokens_padded)
+        min_num_scheduled_tokens = (
+            int(num_scheduled_tokens_np[:num_reqs].min())
+            if num_reqs > 0
+            else 0
+        )
+        # Probe once outside graph capture, then describe the replay contract
+        # explicitly. This keeps graph dispatch stable: a bucket cannot first be
+        # captured with host-metadata FLA and later be replayed as native.
+        graph_capability = GDNPrefillGraphCapability.EXACT_SINGLE_REQUEST
+        if self._has_gdn and force_uniform_decode is None and not uniform_decode:
+            from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
+
+            native_dynamic_lengths_available = (
+                AscendGatedDeltaNetAttention._probe_fused_chunk()
+                and get_pcp_group().world_size == 1
+            )
+            graph_capability = get_gdn_prefill_graph_capability(
+                self.ascend_config.gdn_prefill_backend,
+                native_dynamic_lengths_available=native_dynamic_lengths_available,
+                capture_metadata_is_exact=is_exact_gdn_prefill_graph_contract(
+                    num_reqs=num_reqs,
+                    num_actual_tokens=num_tokens,
+                    graph_num_tokens=batch_descriptor.num_tokens,
+                    min_num_scheduled_tokens=min_num_scheduled_tokens,
+                    max_num_scheduled_tokens=max_num_scheduled_tokens,
+                ),
+                fla_graph_capture_supported=is_950(),
+            )
+        is_gdn_prefill_graph_compatible = _is_gdn_prefill_graph_compatible(
+            uniform_decode=uniform_decode,
+            num_reqs=num_reqs,
+            num_tokens=num_tokens_padded,
+            graph_num_reqs=batch_descriptor.num_reqs,
+            graph_num_tokens=batch_descriptor.num_tokens,
+            min_num_scheduled_tokens=min_num_scheduled_tokens,
+            max_num_scheduled_tokens=max_num_scheduled_tokens,
+            decode_threshold=self.decode_threshold,
+            graph_capability=graph_capability,
+        )
+        if (
+            self._has_gdn
+            and force_uniform_decode is None
+            and not uniform_decode
+            and cudagraph_mode == CUDAGraphMode.FULL
+            and not is_gdn_prefill_graph_compatible
+        ):
+            cudagraph_mode, batch_descriptor = dispatch_cudagraph(
+                num_tokens_padded,
+                disable_full=True,
+            )
         num_tokens_padded = batch_descriptor.num_tokens
         if enable_sp(self.vllm_config):
             assert batch_descriptor.num_tokens % self.vllm_config.parallel_config.tensor_parallel_size == 0, (
@@ -3440,6 +3753,41 @@ class NPUModelRunner(GPUModelRunner):
                 req_idx = self.input_batch.req_id_to_index[req_id]
                 req_doc_ranges[req_idx] = image_doc_ranges
 
+        gdn_prefill_graph_backend = None
+        if self._has_gdn and cudagraph_runtime_mode == CUDAGraphMode.FULL:
+            from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
+
+            scheduled = (
+                num_scheduled_tokens_np[:num_reqs]
+                if num_scheduled_tokens_np is not None
+                else np.asarray([num_tokens], dtype=np.int32)
+            )
+            min_scheduled = int(scheduled.min()) if scheduled.size else 0
+            max_scheduled = int(scheduled.max()) if scheduled.size else 0
+            graph_num_tokens = (
+                batch_descriptor.num_tokens
+                if batch_descriptor is not None
+                else num_tokens_padded
+            )
+            graph_metadata_is_exact = is_exact_gdn_prefill_graph_contract(
+                num_reqs=num_reqs,
+                num_actual_tokens=num_tokens,
+                graph_num_tokens=graph_num_tokens,
+                min_num_scheduled_tokens=min_scheduled,
+                max_num_scheduled_tokens=max_scheduled,
+            )
+            native_dynamic_lengths_available = (
+                AscendGatedDeltaNetAttention._probe_fused_chunk()
+                and get_pcp_group().world_size == 1
+            )
+            gdn_prefill_graph_backend = select_gdn_prefill_graph_backend(
+                self.ascend_config.gdn_prefill_backend,
+                runtime_mode=cudagraph_runtime_mode,
+                is_ascend_950=is_950(),
+                metadata_immutable=graph_metadata_is_exact,
+                native_dynamic_lengths_available=native_dynamic_lengths_available,
+            )
+
         cm_base = AscendCommonAttentionMetadata(
             query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
             query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],
@@ -3464,6 +3812,7 @@ class NPUModelRunner(GPUModelRunner):
             causal=True,
             is_prefilling=is_prefilling,
             num_input_tokens=num_tokens_padded,
+            gdn_prefill_graph_backend=gdn_prefill_graph_backend,
             actual_seq_lengths_q=self.actual_seq_lengths_q,
             positions=self.positions,
             positions_cpu=self._dsa_positions_cpu_buf if self.use_compress else None,
@@ -3607,21 +3956,23 @@ class NPUModelRunner(GPUModelRunner):
                 num_reqs_padded,
             )
 
-            # Now, query_start_loc is padded.
-            # But gdn needs an unpadded one.
-            # gdn_query_start_loc is an unpadded version of query_start_loc.
-            # TODO delete it if fia's check is removed.
-            if self._has_gdn:
-                attn_group = self.attn_groups[kv_cache_gid][0]
-                builder = attn_group.get_metadata_builder(0)
-                if isinstance(builder, GDNAttentionMetadataBuilder):
-                    cm.query_start_loc_cpu = self.gdn_query_start_loc.cpu[: num_reqs_padded + 1]
-                    cm.query_start_loc = self.gdn_query_start_loc.gpu[: num_reqs_padded + 1]
-
             if kv_cache_gid > 0:
                 cm.block_table_tensor, cm.slot_mapping = _get_block_table_and_slot_mapping(
                     kv_cache_gid
                 )
+            # FIA can append one virtual request to cover a physical token
+            # bucket. GDN owns state only for the real requests and pads its
+            # captured rows independently with zero-length sequences.
+            if self._has_gdn:
+                attn_group = self.attn_groups[kv_cache_gid][0]
+                builder = attn_group.get_metadata_builder(0)
+                if isinstance(builder, GDNAttentionMetadataBuilder):
+                    cm = _gdn_real_request_view(
+                        cm,
+                        self.gdn_query_start_loc.gpu,
+                        self.gdn_query_start_loc.cpu,
+                        num_reqs,
+                    )
             if self.speculative_config and isinstance(self.drafter, (AscendStep3p5MTPProposer, AscendDSparkProposer)):
                 # step3p5 MTP draft layers span multiple KV cache groups; capture
                 # each group's block table / slot mapping so the proposer can
@@ -3733,6 +4084,24 @@ class NPUModelRunner(GPUModelRunner):
         elif profile_cpp:
             num_reqs = 1
             num_scheduled_tokens_list = [num_tokens] * num_reqs
+        elif (
+            is_graph_capturing
+            and cudagraph_runtime_mode == CUDAGraphMode.FULL
+            and getattr(self, "_has_gdn", False)
+            and num_tokens > self.decode_threshold
+        ):
+            # Match the runtime GDN FULL-dispatch contract.  In particular,
+            # avoid manufacturing a mixed [1, ..., 1, 5] dummy for a
+            # non-uniform MTP descriptor; decode/spec graphs are captured by
+            # their uniform descriptors, while this descriptor owns prefill.
+            num_reqs = _get_gdn_prefill_capture_num_reqs(
+                num_tokens=num_tokens,
+                max_num_reqs=max_num_reqs,
+                decode_threshold=self.decode_threshold,
+            )
+            min_tokens_per_req = num_tokens // num_reqs
+            num_scheduled_tokens_list = [min_tokens_per_req] * num_reqs
+            num_scheduled_tokens_list[-1] += num_tokens % num_reqs
         else:
             num_reqs = min(num_tokens, max_num_reqs)
             min_tokens_per_req = num_tokens // num_reqs
@@ -3836,15 +4205,23 @@ class NPUModelRunner(GPUModelRunner):
 
                 cum_num_tokens = self._get_cumsum_and_arange(
                 num_scheduled_tokens, self.query_pos.np)
-                self.query_start_loc.np[1 : num_reqs_padded + 1] = cum_num_tokens
+                _set_dummy_query_start_loc(
+                    self.query_start_loc.np,
+                    cum_num_tokens,
+                    num_reqs=num_reqs,
+                    num_reqs_padded=num_reqs_padded,
+                )
                 self.query_start_loc.copy_to_gpu()
                 if self._has_gdn:
                     if skip_gdn_state_update:
                         self.gdn_query_start_loc.np.fill(0)
                     else:
-                        self.gdn_query_start_loc.np[
-                            1 : num_reqs_padded + 1
-                        ] = cum_num_tokens
+                        _set_dummy_query_start_loc(
+                            self.gdn_query_start_loc.np,
+                            cum_num_tokens,
+                            num_reqs=num_reqs,
+                            num_reqs_padded=num_reqs_padded,
+                        )
                     self.gdn_query_start_loc.copy_to_gpu()
 
                 if not profile_cpp:
@@ -5954,6 +6331,22 @@ class NPUModelRunner(GPUModelRunner):
                 if kv_cache_spec[layer_name].page_size_bytes < mamba_page_size_padded:  # type: ignore[attr-defined]
                     object.__setattr__(kv_cache_spec[layer_name], "page_size_padded", mamba_page_size_padded)
 
+        # KV specs are serialized from workers to the engine core, while the
+        # static forward-context modules are worker-local. Preserve the exact
+        # draft-layer identity discovered by the proposer on the corresponding
+        # spec so engine-core grouping can annotate only the true draft group.
+        for layer_name, spec in kv_cache_spec.items():
+            if getattr(
+                attn_layers.get(layer_name),
+                "_vllm_ascend_is_draft_cache_layer",
+                False,
+            ):
+                object.__setattr__(
+                    spec,
+                    "_vllm_ascend_is_draft_cache_layer",
+                    True,
+                )
+
         if self.sparse_kv_offload_enabled:
             self.kv_cache_spec = kv_cache_spec # reserve for Sparse KV offload usage
         return kv_cache_spec
@@ -6013,6 +6406,13 @@ class NPUModelRunner(GPUModelRunner):
             self.cudagraph_dispatcher.initialize_cudagraph_keys(
                 cudagraph_mode, self.uniform_decode_query_len
             )
+            if getattr(self, "_has_gdn", False) and self.speculative_config is not None:
+                _register_gdn_spec_decode_full_graph_keys(
+                    self.cudagraph_dispatcher,
+                    cudagraph_mode=cudagraph_mode,
+                    uniform_decode_query_len=self.uniform_decode_query_len,
+                    max_num_reqs=self.scheduler_config.max_num_seqs,
+                )
 
         if (
             self.speculative_config
@@ -6045,7 +6445,11 @@ class NPUModelRunner(GPUModelRunner):
     def capture_model(self) -> int:
         """Capture NPU graphs and return actual graph pool memory bytes consumed."""
         parent_module_name = _get_gpu_model_runner_module_name(self)
-        with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(parent_module_name):
+        with (
+            _torch_cuda_wrapper(),
+            _replace_gpu_model_runner_function_wrapper(parent_module_name),
+            gdn_prefill_graph_capture_scope(),
+        ):
             cuda_graph_size = GPUModelRunner.capture_model(self)
 
         mgr = self.encoder_cudagraph_manager

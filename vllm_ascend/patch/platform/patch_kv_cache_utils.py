@@ -34,9 +34,11 @@ from vllm_ascend.utils import vllm_version_is
 
 _KIMI_K3_TARGET_LAYER_PREFIX = "language_model.model.layers."
 _KIMI_K3_DRAFT_LAYER_PREFIX = "model.layers."
+_ASCEND_DRAFT_CACHE_LAYER_ATTR = "_vllm_ascend_is_draft_cache_layer"
 _orig_resolve_kv_cache_block_sizes = vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes
 _orig_get_kv_cache_groups_uniform_page_size = vllm.v1.core.kv_cache_utils._get_kv_cache_groups_uniform_page_size
 _orig_get_kv_cache_groups = vllm.v1.core.kv_cache_utils.get_kv_cache_groups
+_orig_annotate_eagle_groups = vllm.v1.core.kv_cache_utils._annotate_eagle_groups
 _orig_get_kv_cache_config_from_groups = vllm.v1.core.kv_cache_utils.get_kv_cache_config_from_groups
 _orig_max_memory_usage_bytes_from_groups = vllm.v1.core.kv_cache_utils._max_memory_usage_bytes_from_groups
 _orig_pool_bytes_per_block = vllm.v1.core.kv_cache_utils._pool_bytes_per_block
@@ -84,7 +86,10 @@ def _ascend_resolve_kv_cache_block_sizes(
     context parallelism for MLA and SWA-MLA layers independently.
 
     For multiple KV cache groups with DCP, compute scheduler_block_size as
-    lcm(group_block_sizes) * dcp to maintain alignment.
+    lcm(group_block_sizes) * dcp to maintain alignment. Keep vLLM's public
+    ``prefix_match_unit`` override for the independent hash granularity;
+    setting it to a KV-cache group block size disables finer-grain prefix
+    matching without introducing an Ascend-only control.
     """
     cache_config = vllm_config.cache_config
     dcp = vllm_config.parallel_config.decode_context_parallel_size
@@ -102,7 +107,18 @@ def _ascend_resolve_kv_cache_block_sizes(
         scheduler_block_size = math.lcm(*group_block_sizes) * dcp
         if not cache_config.enable_prefix_caching:
             return scheduler_block_size, scheduler_block_size
-        hash_block_size = math.gcd(*group_block_sizes)
+        requested = cache_config.prefix_match_unit
+        hash_block_size = (
+            requested
+            if requested is not None
+            else math.gcd(*group_block_sizes)
+        )
+        if any(bs % hash_block_size != 0 for bs in group_block_sizes):
+            raise ValueError(
+                f"Invalid prefix_match_unit={hash_block_size}; all KV cache group "
+                "block sizes must be divisible by prefix_match_unit. "
+                f"Got group block sizes={group_block_sizes}."
+            )
         return scheduler_block_size, hash_block_size
 
     return _orig_resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
@@ -550,6 +566,62 @@ def _get_glm5_next_kv_cache_groups(
     return _orig_get_kv_cache_groups(vllm_config, kv_cache_spec)
 
 
+def _ascend_annotate_eagle_groups(
+    vllm_config: VllmConfig,
+    kv_cache_spec: dict[str, KVCacheSpec],
+    kv_cache_groups: list[KVCacheGroupSpec],
+    use_deepseek_v4_fallback: bool = False,
+) -> None:
+    """Annotate full-attention draft groups discovered by the proposer.
+
+    Upstream can identify a draft group from a distinct cache spec (for
+    example non-causal draft MLA), but Qwen3.5 MTP uses ordinary full
+    attention and is spec-identical to target full-attention layers. The
+    Ascend proposer already computes the exact set of draft cache layers;
+    preserve that identity on the layer modules and project it onto the final
+    groups here. This avoids the unsafe fallback that marks every hybrid group
+    (including Mamba groups) as a draft group.
+    """
+    _orig_annotate_eagle_groups(
+        vllm_config,
+        kv_cache_spec,
+        kv_cache_groups,
+        use_deepseek_v4_fallback,
+    )
+
+    spec_config = vllm_config.speculative_config
+    if spec_config is None or not spec_config.use_eagle():
+        return
+
+    forward_context = vllm_config.compilation_config.static_forward_context
+    draft_layer_names = {
+        layer_name
+        for layer_name, spec in kv_cache_spec.items()
+        if (
+            getattr(spec, _ASCEND_DRAFT_CACHE_LAYER_ATTR, False)
+            or getattr(
+                forward_context.get(layer_name),
+                _ASCEND_DRAFT_CACHE_LAYER_ATTR,
+                False,
+            )
+        )
+    }
+    if not draft_layer_names:
+        return
+
+    annotated_group_ids = []
+    for group_id, group in enumerate(kv_cache_groups):
+        if draft_layer_names.intersection(group.layer_names):
+            group.is_eagle_group = True
+            annotated_group_ids.append(group_id)
+
+    logger.info(
+        "Annotated draft KV cache group(s) %s from proposer-owned layer(s) %s",
+        annotated_group_ids,
+        sorted(draft_layer_names),
+    )
+
+
 def _ascend_get_kv_cache_config_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -578,6 +650,7 @@ vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes = _ascend_resolve_kv_ca
 vllm.v1.core.kv_cache_utils.group_and_unify_kv_cache_specs = group_and_unify_kv_cache_specs
 vllm.v1.core.kv_cache_utils._get_kv_cache_groups_uniform_groups = _get_kv_cache_groups_uniform_groups
 vllm.v1.core.kv_cache_utils._get_kv_cache_groups_uniform_page_size = _get_kv_cache_groups_uniform_page_size
+vllm.v1.core.kv_cache_utils._annotate_eagle_groups = _ascend_annotate_eagle_groups
 # vLLM v0.24.0 renamed _get_kv_cache_config_deepseek_v4 to
 # _get_kv_cache_config_packed. The v0.28.0 planner still consumes shared_by;
 # main uses _ascend_get_kv_cache_config_from_groups and the stride-aware planner.

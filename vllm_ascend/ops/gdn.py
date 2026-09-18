@@ -18,8 +18,9 @@
 import torch
 import torch_npu
 from einops import rearrange
-from vllm.distributed import get_pcp_group
+from vllm.distributed import get_pcp_group, get_tensor_model_parallel_rank
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator
 from vllm.third_party.flash_linear_attention.ops.l2norm import l2norm_fwd
@@ -28,17 +29,81 @@ from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata  # typ
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.utils import (
     maybe_save_kv_layer_to_connector,
     wait_for_kv_layer_from_connector,
 )
+from vllm_ascend.device.device_config import is_950
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import record_attention_compute_start
 from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionBackend
+from vllm_ascend.ops.gdn_graph_capability import (
+    is_gdn_prefill_graph_capture_active,
+    select_gdn_prefill_graph_backend,
+    select_gdn_prefill_implementation,
+)
 from vllm_ascend.ops.triton.fla.chunk import chunk_gated_delta_rule
 from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_split_reshape_cat
 from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
 from vllm_ascend.ops.triton.mamba.causal_conv1d import extract_last_width
+
+logger = init_logger(__name__)
+
+
+def _chunk_gated_delta_rule_fla_npu(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor,
+    scale: float,
+    prebuilt_meta,
+    fused_fwd,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
+    g = g.to(torch.float32).contiguous()
+    beta = beta.to(v.dtype).contiguous()
+    initial_state = initial_state.contiguous()
+
+    cu_seqlens = prebuilt_meta.cu_seqlens_host
+    chunk_indices = prebuilt_meta.chunk_indices_chunk64_host
+    keep_meta = prebuilt_meta.keep_meta
+    initial_state_kern = initial_state
+    if keep_meta is not None:
+        cu_seqlens = prebuilt_meta.cu_seqlens_kern
+        initial_state_kern = initial_state[keep_meta]
+
+    # print("q.shape=%s",q.shape)
+    # print("k.shape=%s",k.shape)
+    # print("v.shape=%s",v.shape)
+    output, final_state, _, _ = fused_fwd(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state=initial_state_kern,
+        output_final_state=True,
+        chunk_size=64,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        scale=scale,
+        layout="BSND",
+        use_exp2=False,
+        use_qk_l2norm_in_kernel=True,
+        allow_neg_eigval=False,
+        disable_recompute=True,
+        state_v_first=True,
+    )
+    if keep_meta is not None:
+        full_final_state = initial_state.clone()
+        full_final_state[keep_meta] = final_state
+        final_state = full_final_state
+    return output, final_state
 
 
 class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
@@ -136,8 +201,14 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         initial_state = initial_state.to(torch.bfloat16).contiguous()
 
         # actual_seq_lengths is per-batch sequence length [N] (per the interface
-        # doc), derived from the cumulative query_start_loc.
+        # doc), derived from the cumulative query_start_loc.  The native op also
+        # requires the lengths to sum to the static T dimension.  During padded
+        # FULL-graph replay, query_start_loc describes only real tokens, so put
+        # the graph padding in the reserved final dummy row.  Runtime dispatch
+        # only permits padded replay when that row is not occupied by a request.
         actual_seq_lengths = torch.diff(cu_seqlens).to(torch.int32)
+        padding_tokens = (q.shape[0] - actual_seq_lengths.sum()).to(torch.int32)
+        actual_seq_lengths[-1] += padding_tokens
 
         o, final_state = torch_npu.npu_chunk_gated_delta_rule(
             q,
@@ -522,11 +593,85 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 g_non_spec = g_non_spec[:, num_decode_tokens:]
                 beta_non_spec = beta_non_spec[:, num_decode_tokens:]
 
+            ascend_config = get_ascend_config()
+            pcp_single_rank = get_pcp_group().world_size == 1
+            graph_capture_enabled = is_gdn_prefill_graph_capture_active() or getattr(
+                forward_context, "capturing", False
+            )
+            ascend_950 = is_950()
+            native_dynamic_lengths_available = pcp_single_rank and (
+                AscendGatedDeltaNetAttention._fused_chunk_available is True
+                or (
+                    (graph_capture_enabled or query_non_spec.device.type == "npu")
+                    and not ascend_950
+                    and hasattr(torch_npu, "npu_chunk_gated_delta_rule")
+                )
+            )
+            if (
+                ascend_config.gdn_prefill_backend == "fla_npu"
+                and not ascend_950
+                and (not torch.distributed.is_initialized() or get_tensor_model_parallel_rank() == 0)
+            ):
+                logger.warning_once(
+                    "FLA NPU GDN prefill requires the A5 prepare-path contract; "
+                    "falling back to the native GDN operator on this device."
+                )
+            prefill_meta = getattr(
+                attn_metadata,
+                "non_spec_prefill_metadata",
+                None,
+            )
+            chunk_meta = getattr(prefill_meta, "chunk", None)
+            cu_seqlens_host = getattr(chunk_meta, "cu_seqlens_host", None)
+            metadata_immutable = (getattr(attn_metadata, "gdn_prefill_graph_backend", None) == "fla_npu") or (
+                getattr(attn_metadata, "num_prefills", 0) == 1
+                and isinstance(cu_seqlens_host, tuple | list)
+                and tuple(cu_seqlens_host) == (0, getattr(attn_metadata, "num_actual_tokens", -1))
+            )
+            graph_backend = select_gdn_prefill_graph_backend(
+                ascend_config.gdn_prefill_backend,
+                runtime_mode=forward_context.cudagraph_runtime_mode,
+                is_ascend_950=ascend_950,
+                metadata_immutable=metadata_immutable,
+                native_dynamic_lengths_available=native_dynamic_lengths_available,
+                capture_enabled=graph_capture_enabled,
+            )
+            if graph_backend is None:
+                prefill_implementation = select_gdn_prefill_implementation(
+                    ascend_config.gdn_prefill_backend,
+                    is_graph_capture=False,
+                    graph_metadata_is_exact=False,
+                    native_dynamic_lengths_available=native_dynamic_lengths_available,
+                    fla_runtime_supported=ascend_950,
+                    fla_graph_capture_supported=ascend_950,
+                )
+            else:
+                # Stream capture state is false during FX warmup.  The forward
+                # context runtime mode is authoritative for graph execution;
+                # the typed metadata field only describes whether A5 FLA host
+                # metadata is the exact immutable singleton required by replay.
+                prefill_implementation = graph_backend
+            if prefill_implementation == "fla_npu":
+                if get_pcp_group().world_size != 1:
+                    raise RuntimeError("FLA fused GDN prefill currently requires PCP world size 1.")
+                initial_state = ssm_state[prefill_state_indices]
+                clear_ssm_states(initial_state, prefill_has_initial_state)
+                (core_attn_out_non_spec, last_recurrent_state) = _chunk_gated_delta_rule_fla_npu(
+                    q=query_non_spec,
+                    k=key_non_spec,
+                    v=value_non_spec,
+                    g=g_non_spec,
+                    beta=beta_non_spec,
+                    initial_state=initial_state,
+                    scale=key_non_spec.shape[-1] ** -0.5,
+                    prebuilt_meta=attn_metadata.non_spec_prefill_metadata.chunk,
+                    fused_fwd=ascend_config.gdn_prefill_op,
+                )
+                ssm_state[prefill_state_indices] = last_recurrent_state.to(ssm_state.dtype)
             # Use the fused CANN operator when available (probed once, cached on
             # the class) and applicable. It only supports the non-PCP case; fall
             # back to the Triton pipeline under PCP or if the op is unavailable.
-            use_fused_chunk = AscendGatedDeltaNetAttention._probe_fused_chunk() and get_pcp_group().world_size == 1
-            if use_fused_chunk:
+            elif prefill_implementation == "native":
                 # The fused op's state layout [N, Nv, Dv, Dk] matches ssm_state
                 # directly, so no transpose is needed. Advanced indexing already
                 # returns a copy, safe to clear in place.
