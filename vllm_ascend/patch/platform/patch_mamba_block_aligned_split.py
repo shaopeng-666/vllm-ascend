@@ -29,12 +29,16 @@ Other models retain the upstream behavior.
 import functools
 import inspect
 
+from vllm.logger import init_logger
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import Request
 
+from vllm_ascend.ascend_config import init_ascend_config
 from vllm_ascend.patch.platform.patch_mamba_config import (
     _get_sparse_index_kpool,
 )
+
+logger = init_logger(__name__)
 
 _EXPECTED_PARAMETERS = (
     "self",
@@ -45,6 +49,30 @@ _EXPECTED_PARAMETERS = (
 )
 
 _original_mamba_block_aligned_split = Scheduler._mamba_block_aligned_split
+_original_scheduler_init = Scheduler.__init__
+
+
+@functools.wraps(_original_scheduler_init)
+def _scheduler_init(self: Scheduler, *args, **kwargs) -> None:
+    """Initialize process-local Ascend config before KV coordination.
+
+    EngineCore is spawned in a separate process and constructs its scheduler
+    before worker-side platform initialization. Initialize from the scheduler's
+    own ``vllm_config`` so prefix-cache policy cannot silently differ between
+    processes.
+    """
+    if args:
+        vllm_config = args[0]
+    else:
+        vllm_config = kwargs["vllm_config"]
+    ascend_config = init_ascend_config(vllm_config)
+    use_scheduler_block_size = ascend_config.prefix_cache_use_scheduler_block_size
+    self._ascend_prefix_cache_use_scheduler_block_size = use_scheduler_block_size
+    logger.info(
+        "Effective prefix_cache_use_scheduler_block_size=%s in Scheduler",
+        use_scheduler_block_size,
+    )
+    _original_scheduler_init(self, *args, **kwargs)
 
 
 @functools.wraps(_original_mamba_block_aligned_split)
@@ -60,8 +88,25 @@ def _mamba_block_aligned_split(
     if kv_transfer_config is not None and kv_transfer_config.is_kv_consumer:
         return num_new_tokens
 
+    num_computed_tokens = request.num_computed_tokens + num_new_local_computed_tokens + num_external_computed_tokens
+    prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
+    use_scheduler_block_size = self._ascend_prefix_cache_use_scheduler_block_size
+    if (
+        use_scheduler_block_size
+        and self.cache_config.enable_prefix_caching
+        and self.cache_config.mamba_cache_mode == "align"
+        and num_computed_tokens < prefill_end
+    ):
+        block_size = self.block_size
+        scheduled_end = num_computed_tokens + num_new_tokens
+        # Exact-boundary prompts must recompute their final token on a future
+        # hit. Stop at the preceding scheduler page now so every Mamba group
+        # materializes the recurrent-state checkpoint needed for that hit.
+        next_boundary = (num_computed_tokens // block_size + 1) * block_size
+        if num_computed_tokens < next_boundary < scheduled_end:
+            return next_boundary - num_computed_tokens
+
     if _get_sparse_index_kpool(self.vllm_config.model_config) is not None:
-        num_computed_tokens = request.num_computed_tokens + num_new_local_computed_tokens + num_external_computed_tokens
         if num_computed_tokens < max(
             request.num_prompt_tokens,
             request.num_tokens - 1,
@@ -97,3 +142,4 @@ if current_parameters != _EXPECTED_PARAMETERS:
     )
 
 Scheduler._mamba_block_aligned_split = _mamba_block_aligned_split
+Scheduler.__init__ = _scheduler_init

@@ -20,6 +20,7 @@ import vllm.v1.core.sched.scheduler as scheduler_module
 from vllm_ascend.patch.platform.patch_mamba_block_aligned_split import (
     _mamba_block_aligned_split,
     _original_mamba_block_aligned_split,
+    _scheduler_init,
 )
 from vllm_ascend.utils import vllm_version_is
 
@@ -28,6 +29,8 @@ def _scheduler(
     *,
     is_kv_consumer: bool | None,
     uses_sparse_index_kpool: bool = False,
+    use_scheduler_block_size: bool = False,
+    use_eagle: bool = True,
 ):
     kv_transfer_config = None if is_kv_consumer is None else SimpleNamespace(is_kv_consumer=is_kv_consumer)
     # vLLM main added `mamba_has_prefill_checkpoint_blocks` (gated by
@@ -45,13 +48,18 @@ def _scheduler(
                 hf_text_config=SimpleNamespace(**indexer_config),
             ),
         ),
-        cache_config=SimpleNamespace(block_size=384),
+        cache_config=SimpleNamespace(
+            block_size=384,
+            enable_prefix_caching=True,
+            mamba_cache_mode="align",
+        ),
         block_size=128,
-        use_eagle=True,
+        use_eagle=use_eagle,
         max_num_scheduled_tokens=8192,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
         hash_block_size=384,
         mamba_partial_cache_hit=False,
+        _ascend_prefix_cache_use_scheduler_block_size=(use_scheduler_block_size),
         **scheduler_kwargs,
     )
 
@@ -182,6 +190,62 @@ def test_sparse_index_kpool_pd_consumer_still_preserves_verifier_window():
     )
 
     assert result == 8
+
+
+def test_scheduler_block_alignment_splits_exact_prompt_boundary():
+    result = _mamba_block_aligned_split(
+        _scheduler(
+            is_kv_consumer=False,
+            use_scheduler_block_size=True,
+            use_eagle=False,
+        ),
+        _request(
+            num_computed_tokens=0,
+            num_prompt_tokens=256,
+            num_tokens=256,
+        ),
+        num_new_tokens=256,
+    )
+
+    assert result == 128
+
+
+def test_disabled_scheduler_block_alignment_keeps_exact_prompt_chunk():
+    result = _mamba_block_aligned_split(
+        _scheduler(
+            is_kv_consumer=False,
+            use_scheduler_block_size=False,
+            use_eagle=False,
+        ),
+        _request(
+            num_computed_tokens=0,
+            num_prompt_tokens=256,
+            num_tokens=256,
+        ),
+        num_new_tokens=256,
+    )
+
+    assert result == 256
+
+
+def test_scheduler_init_publishes_effective_prefix_cache_setting(monkeypatch):
+    scheduler = SimpleNamespace()
+    vllm_config = object()
+    calls = []
+
+    monkeypatch.setattr(
+        "vllm_ascend.patch.platform.patch_mamba_block_aligned_split.init_ascend_config",
+        lambda config: calls.append(("ascend", config)) or SimpleNamespace(prefix_cache_use_scheduler_block_size=True),
+    )
+    monkeypatch.setattr(
+        "vllm_ascend.patch.platform.patch_mamba_block_aligned_split._original_scheduler_init",
+        lambda instance, config, **kwargs: calls.append(("upstream", config)),
+    )
+
+    _scheduler_init(scheduler, vllm_config)
+
+    assert calls == [("ascend", vllm_config), ("upstream", vllm_config)]
+    assert scheduler._ascend_prefix_cache_use_scheduler_block_size is True
 
 
 def test_patch_is_registered_with_upstream_signature():

@@ -36,6 +36,7 @@ from vllm_ascend.core.kv_cache_interface import (
 )
 from vllm_ascend.patch.platform.patch_kv_cache_coordinator import (
     AscendHybridKVCacheCoordinator,
+    _get_eagle_probe_max_length,
     _is_deepseek_v4_kv_cache_spec,
     get_kv_cache_coordinator,
 )
@@ -135,10 +136,7 @@ def test_qwen35_mtp_marks_only_full_attention_draft_group() -> None:
     specs = {
         "model.layers.0.self_attn.attn": target_full_spec,
         "mtp.layers.0.self_attn.attn": draft_full_spec,
-        **{
-            group.layer_names[0]: group.kv_cache_spec
-            for group in groups[1:]
-        },
+        **{group.layer_names[0]: group.kv_cache_spec for group in groups[1:]},
     }
 
     _ascend_annotate_eagle_groups(vllm_config, specs, groups)
@@ -357,11 +355,9 @@ def test_cp_hybrid_groups_honor_prefix_match_unit() -> None:
         prefix_match_unit=8,
     )
 
-    scheduler_block_size, hash_block_size = (
-        _ascend_resolve_kv_cache_block_sizes(
-            kv_cache_config,
-            vllm_config,
-        )
+    scheduler_block_size, hash_block_size = _ascend_resolve_kv_cache_block_sizes(
+        kv_cache_config,
+        vllm_config,
     )
 
     assert scheduler_block_size == 64
@@ -443,8 +439,34 @@ def test_hybrid_prefix_cache_can_use_scheduler_block_alignment(
     assert coordinator.scheduler_block_size == scheduler_block_size
     assert coordinator.enable_partial_hash_hits is expected_partial_hits
     assert coordinator._cache_hit_alignment_tokens == expected_alignment
-    assert coordinator._align_cacheable(2560) == (
-        scheduler_block_size if use_scheduler_alignment else 2560
+    assert coordinator._align_cacheable(2560) == (scheduler_block_size if use_scheduler_alignment else 2560)
+
+
+def test_eagle_probe_can_verify_exact_prompt_boundary_before_drop() -> None:
+    block_hashes = [MagicMock(), MagicMock()]
+
+    assert (
+        _get_eagle_probe_max_length(
+            candidate_length=4095,
+            eagle_margin=2048,
+            block_hashes=block_hashes,
+            hash_block_size=2048,
+        )
+        == 4096
+    )
+
+
+def test_eagle_probe_never_exceeds_available_hash_coverage() -> None:
+    block_hashes = [MagicMock()]
+
+    assert (
+        _get_eagle_probe_max_length(
+            candidate_length=2048,
+            eagle_margin=2048,
+            block_hashes=block_hashes,
+            hash_block_size=2048,
+        )
+        == 2048
     )
 
 
@@ -1020,7 +1042,8 @@ def test_get_kv_cache_coordinator_delegates_hybrid_without_caching(monkeypatch) 
     assert coordinator is sentinel
 
 
-def test_get_kv_cache_coordinator_uses_ascend_for_deepseek_v4(monkeypatch) -> None:
+@pytest.mark.parametrize("use_scheduler_block_size", [False, True])
+def test_get_kv_cache_coordinator_uses_ascend_for_deepseek_v4(monkeypatch, use_scheduler_block_size: bool) -> None:
     sentinel = object()
     kv_cache_config = _make_deepseek_v4_kv_cache_config()
     coordinator_kwargs = {}
@@ -1042,7 +1065,7 @@ def test_get_kv_cache_coordinator_uses_ascend_for_deepseek_v4(monkeypatch) -> No
     )
     monkeypatch.setattr(
         "vllm_ascend.patch.platform.patch_kv_cache_coordinator.get_ascend_config",
-        lambda: SimpleNamespace(prefix_cache_use_scheduler_block_size=True),
+        lambda: SimpleNamespace(prefix_cache_use_scheduler_block_size=use_scheduler_block_size),
     )
 
     coordinator = get_kv_cache_coordinator(
@@ -1058,7 +1081,7 @@ def test_get_kv_cache_coordinator_uses_ascend_for_deepseek_v4(monkeypatch) -> No
     )
 
     assert coordinator is sentinel
-    assert coordinator_kwargs["prefix_cache_use_scheduler_block_size"] is True
+    assert coordinator_kwargs["prefix_cache_use_scheduler_block_size"] is use_scheduler_block_size
 
 
 class _FakeEagleManager:
