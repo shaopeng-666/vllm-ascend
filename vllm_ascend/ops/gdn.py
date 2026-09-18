@@ -201,8 +201,14 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         initial_state = initial_state.to(torch.bfloat16).contiguous()
 
         # actual_seq_lengths is per-batch sequence length [N] (per the interface
-        # doc), derived from the cumulative query_start_loc.
+        # doc), derived from the cumulative query_start_loc.  The native op also
+        # requires the lengths to sum to the static T dimension.  During padded
+        # FULL-graph replay, query_start_loc describes only real tokens, so put
+        # the graph padding in the reserved final dummy row.  Runtime dispatch
+        # only permits padded replay when that row is not occupied by a request.
         actual_seq_lengths = torch.diff(cu_seqlens).to(torch.int32)
+        padding_tokens = (q.shape[0] - actual_seq_lengths.sum()).to(torch.int32)
+        actual_seq_lengths[-1] += padding_tokens
 
         o, final_state = torch_npu.npu_chunk_gated_delta_rule(
             q,

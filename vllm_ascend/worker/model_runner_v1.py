@@ -349,6 +349,7 @@ def _is_gdn_prefill_graph_compatible(
     uniform_decode: bool,
     num_reqs: int,
     num_tokens: int,
+    graph_num_reqs: int,
     graph_num_tokens: int,
     min_num_scheduled_tokens: int,
     max_num_scheduled_tokens: int,
@@ -360,6 +361,8 @@ def _is_gdn_prefill_graph_compatible(
     Host-metadata implementations keep the exact-singleton contract. A backend
     advertising device-side dynamic lengths can replay a padded token bucket;
     multi-request replay additionally requires the explicit multi-request bit.
+    A padded replay must retain one dummy request row for the native operator's
+    padding segment, while an exact-token replay may occupy every captured row.
     """
     is_prefill_only = (
         not uniform_decode
@@ -374,6 +377,7 @@ def _is_gdn_prefill_graph_compatible(
     )
     padded_dynamic = (
         graph_num_tokens >= num_tokens
+        and (graph_num_tokens == num_tokens or num_reqs < graph_num_reqs)
         and bool(
             graph_capability & GDNPrefillGraphCapability.PADDED_DYNAMIC_LENGTHS
         )
@@ -383,6 +387,136 @@ def _is_gdn_prefill_graph_compatible(
         )
     )
     return is_prefill_only and (exact_single or padded_dynamic)
+
+
+def _get_gdn_prefill_capture_num_reqs(
+    *,
+    num_tokens: int,
+    max_num_reqs: int,
+    decode_threshold: int,
+) -> int:
+    """Return the largest request count that is still a pure prefill.
+
+    FULL graph capture normally spreads a token bucket over ``max_num_reqs``.
+    With speculative decoding that can manufacture a mixed dummy batch, for
+    example 12 tokens become ``[1] * 7 + [5]`` when MTP=3.  Such a dummy does
+    not represent any batch that GDN prefill dispatch is allowed to replay:
+    runtime FULL dispatch requires every real request to exceed the decode/spec
+    threshold.  Capture the maximum replayable pure-prefill row capacity
+    instead.  Small decode/spec-only buckets keep the generic dummy layout.
+    """
+    if num_tokens <= decode_threshold:
+        return min(num_tokens, max_num_reqs)
+    min_prefill_tokens = decode_threshold + 1
+    return min(max_num_reqs, num_tokens // min_prefill_tokens)
+
+
+def _get_gdn_uniform_spec_graph_descriptor(
+    mixed_descriptor: BatchDescriptor,
+    *,
+    uniform_decode_query_len: int,
+    max_num_reqs: int,
+) -> BatchDescriptor | None:
+    """Return a distinct FULL-graph key for uniform speculative decode.
+
+    ``CUDAGraphMode.FULL`` normally normalizes uniform and non-uniform batches
+    onto the same descriptor. That is not valid for GDN: graph capture fixes
+    the Python branch in ``_forward_core``, so a ``4 x 1`` ordinary-decode
+    capture cannot replay a ``1 x 4`` MTP verification batch. Keep the mixed
+    descriptor for ordinary decode/prefill and add a uniform descriptor whose
+    request rows are derived from the speculative width.
+    """
+    num_tokens = mixed_descriptor.num_tokens
+    if (
+        uniform_decode_query_len <= 1
+        or num_tokens % uniform_decode_query_len != 0
+    ):
+        return None
+    num_reqs = min(num_tokens // uniform_decode_query_len, max_num_reqs)
+    if num_reqs <= 0:
+        return None
+    return replace(
+        mixed_descriptor,
+        num_reqs=num_reqs,
+        uniform=True,
+    )
+
+
+def _must_run_fused_mc2_spec_target_eager(
+    *,
+    use_spec_decode: bool,
+    cudagraph_mode: CUDAGraphMode,
+    enable_fused_mc2: int,
+) -> bool:
+    """Keep the fused-MC2 speculative target step out of FULL graph replay.
+
+    On A3 the fused MoE collective can leave asynchronous graph work pending
+    after the target verification graph returns, which then hangs at the
+    rejection sampler's first synchronization.  Communication-method mixing
+    inside the same graph pool is also unsafe, so retain fused MC2 and run only
+    this target step eagerly.  Prefill, ordinary decode, and the eager draft
+    model keep their existing execution paths.
+    """
+    return (
+        use_spec_decode
+        and cudagraph_mode == CUDAGraphMode.FULL
+        and enable_fused_mc2 == 1
+    )
+
+
+def _register_gdn_spec_decode_full_graph_keys(
+    cudagraph_dispatcher,
+    *,
+    cudagraph_mode: CUDAGraphMode,
+    uniform_decode_query_len: int,
+    max_num_reqs: int,
+) -> None:
+    """Add separate GDN speculative FULL graphs without changing vLLM modes."""
+    if (
+        uniform_decode_query_len <= 1
+        or not cudagraph_mode.has_mode(CUDAGraphMode.FULL)
+        or cudagraph_mode.separate_routine()
+    ):
+        return
+
+    mixed_keys = list(cudagraph_dispatcher.cudagraph_keys[CUDAGraphMode.FULL])
+    max_spec_tokens = uniform_decode_query_len * max_num_reqs
+    for mixed_descriptor in mixed_keys:
+        if mixed_descriptor.uniform or mixed_descriptor.num_tokens > max_spec_tokens:
+            continue
+        spec_descriptor = _get_gdn_uniform_spec_graph_descriptor(
+            mixed_descriptor,
+            uniform_decode_query_len=uniform_decode_query_len,
+            max_num_reqs=max_num_reqs,
+        )
+        if spec_descriptor is not None:
+            cudagraph_dispatcher.add_cudagraph_key(
+                CUDAGraphMode.FULL,
+                spec_descriptor,
+            )
+
+
+def _set_dummy_query_start_loc(
+    query_start_loc: np.ndarray,
+    cum_num_tokens: np.ndarray,
+    *,
+    num_reqs: int,
+    num_reqs_padded: int,
+) -> None:
+    """Write real dummy boundaries and repeat the terminal boundary for padding.
+
+    GDN FULL capture may deliberately use fewer real requests than the generic
+    graph descriptor's row capacity so every real row is a pure prefill.  The
+    extra descriptor rows are zero-length padding and therefore must repeat the
+    final cumulative token count rather than consuming entries that do not
+    exist in ``cum_num_tokens``.
+    """
+    assert cum_num_tokens.shape == (num_reqs,)
+    assert num_reqs <= num_reqs_padded
+    query_start_loc[1 : num_reqs + 1] = cum_num_tokens
+    if num_reqs < num_reqs_padded:
+        terminal = int(cum_num_tokens[-1]) if num_reqs else 0
+        query_start_loc[num_reqs + 1 : num_reqs_padded + 1] = terminal
 
 
 def _gdn_real_request_view(
@@ -2437,6 +2571,7 @@ class NPUModelRunner(GPUModelRunner):
                     use_cascade_attn=cascade_attn_prefix_lens is not None,
                     force_eager=self.model_config.enforce_eager,
                     num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
+                    use_spec_decode=spec_decode_metadata is not None,
                 )
 
                 if logger.isEnabledFor(logging.DEBUG):
@@ -3283,17 +3418,24 @@ class NPUModelRunner(GPUModelRunner):
         force_has_lora: bool | None = None,
         force_num_active_loras: int | None = None,
         num_encoder_reqs: int = 0,
+        use_spec_decode: bool = False,
     ) -> tuple[CUDAGraphMode, BatchDescriptor, bool, torch.Tensor | None, CUDAGraphStat | None]:
         num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
         # A stateful P/D handoff can use a uniform decode graph even at
         # prompt_len - 1 computed tokens. Keep first-token prefills out.
         has_initial_state = np.all(self.input_batch.num_computed_tokens_cpu[:num_reqs] > 0)
-        uniform_decode = (
-            (
-                has_initial_state
-                and (max_num_scheduled_tokens == self.uniform_decode_query_len)
-                and (num_tokens == max_num_scheduled_tokens * num_reqs)
+        uniform_decode_shape = (
+            max_num_scheduled_tokens == self.uniform_decode_query_len
+            and num_tokens == max_num_scheduled_tokens * num_reqs
+            and bool(
+                np.all(
+                    num_scheduled_tokens_np[:num_reqs]
+                    == self.uniform_decode_query_len
+                )
             )
+        )
+        uniform_decode = (
+            ((has_initial_state or use_spec_decode) and uniform_decode_shape)
             if force_uniform_decode is None
             else force_uniform_decode
         )
@@ -3312,7 +3454,7 @@ class NPUModelRunner(GPUModelRunner):
             if force_eager:
                 return (CUDAGraphMode.NONE, BatchDescriptor(num_tokens_padded))
 
-            return self.cudagraph_dispatcher.dispatch(
+            mode, descriptor = self.cudagraph_dispatcher.dispatch(
                 num_tokens=num_tokens,
                 has_lora=has_lora,
                 uniform_decode=uniform_decode,
@@ -3320,8 +3462,43 @@ class NPUModelRunner(GPUModelRunner):
                 invalid_modes={CUDAGraphMode.FULL} if disable_full else None,
                 num_active_loras=num_active_loras,
             )
+            if (
+                self._has_gdn
+                and uniform_decode
+                and not disable_full
+                and (valid_modes is None or CUDAGraphMode.FULL in valid_modes)
+            ):
+                spec_descriptor = _get_gdn_uniform_spec_graph_descriptor(
+                    descriptor,
+                    uniform_decode_query_len=self.uniform_decode_query_len,
+                    max_num_reqs=self.scheduler_config.max_num_seqs,
+                )
+                if (
+                    spec_descriptor is not None
+                    and spec_descriptor
+                    in self.cudagraph_dispatcher.cudagraph_keys[
+                        CUDAGraphMode.FULL
+                    ]
+                ):
+                    return CUDAGraphMode.FULL, spec_descriptor
+            return mode, descriptor
 
         cudagraph_mode, batch_descriptor = dispatch_cudagraph(num_tokens_padded, use_cascade_attn or has_encoder_output)
+        if _must_run_fused_mc2_spec_target_eager(
+            use_spec_decode=use_spec_decode,
+            cudagraph_mode=cudagraph_mode,
+            enable_fused_mc2=getattr(
+                self.ascend_config,
+                "enable_fused_mc2",
+                0,
+            ),
+        ):
+            logger.warning_once(
+                "Running the fused-MC2 speculative target step eagerly because "
+                "A3 FULL graph replay does not safely complete this collective."
+            )
+            cudagraph_mode = CUDAGraphMode.NONE
+            batch_descriptor = BatchDescriptor(num_tokens=num_tokens_padded)
         min_num_scheduled_tokens = (
             int(num_scheduled_tokens_np[:num_reqs].min())
             if num_reqs > 0
@@ -3354,6 +3531,7 @@ class NPUModelRunner(GPUModelRunner):
             uniform_decode=uniform_decode,
             num_reqs=num_reqs,
             num_tokens=num_tokens_padded,
+            graph_num_reqs=batch_descriptor.num_reqs,
             graph_num_tokens=batch_descriptor.num_tokens,
             min_num_scheduled_tokens=min_num_scheduled_tokens,
             max_num_scheduled_tokens=max_num_scheduled_tokens,
@@ -3906,6 +4084,24 @@ class NPUModelRunner(GPUModelRunner):
         elif profile_cpp:
             num_reqs = 1
             num_scheduled_tokens_list = [num_tokens] * num_reqs
+        elif (
+            is_graph_capturing
+            and cudagraph_runtime_mode == CUDAGraphMode.FULL
+            and getattr(self, "_has_gdn", False)
+            and num_tokens > self.decode_threshold
+        ):
+            # Match the runtime GDN FULL-dispatch contract.  In particular,
+            # avoid manufacturing a mixed [1, ..., 1, 5] dummy for a
+            # non-uniform MTP descriptor; decode/spec graphs are captured by
+            # their uniform descriptors, while this descriptor owns prefill.
+            num_reqs = _get_gdn_prefill_capture_num_reqs(
+                num_tokens=num_tokens,
+                max_num_reqs=max_num_reqs,
+                decode_threshold=self.decode_threshold,
+            )
+            min_tokens_per_req = num_tokens // num_reqs
+            num_scheduled_tokens_list = [min_tokens_per_req] * num_reqs
+            num_scheduled_tokens_list[-1] += num_tokens % num_reqs
         else:
             num_reqs = min(num_tokens, max_num_reqs)
             min_tokens_per_req = num_tokens // num_reqs
@@ -4009,15 +4205,23 @@ class NPUModelRunner(GPUModelRunner):
 
                 cum_num_tokens = self._get_cumsum_and_arange(
                 num_scheduled_tokens, self.query_pos.np)
-                self.query_start_loc.np[1 : num_reqs_padded + 1] = cum_num_tokens
+                _set_dummy_query_start_loc(
+                    self.query_start_loc.np,
+                    cum_num_tokens,
+                    num_reqs=num_reqs,
+                    num_reqs_padded=num_reqs_padded,
+                )
                 self.query_start_loc.copy_to_gpu()
                 if self._has_gdn:
                     if skip_gdn_state_update:
                         self.gdn_query_start_loc.np.fill(0)
                     else:
-                        self.gdn_query_start_loc.np[
-                            1 : num_reqs_padded + 1
-                        ] = cum_num_tokens
+                        _set_dummy_query_start_loc(
+                            self.gdn_query_start_loc.np,
+                            cum_num_tokens,
+                            num_reqs=num_reqs,
+                            num_reqs_padded=num_reqs_padded,
+                        )
                     self.gdn_query_start_loc.copy_to_gpu()
 
                 if not profile_cpp:
@@ -6202,6 +6406,13 @@ class NPUModelRunner(GPUModelRunner):
             self.cudagraph_dispatcher.initialize_cudagraph_keys(
                 cudagraph_mode, self.uniform_decode_query_len
             )
+            if getattr(self, "_has_gdn", False) and self.speculative_config is not None:
+                _register_gdn_spec_decode_full_graph_keys(
+                    self.cudagraph_dispatcher,
+                    cudagraph_mode=cudagraph_mode,
+                    uniform_decode_query_len=self.uniform_decode_query_len,
+                    max_num_reqs=self.scheduler_config.max_num_seqs,
+                )
 
         if (
             self.speculative_config

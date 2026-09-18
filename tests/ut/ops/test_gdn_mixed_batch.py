@@ -14,8 +14,209 @@ from vllm_ascend.ops.gdn_attn_builder import (
     GDNCausalConv1dMetadata,
     GDNDecodeMetadata,
     GDNPrefillMetadata,
+    GDNSpecCausalConv1dMetadata,
+    GDNSpecDecodeMetadata,
 )
 from vllm_ascend.ops.gdn_graph_capability import gdn_prefill_graph_capture_scope
+
+
+def test_native_prefill_derives_device_actual_seq_lengths():
+    total_tokens = 8
+    q = torch.randn(1, total_tokens, 1, 4, dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    g = torch.randn(1, total_tokens, 1, dtype=torch.float32)
+    beta = torch.sigmoid(torch.randn(1, total_tokens, 1, dtype=torch.bfloat16))
+    initial_state = torch.zeros(2, 1, 4, 4, dtype=torch.bfloat16)
+    cu_seqlens = torch.tensor([0, 3, 8], dtype=torch.int32)
+
+    def native_op(q, k, v, **kwargs):
+        del q, k, kwargs
+        return v, initial_state
+
+    with (
+        patch("vllm_ascend.ops.gdn.l2norm_fwd", side_effect=lambda value: value),
+        patch(
+            "vllm_ascend.ops.gdn.torch_npu.npu_chunk_gated_delta_rule",
+            side_effect=native_op,
+        ) as native_mock,
+    ):
+        output, final_state = AscendGatedDeltaNetAttention._chunk_gated_delta_rule_fused(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            initial_state=initial_state,
+            cu_seqlens=cu_seqlens,
+            scale=0.5,
+        )
+
+    actual_seq_lengths = native_mock.call_args.kwargs["actual_seq_lengths"]
+    assert actual_seq_lengths.tolist() == [3, 5]
+    assert actual_seq_lengths.dtype == torch.int32
+    assert actual_seq_lengths.device == cu_seqlens.device
+    assert output.shape == v.shape
+    assert final_state.shape == initial_state.shape
+
+
+def test_native_prefill_assigns_graph_padding_to_reserved_final_row():
+    total_tokens = 16
+    q = torch.randn(1, total_tokens, 1, 4, dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    g = torch.randn(1, total_tokens, 1, dtype=torch.float32)
+    beta = torch.sigmoid(torch.randn(1, total_tokens, 1, dtype=torch.bfloat16))
+    initial_state = torch.zeros(3, 1, 4, 4, dtype=torch.bfloat16)
+    cu_seqlens = torch.tensor([0, 3, 8, 8], dtype=torch.int32)
+
+    def native_op(q, k, v, **kwargs):
+        del q, k, kwargs
+        return v, initial_state
+
+    with (
+        patch("vllm_ascend.ops.gdn.l2norm_fwd", side_effect=lambda value: value),
+        patch(
+            "vllm_ascend.ops.gdn.torch_npu.npu_chunk_gated_delta_rule",
+            side_effect=native_op,
+        ) as native_mock,
+    ):
+        AscendGatedDeltaNetAttention._chunk_gated_delta_rule_fused(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            initial_state=initial_state,
+            cu_seqlens=cu_seqlens,
+            scale=0.5,
+        )
+
+    actual_seq_lengths = native_mock.call_args.kwargs["actual_seq_lengths"]
+    assert actual_seq_lengths.tolist() == [3, 5, 8]
+    assert actual_seq_lengths.sum().item() == total_tokens
+    assert actual_seq_lengths.dtype == torch.int32
+    assert actual_seq_lengths.device == cu_seqlens.device
+
+
+def test_mtp_accept_reject_advances_bf16_conv_and_fp32_ssm_with_same_counts():
+    """Target/draft kernels must consume the same accepted-token decision.
+
+    A count of one models rejection of every draft token; four models accepting
+    all three MTP tokens.  The CPU doubles emulate each native state kernel by
+    advancing the addressed state by that count, which makes an argument-order,
+    dtype, state-index, or rollback-control regression visible without an NPU.
+    """
+    layer = _make_layer()
+    layer.kv_cache = (
+        torch.zeros(2, 1, 2, dtype=torch.bfloat16),
+        torch.zeros(2, 1, 2, 2, dtype=torch.float32),
+    )
+    accepted = torch.tensor([1, 4], dtype=torch.int32)
+    metadata = AscendGDNAttentionMetadata(
+        num_prefills=0,
+        num_prefill_tokens=0,
+        num_decodes=0,
+        num_decode_tokens=0,
+        num_spec_decodes=2,
+        num_spec_decode_tokens=8,
+        num_actual_tokens=8,
+        non_spec_query_start_loc=torch.tensor([0], dtype=torch.int32),
+        non_spec_state_indices_tensor=torch.empty(0, dtype=torch.int32),
+        spec_sequence_masks=torch.tensor([True, True]),
+    )
+    metadata.spec_state_indices_tensor = torch.tensor([0, 1], dtype=torch.int32)
+    metadata.spec_token_indx = torch.arange(8, dtype=torch.int64)
+    metadata.non_spec_token_indx = torch.empty(0, dtype=torch.int64)
+    metadata.spec_decode_metadata = GDNSpecDecodeMetadata(
+        spec_causal_conv1d=GDNSpecCausalConv1dMetadata(
+            query_start_loc=torch.tensor([0, 4, 8], dtype=torch.int32),
+            cache_indices=torch.tensor([[0], [1]], dtype=torch.int32),
+            num_accepted_tokens=accepted,
+        ),
+        actual_seq_lengths=torch.tensor([0, 4, 4], dtype=torch.int32),
+    )
+
+    mixed_qkv = torch.arange(48, dtype=torch.bfloat16).reshape(8, 6)
+    a = torch.zeros(8, 1, dtype=torch.bfloat16)
+    b = torch.zeros(8, 1, dtype=torch.bfloat16)
+    core_attn_out = torch.empty(8, 1, 2, dtype=torch.bfloat16)
+    forward_context = ForwardContext(
+        no_compile_layers={layer.prefix: layer},
+        attn_metadata={layer.prefix: metadata},
+        slot_mapping={},
+    )
+    forward_context.cudagraph_runtime_mode = CUDAGraphMode.FULL
+    conv_calls = []
+    recurrent_calls = []
+
+    def causal_conv1d(
+        output: torch.Tensor,
+        input_tensor: torch.Tensor,
+        conv_weights: torch.Tensor,
+        **kwargs,
+    ) -> None:
+        del conv_weights
+        conv_calls.append(kwargs)
+        state = kwargs["conv_state"]
+        counts = kwargs["num_accepted_tokens_opt"]
+        indices = kwargs["cache_indices_opt"][:, 0]
+        assert state.dtype == torch.bfloat16
+        assert counts.dtype == torch.int32
+        for state_index, count in zip(indices.tolist(), counts.tolist()):
+            state[state_index].add_(count)
+        output.copy_(input_tensor)
+
+    def recurrent_gated_delta_rule(**kwargs) -> torch.Tensor:
+        recurrent_calls.append(kwargs)
+        state = kwargs["state"]
+        counts = kwargs["num_accepted_tokens"]
+        indices = kwargs["ssm_state_indices"]
+        assert state.dtype == torch.float32
+        assert counts.dtype == torch.int32
+        for state_index, count in zip(indices.tolist(), counts.tolist()):
+            state[state_index].add_(count)
+        return kwargs["value"].clone()
+
+    gating = (
+        torch.zeros(1, 8, 1, dtype=torch.float32),
+        torch.ones(1, 8, 1, dtype=torch.bfloat16),
+    )
+    with (
+        override_forward_context(forward_context),
+        patch(
+            "vllm_ascend.ops.gdn.DeviceOperator.fused_gdn_gating",
+            return_value=gating,
+        ),
+        patch("vllm_ascend.ops.gdn.l2norm_fwd", side_effect=lambda value: value),
+        patch("vllm_ascend.ops.gdn.maybe_save_kv_layer_to_connector"),
+        patch.object(
+            torch.ops._C_ascend,
+            "npu_causal_conv1d_custom",
+            side_effect=causal_conv1d,
+            create=True,
+        ),
+        patch.object(
+            torch.ops._C_ascend,
+            "npu_recurrent_gated_delta_rule",
+            side_effect=recurrent_gated_delta_rule,
+            create=True,
+        ),
+    ):
+        AscendGatedDeltaNetAttention._forward_core(
+            layer,
+            mixed_qkv,
+            b,
+            a,
+            core_attn_out,
+        )
+
+    assert len(conv_calls) == 1
+    assert len(recurrent_calls) == 1
+    assert torch.equal(conv_calls[0]["num_accepted_tokens_opt"], accepted)
+    assert torch.equal(recurrent_calls[0]["num_accepted_tokens"], accepted)
+    assert layer.kv_cache[0][:, 0, 0].tolist() == [1.0, 4.0]
+    assert layer.kv_cache[1][:, 0, 0, 0].tolist() == [1.0, 4.0]
 
 
 def _make_mixed_metadata() -> AscendGDNAttentionMetadata:
