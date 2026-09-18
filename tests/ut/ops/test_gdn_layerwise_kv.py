@@ -170,6 +170,10 @@ def test_connector_observes_updated_gdn_state_for_each_compiled_call():
     with (
         override_forward_context(forward_context),
         patch.object(torch.accelerator, "is_available", return_value=False),
+        patch(
+            "vllm_ascend.ops.gdn.get_ascend_config",
+            return_value=SimpleNamespace(gdn_prefill_backend="auto"),
+        ),
         patch("vllm_ascend.ops.gdn.get_pcp_group", return_value=SimpleNamespace(world_size=1)),
         patch("vllm_ascend.ops.gdn.DeviceOperator.fused_gdn_gating", return_value=gating),
         patch("vllm_ascend.ops.gdn.clear_ssm_states"),

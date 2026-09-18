@@ -127,6 +127,13 @@ class GDNSpecDecodeMetadata:
     actual_seq_lengths: torch.Tensor
 
 
+@dataclass
+class AscendGDNAttentionMetadata(GDNAttentionMetadata):
+    """GDN metadata carrying the graph-prefill implementation contract."""
+
+    gdn_prefill_graph_backend: str | None = None
+
+
 def _build_actual_seq_lengths(
     query_start_loc: torch.Tensor,
     num_sequences: int,
@@ -258,6 +265,7 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             self.vllm_config.scheduler_config.max_num_seqs,
             self.decode_cudagraph_max_bs,
         )
+        self._sequence_index_capacity = sequence_index_capacity
 
         self.spec_sequence_masks: torch.Tensor = torch.empty(
             (sequence_index_capacity,), dtype=torch.bool, device=device
@@ -425,6 +433,79 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             )
         return captured
 
+    def _pad_native_prefill_capture_rows(
+        self,
+        captured: GDNAttentionMetadata,
+    ) -> GDNAttentionMetadata:
+        """Give native prefill graphs the driver's fixed request-row capacity.
+
+        A non-uniform FULL descriptor can use fewer real requests than its
+        padded descriptor (for example, 32 tokens are captured as six pure
+        prefill rows and two zero-length rows).  The target forward records the
+        real-row view first, while a later draft forward observes the padded
+        view.  Both forwards belong to the same graph capture, so the stable
+        metadata buffers must have room for every descriptor row from the
+        outset.
+
+        Keep recurrent-state indices and causal-conv cache indices in distinct
+        storage: their unused-row sentinels intentionally differ.
+        """
+
+        row_capacity = self._sequence_index_capacity
+
+        def _pad_rows(
+            value: torch.Tensor,
+            size: int,
+            fill_value: int | bool,
+        ) -> torch.Tensor:
+            if value.shape[0] >= size:
+                return value
+            padded = value.new_full(
+                (size, *value.shape[1:]),
+                fill_value,
+            )
+            padded[: value.shape[0]].copy_(value)
+            return padded
+
+        assert captured.non_spec_query_start_loc is not None
+        terminal = int(captured.non_spec_query_start_loc[-1].item())
+        query_start_loc = _pad_rows(
+            captured.non_spec_query_start_loc,
+            row_capacity + 1,
+            terminal,
+        )
+        captured.non_spec_query_start_loc = query_start_loc
+        captured.prefill_query_start_loc = query_start_loc
+
+        assert captured.prefill_state_indices is not None
+        state_indices = _pad_rows(
+            captured.prefill_state_indices,
+            row_capacity,
+            NULL_BLOCK_ID,
+        )
+        captured.prefill_state_indices = state_indices
+        captured.non_spec_state_indices_tensor = state_indices
+
+        assert captured.prefill_has_initial_state is not None
+        initial_state_mode = _pad_rows(
+            captured.prefill_has_initial_state,
+            row_capacity,
+            True,
+        )
+        captured.prefill_has_initial_state = initial_state_mode
+        captured.has_initial_state = initial_state_mode
+
+        assert captured.non_spec_prefill_metadata is not None
+        conv = captured.non_spec_prefill_metadata.causal_conv1d
+        conv.query_start_loc = query_start_loc
+        conv.cache_indices = _pad_rows(
+            conv.cache_indices,
+            row_capacity,
+            PAD_SLOT_ID,
+        )
+        conv.initial_state_mode = initial_state_mode
+        return captured
+
     def build_for_cudagraph_capture(
         self,
         common_attn_metadata: CommonAttentionMetadata,
@@ -434,25 +515,55 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         Capture keeps the generic driver's request-row capacity.  At replay,
         device query boundaries and state/cache indices are refreshed while
         unused tail rows become zero-length.  The runtime dispatcher selects
-        padded/multi-request graphs only when fused CANN GDN is available;
-        the host-metadata Triton fallback remains exact-singleton only.
+        padded/multi-request graphs only when fused CANN GDN is available.
+        FLA can be retained only for a capture whose host sequence metadata is
+        already the exact immutable singleton used by every replay.
         """
         m = common_attn_metadata
         query_lens_cpu = torch.diff(m.query_start_loc_cpu)
-        if query_lens_cpu.numel() > 0 and bool(torch.all(query_lens_cpu <= self.num_spec + 1).item()):
+        active_query_lens = query_lens_cpu[query_lens_cpu > 0]
+        is_decode_or_spec = active_query_lens.numel() == 0 or bool(
+            torch.all(active_query_lens <= self.num_spec + 1).item()
+        )
+        if is_decode_or_spec:
             return super().build_for_cudagraph_capture(m)
+
+        # Zero-length rows are graph padding.  Every active row beyond the
+        # decode/spec threshold must be a real prefill; a mixed dummy layout is
+        # neither a replayable pure-prefill graph nor a uniform MTP graph.  Keep
+        # this assertion as the capture-contract guard, but make the three row
+        # classes explicit so an invalid dummy cannot be silently re-labelled.
+        assert bool(torch.all(active_query_lens > self.num_spec + 1).item()), (
+            "GDN FULL graph capture mixes decode/spec rows with real prefill "
+            f"rows: query_lens={query_lens_cpu.tolist()}, "
+            f"decode_threshold={self.num_spec + 1}"
+        )
 
         capture_size = m.num_actual_tokens
         captured = self.build(0, m)
         assert self._is_pure_prefill(captured, capture_size)
         assert captured.non_spec_prefill_metadata is not None
+        if captured.gdn_prefill_graph_backend == "triton":
+            raise RuntimeError(
+                "FULL GDN prefill graph requires native device-side dynamic "
+                "sequence lengths; refusing the Triton host-metadata fallback"
+            )
+        cu_seqlens_host = captured.non_spec_prefill_metadata.chunk.cu_seqlens_host
+        graph_metadata_is_exact = (
+            captured.num_prefills == 1 and len(cu_seqlens_host) == 2 and cu_seqlens_host == (0, capture_size)
+        )
+        if captured.gdn_prefill_graph_backend == "fla_npu" and not graph_metadata_is_exact:
+            raise RuntimeError("FLA GDN graph metadata must be an exact singleton prefill")
         # Recurrent state indices use the scheduler-reserved null block (0),
         # while causal-conv uses PAD_SLOT_ID (-1) as an explicit skip sentinel.
         # The eager metadata can expose both as views of the same block table;
         # graph capture needs distinct storage so their padded tails cannot
         # overwrite one another.
-        conv = captured.non_spec_prefill_metadata.causal_conv1d
-        conv.cache_indices = conv.cache_indices.clone()
+        if captured.gdn_prefill_graph_backend == "native":
+            captured = self._pad_native_prefill_capture_rows(captured)
+        else:
+            conv = captured.non_spec_prefill_metadata.causal_conv1d
+            conv.cache_indices = conv.cache_indices.clone()
         self._captured_prefill_metadata[capture_size] = captured
         return captured
 
@@ -719,7 +830,20 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             spec_sequence_masks = None
             num_spec_decodes = 0
         else:
-            num_reqs = num_decode_draft_tokens_cpu.numel()
+            # FULL graph scheduling can retain padded speculative-decode
+            # buffers after the GDN common metadata has been narrowed to the
+            # real request rows (for example, two live requests and one FIA
+            # padding row).  Sequence masks index query_start_loc rows, so do
+            # not let trailing draft-buffer capacity become a third request.
+            num_reqs = query_start_loc_cpu.numel() - 1
+            if num_decode_draft_tokens_cpu.numel() < num_reqs:
+                raise ValueError(
+                    "Speculative decode metadata has fewer rows than GDN "
+                    f"requests: {num_decode_draft_tokens_cpu.numel()} < {num_reqs}"
+                )
+            num_decode_draft_tokens_cpu = num_decode_draft_tokens_cpu[:num_reqs]
+            if num_accepted_tokens is not None:
+                num_accepted_tokens = num_accepted_tokens[:num_reqs]
             spec_sequence_masks_cpu = self.spec_sequence_masks_cpu[:num_reqs]
             runtime_draft_tokens = num_decode_draft_tokens_cpu[num_decode_draft_tokens_cpu >= 0]
             if runtime_draft_tokens.sum().item() > 0:
@@ -1020,7 +1144,7 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             )
             non_spec_conv1d_cache_indices = non_spec_state_indices_tensor
 
-        attn_metadata = GDNAttentionMetadata(
+        attn_metadata = AscendGDNAttentionMetadata(
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
             num_decodes=num_decodes,
@@ -1045,6 +1169,11 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             nums_dict=nums_dict,
             batch_ptr=batch_ptr,
             token_chunk_offset_ptr=token_chunk_offset_ptr,
+            gdn_prefill_graph_backend=getattr(
+                m,
+                "gdn_prefill_graph_backend",
+                None,
+            ),
         )
         attn_metadata = self._attach_non_spec_prefill_metadata(
             attn_metadata,

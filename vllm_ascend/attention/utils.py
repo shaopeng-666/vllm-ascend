@@ -284,6 +284,11 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     # Total number of tokens including padding, used for padding operations.
     num_input_tokens: int = 0
 
+    # Explicit implementation selected for a GDN prefill graph. ``None``
+    # denotes ordinary eager/runtime metadata. Keeping this as a dataclass
+    # field makes the contract survive shallow copies and per-group rebuilds.
+    gdn_prefill_graph_backend: str | None = None
+
     # Metadata for Decode Context Parallelism (DCP) operations.
     context_parallel_metadata: AscendDCPMetadata | None = None
     group_len: torch.Tensor = None
@@ -323,6 +328,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             attn_state=self.attn_state,
             graph_pad_size=-1,  # It should be -1 when not run in fullgraph mode.
             num_input_tokens=self.num_input_tokens,
+            gdn_prefill_graph_backend=self.gdn_prefill_graph_backend,
             context_parallel_metadata=self.context_parallel_metadata,
             seq_lens_cpu_upper_bound=self.seq_lens_cpu_upper_bound[:num_actual_reqs]
             if self.seq_lens_cpu_upper_bound is not None
