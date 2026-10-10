@@ -14,6 +14,7 @@
 
 """Ascend QSA owner for Qwen3.8-Flash-Next."""
 
+from copy import copy
 from typing import Protocol, TypeAlias, cast
 
 import torch
@@ -34,19 +35,21 @@ from vllm_ascend.device.hardware_profile import (
     HardwareCapability,
     get_current_hardware_profile,
 )
+from vllm_ascend.ops.gbsa_qsa import qsa_gbsa_attention
 from vllm_ascend.ops.triton.qwen4_exp.qsa import (
     qsa_select_paged_tokens as qsa_select_paged_tokens_triton,
 )
 from vllm_ascend.ops.triton.qwen4_exp.qsa import (
+    qsa_compress_groups_with_ratio as qsa_compress_groups_with_ratio_triton,
     qsa_sparse_paged_attention,
-    qsa_store_cache_rows,
+    qsa_store_cache_rows as qsa_store_cache_rows_triton,
 )
 from vllm_ascend.utils import is_950
 
 from .lightning_indexer import qsa_select_paged_tokens_lightning
 from .ops import (
-    qsa_compress_groups_with_ratio,
-    reshape_and_cache_qsa,
+    qsa_compress_groups_with_ratio as qsa_compress_groups_with_ratio_reference,
+    qsa_store_cache_rows as qsa_store_cache_rows_reference,
 )
 from .ops import (
     qsa_select_paged_tokens as qsa_select_paged_tokens_reference,
@@ -77,6 +80,76 @@ def _qsa_cache_is_bound(kv_cache: QSAKVCache) -> bool:
     if isinstance(kv_cache, tuple):
         return len(kv_cache) == 2 and all(cache.numel() for cache in kv_cache)
     return bool(kv_cache.numel())
+
+
+def _is_unit_stride_1d(tensor: torch.Tensor) -> bool:
+    """Return whether a metadata tensor matches the Triton pointer contract."""
+    return tensor.ndim == 1 and tensor.stride(0) == 1
+
+
+def _store_qsa_cache_rows(
+    cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    rows: torch.Tensor,
+) -> None:
+    """Prefer the Triton row store and retain the generic reference fallback."""
+    flat_slots = slot_mapping.reshape(-1)
+    use_triton = (
+        not envs.VLLM_ASCEND_FORCE_QSA_REFERENCE
+        and cache.device.type == "npu"
+        and cache.ndim == 4
+        and cache.shape[2] == 1
+        and _is_unit_stride_1d(flat_slots)
+    )
+    if use_triton:
+        qsa_store_cache_rows_triton(cache, flat_slots, rows)
+    else:
+        qsa_store_cache_rows_reference(cache, flat_slots, rows)
+
+
+def _compress_qsa_groups(
+    raw_keys: torch.Tensor,
+    raw_positions: torch.Tensor,
+    compressor_state_cache: torch.Tensor,
+    compressor_state_block_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    logical_positions: torch.Tensor,
+    compressed_slots: torch.Tensor,
+    compress_ratio: int,
+    rope_cache: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Prefer Triton compression when its one-dimensional metadata is dense."""
+    use_triton = (
+        not envs.VLLM_ASCEND_FORCE_QSA_REFERENCE
+        and raw_keys.device.type == "npu"
+        and all(
+            _is_unit_stride_1d(tensor)
+            for tensor in (
+                token_to_req,
+                query_start_loc,
+                logical_positions,
+                compressed_slots,
+            )
+        )
+    )
+    op = (
+        qsa_compress_groups_with_ratio_triton
+        if use_triton
+        else qsa_compress_groups_with_ratio_reference
+    )
+    return op(
+        raw_keys,
+        raw_positions,
+        compressor_state_cache,
+        compressor_state_block_table,
+        token_to_req,
+        query_start_loc,
+        logical_positions,
+        compressed_slots,
+        compress_ratio,
+        rope_cache,
+    )
 
 
 def apply_qsa_rope(
@@ -136,6 +209,46 @@ def apply_qsa_rope(
 class AscendQSAIndexer(upstream_indexer.QSAIndexer):
     """QSA indexer using NPU-compatible cache, RoPE and top-k operators."""
 
+    @property
+    def output_width(self) -> int:
+        return self.token_topk // self.compress_ratio + self.compress_ratio - 1
+
+    def _fused_norm_rope_eligible(
+        self,
+        tensor: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> bool:
+        section = getattr(self.rotary_emb, "mrope_section", None)
+        return bool(
+            envs.VLLM_ASCEND_ENABLE_QSA_INDEXER_FUSED_NORM_ROPE
+            and tensor.dtype == torch.bfloat16
+            and tensor.ndim == 3
+            and tensor.shape[-1] == self.index_head_dim == 128
+            and getattr(self.rotary_emb, "rotary_dim", None) == 64
+            and getattr(self.rotary_emb, "is_neox_style", False)
+            and getattr(self.rotary_emb, "mrope_interleaved", False)
+            and section is not None
+            and list(section) == [11, 11, 10]
+            and positions.ndim in (1, 2)
+            and (positions.ndim == 1 or positions.shape[0] == 3)
+        )
+
+    def _fused_norm_rope(
+        self,
+        tensor: torch.Tensor,
+        norm: torch.nn.Module,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        cos_sin = self.rotary_emb._match_cos_sin_cache_dtype(tensor)[positions]
+        return torch.ops.vllm.triton_qsa_rmsnorm_mrope(
+            tensor=tensor,
+            weight=norm.weight,
+            cos_sin=cos_sin,
+            eps=norm.variance_epsilon,
+            mrope_section=list(self.rotary_emb.mrope_section),
+            rope_dim=self.rotary_emb.rotary_dim,
+        )
+
     def _metadata(
         self,
     ) -> tuple[QSAForwardMetadata, QSAForwardMetadata] | None:
@@ -163,27 +276,18 @@ class AscendQSAIndexer(upstream_indexer.QSAIndexer):
         first_positions: torch.Tensor,
     ) -> torch.Tensor:
         """Apply the reference K normalization and RoPE to compressed keys."""
-        if (
-            envs.VLLM_ASCEND_ENABLE_QSA_INDEXER_SPLIT_NORM_ROPE
-            and pooled.dtype == torch.bfloat16
-            and pooled.shape[-1] == 128
-        ):
-            compressed_keys = self.k_layernorm(pooled.reshape(-1, self.index_head_dim)).reshape(
-                -1, 1, self.index_head_dim
-            )
-        else:
-            # Keep this path on upstream's public portable normalization
-            # helper. The former private Triton helper was removed when
-            # Qwen4Exp's AMD indexer switched to the shared GemmaRMSNorm
-            # module.
-            compressed_keys = upstream_indexer.apply_qsa_rmsnorm(
-                self.k_layernorm,
-                pooled.reshape(-1, self.index_head_dim),
-            ).reshape(-1, 1, self.index_head_dim)
         if getattr(self.rotary_emb, "mrope_section", None):
             first_positions = first_positions.transpose(0, 1)
         else:
             first_positions = first_positions[:, 0]
+        pooled = pooled.reshape(-1, 1, self.index_head_dim)
+        if self._fused_norm_rope_eligible(pooled, first_positions):
+            return self._fused_norm_rope(pooled, self.k_layernorm, first_positions)
+        else:
+            compressed_keys = upstream_indexer.apply_qsa_rmsnorm(
+                self.k_layernorm,
+                pooled.reshape(-1, self.index_head_dim),
+            ).reshape(-1, 1, self.index_head_dim)
         return apply_qsa_rope(
             self.rotary_emb,
             first_positions,
@@ -245,6 +349,9 @@ class AscendQSAIndexer(upstream_indexer.QSAIndexer):
             dim=-1,
         )
         q = q_raw.reshape(-1, self.index_n_heads, self.index_head_dim)
+        if self._fused_norm_rope_eligible(q, positions):
+            q = self._fused_norm_rope(q, self.q_layernorm, positions)
+            return q, token_k.reshape(-1, 1, self.index_head_dim)
         q = self.q_layernorm(q.reshape(-1, self.index_head_dim)).reshape_as(q)
         q = apply_qsa_rope(self.rotary_emb, positions, q)
         return q, token_k.reshape(-1, 1, self.index_head_dim)
@@ -265,7 +372,7 @@ class AscendQSAIndexer(upstream_indexer.QSAIndexer):
             position_rows = qsa_cache.canonical_qsa_rope_positions(positions)[:num_tokens].to(
                 device=raw_key_cache.device
             )
-        pooled, first_positions = qsa_compress_groups_with_ratio(
+        pooled, first_positions = _compress_qsa_groups(
             token_k[:num_tokens],
             position_rows,
             raw_key_cache,
@@ -278,14 +385,14 @@ class AscendQSAIndexer(upstream_indexer.QSAIndexer):
             rope_position_cache,
         )
         normalized = self.normalize_compressed_keys(pooled, first_positions)
-        qsa_store_cache_rows(
+        _store_qsa_cache_rows(
             self.compressed_key_cache.kv_cache,
             compressed_metadata.slot_mapping,
             normalized,
         )
-        qsa_store_cache_rows(raw_key_cache, raw_metadata.slot_mapping, token_k[:num_tokens])
+        _store_qsa_cache_rows(raw_key_cache, raw_metadata.slot_mapping, token_k[:num_tokens])
         if rope_position_cache is not None:
-            qsa_store_cache_rows(
+            _store_qsa_cache_rows(
                 rope_position_cache,
                 raw_metadata.slot_mapping,
                 position_rows,
@@ -298,12 +405,12 @@ class AscendQSAIndexer(upstream_indexer.QSAIndexer):
     ) -> bool:
         cache = self.compressed_key_cache.kv_cache
         return (
-            query.dtype == torch.bfloat16
+            query.dtype in (torch.float16, torch.bfloat16)
             and query.ndim == 3
             and query.shape[1] <= 64
             and query.shape[2] == 128
             and cache.ndim == 4
-            and cache.shape[1:] == (192, 1, 128)
+            and cache.shape[1:] == (384, 1, 128)
             and self.compress_ratio == 4
             and self.token_topk == 2048
             and metadata.query_start_loc.ndim == 1
@@ -316,7 +423,7 @@ class AscendQSAIndexer(upstream_indexer.QSAIndexer):
         metadata: QSAForwardMetadata,
         out: torch.Tensor | None,
     ) -> torch.Tensor:
-        force_reference = envs.VLLM_ASCEND_FORCE_QSA_REFERENCE or is_950()
+        force_reference = envs.VLLM_ASCEND_FORCE_QSA_REFERENCE
         if force_reference:
             return qsa_select_paged_tokens_reference(
                 query,
@@ -344,6 +451,20 @@ class AscendQSAIndexer(upstream_indexer.QSAIndexer):
                 "unavailable on this SoC; falling back to the portable QSA expansion."
             )
             use_e3 = False
+        if use_lightning and is_950():
+            return qsa_select_paged_tokens_lightning(
+                query,
+                self.compressed_key_cache.kv_cache,
+                metadata.block_table,
+                metadata.token_to_req,
+                metadata.logical_positions,
+                metadata.seq_lens,
+                metadata.query_start_loc,
+                self.token_topk,
+                self.compress_ratio,
+                out,
+                use_e3=use_e3,
+            )
         if use_lightning or use_e3:
             if self._lightning_indexer_eligible(query, metadata):
                 if not use_lightning:
@@ -413,12 +534,9 @@ class AscendQSAImpl:
         slot_mapping: torch.Tensor,
     ) -> None:
         del layer
-        if isinstance(kv_cache, tuple):
-            key_cache, value_cache = _split_qsa_kv_cache(kv_cache, self.head_size)
-            qsa_store_cache_rows(key_cache, slot_mapping, key)
-            qsa_store_cache_rows(value_cache, slot_mapping, value)
-        else:
-            reshape_and_cache_qsa(key, value, kv_cache, slot_mapping, self.head_size)
+        key_cache, value_cache = _split_qsa_kv_cache(kv_cache, self.head_size)
+        _store_qsa_cache_rows(key_cache, slot_mapping, key)
+        _store_qsa_cache_rows(value_cache, slot_mapping, value)
 
     def forward_qsa(
         self,
@@ -440,25 +558,36 @@ class AscendQSAImpl:
         output.zero_()
         if num_tokens == 0:
             return output
-        logical_indices = layer.topk_indices_buffer[:num_tokens]
+        compact_indices = layer.topk_indices_buffer[:num_tokens]
         key_cache, value_cache = _split_qsa_kv_cache(kv_cache, self.head_size)
         key_cache = canonicalize_singleton_dim_strides(key_cache)
         value_cache = canonicalize_singleton_dim_strides(value_cache)
-        if envs.VLLM_ASCEND_FORCE_QSA_REFERENCE or is_950():
+        if envs.VLLM_ASCEND_FORCE_QSA_REFERENCE:
             return qsa_sparse_paged_attention_reference(
                 query[:num_tokens],
                 key_cache,
                 value_cache,
-                logical_indices,
+                compact_indices,
                 attn_metadata.block_table,
                 token_to_req[:num_tokens],
+                output[:num_tokens],
+            )
+        if is_950():
+            return qsa_gbsa_attention(
+                query[:num_tokens],
+                key_cache,
+                value_cache,
+                compact_indices,
+                attn_metadata.block_table,
+                token_to_req[:num_tokens],
+                attn_metadata.seq_lens,
                 output[:num_tokens],
             )
         return qsa_sparse_paged_attention(
             query[:num_tokens],
             key_cache,
             value_cache,
-            logical_indices,
+            compact_indices,
             attn_metadata.block_table,
             token_to_req[:num_tokens],
             output[:num_tokens],
@@ -485,7 +614,15 @@ upstream_qsa.Qwen4ExpQSAFlashAttentionBackend = AscendQSABackend
 
 # qsa_cache selects its Triton metadata builder at import time. The upstream
 # kernel uses CUDA PDL intrinsics, so Ascend must use the equivalent Torch path.
-qsa_cache.build_qsa_metadata = qsa_cache._build_qsa_metadata_torch
+def _build_ascend_qsa_metadata(common_attn_metadata, *args, **kwargs):
+    metadata = copy(common_attn_metadata)
+    metadata.query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu.clamp_max(
+        common_attn_metadata.num_actual_tokens
+    )
+    return qsa_cache._build_qsa_metadata_torch(metadata, *args, **kwargs)
+
+
+qsa_cache.build_qsa_metadata = _build_ascend_qsa_metadata
 
 
 class AscendQwen4ExpQSAAttention(upstream_qsa.Qwen4ExpQSAAttention):
