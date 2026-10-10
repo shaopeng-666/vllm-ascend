@@ -11,15 +11,13 @@ import math
 
 import torch
 
-from vllm_ascend.ops.triton.qwen4_exp.qsa import (
-    expand_qsa_block_indices_e3,
-    expand_qsa_block_indices_npu,
-)
+from vllm_ascend.ops.triton.qwen4_exp.qsa import pack_qsa_group_indices_npu
 
-_PA_PAGE_SIZE = 192
+_PA_PAGE_SIZE = 384
 _HEAD_DIM = 128
 _COMPRESS_RATIO = 4
 _TOKEN_TOPK = 2048
+_SUPPORTED_HEAD_COUNTS = (8, 16, 24, 32, 64)
 
 
 def _validate_request_boundaries(
@@ -64,16 +62,20 @@ def qsa_select_paged_tokens_lightning(
         token_to_req,
         sequence_lengths,
     )
-    if query.dtype != torch.bfloat16 or query.ndim != 3:
-        raise ValueError("QSA LightningIndexer query must be three-dimensional BF16")
-    if query.shape[1] > 64 or query.shape[2] != _HEAD_DIM:
+    if query.dtype not in (torch.float16, torch.bfloat16) or query.ndim != 3:
+        raise ValueError("QSA LightningIndexer query must be three-dimensional FP16/BF16")
+    if query.shape[1] > _SUPPORTED_HEAD_COUNTS[-1] or query.shape[2] != _HEAD_DIM:
         raise ValueError("QSA LightningIndexer requires at most 64 heads of width 128")
     if compressed_key_cache.ndim != 4 or compressed_key_cache.shape[1:] != (
         _PA_PAGE_SIZE,
         1,
         _HEAD_DIM,
     ):
-        raise ValueError("QSA LightningIndexer requires a [pages,192,1,128] cache")
+        raise ValueError(
+            "QSA LightningIndexer requires a [pages,384,1,128] cache, "
+            f"got shape={tuple(compressed_key_cache.shape)} "
+            f"stride={compressed_key_cache.stride()}"
+        )
     if compress_ratio != _COMPRESS_RATIO or token_topk != _TOKEN_TOPK:
         raise ValueError("QSA LightningIndexer requires ratio=4 and token_topk=2048")
     if block_table.ndim != 2 or sequence_lengths.shape != (block_table.shape[0],):
@@ -82,7 +84,8 @@ def qsa_select_paged_tokens_lightning(
         raise ValueError("QSA LightningIndexer positions must match query rows")
 
     rows = query.shape[0]
-    output_width = token_topk + compress_ratio - 1
+    block_topk = token_topk // compress_ratio
+    output_width = block_topk + compress_ratio - 1
     if out is None:
         out = torch.empty((rows, output_width), dtype=torch.int32, device=query.device)
     elif out.shape != (rows, output_width):
@@ -90,7 +93,6 @@ def qsa_select_paged_tokens_lightning(
     if not rows:
         return out
 
-    block_topk = token_topk // compress_ratio
     score_weight = 1.0 / math.sqrt(query.shape[2])
     row_requests = token_to_req.to(torch.int64)
     row_sequence_lengths = sequence_lengths[row_requests]
@@ -105,12 +107,37 @@ def qsa_select_paged_tokens_lightning(
         dtype=torch.int32,
         device=query.device,
     )
+    original_heads = query.shape[1]
+    padded_heads = next(heads for heads in _SUPPORTED_HEAD_COUNTS if heads >= original_heads)
     weights = torch.full(
-        (rows, query.shape[1]),
+        (rows, original_heads),
         score_weight,
-        dtype=torch.float32,
+        dtype=query.dtype,
         device=query.device,
     )
+    if padded_heads != original_heads:
+        query = torch.cat(
+            (
+                query,
+                torch.zeros(
+                    (rows, padded_heads - original_heads, query.shape[2]),
+                    dtype=query.dtype,
+                    device=query.device,
+                ),
+            ),
+            dim=1,
+        )
+        weights = torch.cat(
+            (
+                weights,
+                torch.zeros(
+                    (rows, padded_heads - original_heads),
+                    dtype=query.dtype,
+                    device=query.device,
+                ),
+            ),
+            dim=1,
+        )
     groups, _ = torch.ops.npu.npu_lightning_indexer.default(
         query,
         compressed_key_cache,
@@ -126,25 +153,13 @@ def qsa_select_paged_tokens_lightning(
         next_tokens=9223372036854775807,
         return_value=False,
     )
-    groups = groups.squeeze(1)
-    if use_e3:
-        expand_qsa_block_indices_e3(
-            groups,
-            query_positions,
-            sequence_lengths,
-            token_to_req,
-            compress_ratio,
-            token_topk,
-            out,
-        )
-    else:
-        expand_qsa_block_indices_npu(
-            groups,
-            query_positions,
-            sequence_lengths,
-            token_to_req,
-            compress_ratio,
-            token_topk,
-            out,
-        )
-    return out
+    del use_e3
+    return pack_qsa_group_indices_npu(
+        groups.squeeze(1),
+        query_positions,
+        sequence_lengths,
+        token_to_req,
+        compress_ratio,
+        token_topk,
+        out,
+    )
