@@ -19,7 +19,7 @@ from vllm.models.qwen4_exp.amd import (
     hyperconnection as upstream_hc,
 )
 
-from .ops import (
+from vllm_ascend.ops.triton.qwen4_exp.hc import (
     grouped_gemma_rmsnorm,
     hc_combine,
     hc_combine_norm,
