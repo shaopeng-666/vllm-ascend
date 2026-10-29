@@ -29,6 +29,9 @@ from typing import Any
 
 
 env_variables: dict[str, Callable[[], Any]] = {
+    # Qwen PLE convolution backend: "torch" (default) or "triton" for
+    # comparison/fallback. This setting does not contain sensitive data.
+    "VLLM_ASCEND_PLE_BACKEND": lambda: os.getenv("VLLM_ASCEND_PLE_BACKEND", "torch"),
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.
