@@ -1,0 +1,7 @@
+pr: 40
+entries:
+  - category: performance
+    text: Use NPU-friendly PyTorch operators for Qwen PLE convolution in prefill, decode and speculative decoding.
+    model: qwen3.8-flash-next
+  - category: config
+    text: Add VLLM_ASCEND_PLE_BACKEND with torch as the default and triton available for comparison or fallback.
