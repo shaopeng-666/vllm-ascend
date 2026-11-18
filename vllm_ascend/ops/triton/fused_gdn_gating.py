@@ -25,6 +25,7 @@ def fused_gdn_gating_kernel(
     threshold,
     BLK_HEADS: tl.constexpr,
     BLK_BATCHES: tl.constexpr,
+    ROUND_BETA_TO_BF16: tl.constexpr,
     ROW_ITER,
 ):
     i_b, i_s = tl.program_id(0), tl.program_id(1)
@@ -53,6 +54,10 @@ def fused_gdn_gating_kernel(
 
             # compute beta_output = sigmoid(b)
             blk_beta_output = tl.sigmoid(blk_b.to(tl.float32))
+            if ROUND_BETA_TO_BF16:
+                # Preserve the old BF16-output -> internal-FP32-Cast
+                # numerics while storing the final FP32 value directly.
+                blk_beta_output = blk_beta_output.to(tl.bfloat16).to(tl.float32)
             tl.store(beta_output + off, blk_beta_output.to(beta_output.dtype.element_ty), mask=mask)
 
 
@@ -63,6 +68,7 @@ def fused_gdn_gating_patch(
     dt_bias: torch.Tensor,
     beta: float = 1.0,
     threshold: float = 20.0,
+    beta_output_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     batch, num_heads = a.shape
     seq_len = 1
@@ -77,7 +83,13 @@ def fused_gdn_gating_patch(
     ROW_ITER = triton.cdiv(row_per_core, BLK_BATCHES)
 
     g = torch.empty(1, batch, num_heads, dtype=torch.float32, device=a.device)
-    beta_output = torch.empty(1, batch, num_heads, dtype=b.dtype, device=b.device)
+    beta_output = torch.empty(
+        1,
+        batch,
+        num_heads,
+        dtype=beta_output_dtype or b.dtype,
+        device=b.device,
+    )
 
     grid = (progs, seq_len)
     fused_gdn_gating_kernel[grid](
@@ -94,6 +106,9 @@ def fused_gdn_gating_patch(
         threshold,
         BLK_HEADS=BLK_HEADS,
         BLK_BATCHES=BLK_BATCHES,
+        ROUND_BETA_TO_BF16=(
+            beta_output_dtype == torch.float32 and b.dtype == torch.bfloat16
+        ),
         ROW_ITER=ROW_ITER,
     )
     return g, beta_output

@@ -955,8 +955,20 @@ class BaseDeviceAdaptor:
         return output, final_state.transpose(-1, -2).contiguous()
 
     @staticmethod
-    def fused_gdn_gating(A_log: torch.Tensor, a: torch.Tensor, b: torch.Tensor, dt_bias: torch.Tensor):
-        return fused_gdn_gating_patch(A_log, a, b, dt_bias)
+    def fused_gdn_gating(
+        A_log: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        dt_bias: torch.Tensor,
+        beta_output_dtype: torch.dtype | None = None,
+    ):
+        return fused_gdn_gating_patch(
+            A_log,
+            a,
+            b,
+            dt_bias,
+            beta_output_dtype=beta_output_dtype,
+        )
 
     @staticmethod
     def split_qkv_rmsnorm_rope(
@@ -1927,7 +1939,10 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
             q, k, v = (x.contiguous() for x in (q, k, v))
             layout = "BSND"
         g = g.to(torch.float32).contiguous()
-        beta = beta.to(v.dtype).contiguous()
+        # The A5 FLA kernel consumes beta as FP32 internally.  The prefill
+        # gating path already writes the old BF16-rounded value into FP32
+        # storage, so retain it and avoid an FP32 -> BF16 -> FP32 cast pair.
+        beta = beta.to(torch.float32).contiguous()
         initial_state = initial_state.contiguous()
 
         cu_seqlens = prebuilt_meta.cu_seqlens_host
@@ -1964,8 +1979,20 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
         return output, final_state
 
     @staticmethod
-    def fused_gdn_gating(A_log: torch.Tensor, a: torch.Tensor, b: torch.Tensor, dt_bias: torch.Tensor):
-        return fused_gdn_gating_patch(A_log, a, b, dt_bias)
+    def fused_gdn_gating(
+        A_log: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        dt_bias: torch.Tensor,
+        beta_output_dtype: torch.dtype | None = None,
+    ):
+        return fused_gdn_gating_patch(
+            A_log,
+            a,
+            b,
+            dt_bias,
+            beta_output_dtype=beta_output_dtype,
+        )
 
     @staticmethod
     def split_qkv_rmsnorm_rope(

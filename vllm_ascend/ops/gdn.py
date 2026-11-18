@@ -716,8 +716,33 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         else:
             query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(mixed_qkv_non_spec)
 
-        # 2. Recurrent attention
-        g, beta = DeviceOperator.fused_gdn_gating(self.A_log, a, b, self.dt_bias)
+        # 2. Recurrent attention.  Pure prefill on A5 immediately promotes the
+        # BF16 beta produced here back to FP32 inside the FLA operator.  Write
+        # the BF16-rounded value into FP32 storage directly so that path does
+        # not launch a standalone Cast kernel.  Mixed/spec/decode batches keep
+        # the original model-dtype ABI.
+        pure_fla_prefill_op = None
+        if (
+            spec_sequence_masks is None
+            and attn_metadata.num_prefills > 0
+            and attn_metadata.num_decodes == 0
+            and query_non_spec.dtype == torch.bfloat16
+            and get_pcp_group().world_size == 1
+            and get_current_hardware_profile().supports(HardwareCapability.FLA_GDN_PREFILL)
+        ):
+            pure_fla_prefill_op = _get_fla_gdn_prefill_op()
+        gating_kwargs = (
+            {"beta_output_dtype": torch.float32}
+            if pure_fla_prefill_op is not None
+            else {}
+        )
+        g, beta = DeviceOperator.fused_gdn_gating(
+            self.A_log,
+            a,
+            b,
+            self.dt_bias,
+            **gating_kwargs,
+        )
         if spec_sequence_masks is not None:
             if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
                 g_spec = g
@@ -829,7 +854,11 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 and get_pcp_group().world_size == 1
                 and get_current_hardware_profile().supports(HardwareCapability.FLA_GDN_PREFILL)
             )
-            fla_gdn_prefill_op = _get_fla_gdn_prefill_op() if use_fla_gdn_prefill else None
+            fla_gdn_prefill_op = (
+                pure_fla_prefill_op
+                if pure_fla_prefill_op is not None
+                else (_get_fla_gdn_prefill_op() if use_fla_gdn_prefill else None)
+            )
             # The built-in fused operator is NPU-only. Keep CPU/unit-test
             # dispatch on the Triton-compatible path even when its availability
             # probe was cached globally.
